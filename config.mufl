@@ -1,0 +1,26 @@
+// ours shared mufl core — compile configuration.
+//
+// Not compiled standalone: consumers (the MCP agent packet, the web
+// messenger) pull these libraries in via `config_load #"core"` from their own
+// config.mufl, with this repo checked out as a `core/` subfolder of their
+// mufl_code/ directory.
+
+config script
+{
+    (
+        $exports ->
+        (
+            $libraries ->
+            (
+                $version -> #"version.mm",
+                $a2a_capabilities -> #"a2a_capabilities.mm",
+                $a2a_protocol -> #"a2a_protocol.mm",
+                $a2a_messaging -> #"a2a_messaging.mm",
+                $a2a_cluster -> #"a2a_cluster.mm",
+                $a2a_monitoring -> #"a2a_monitoring.mm",
+                $a2a_control -> #"a2a_control.mm"
+            ),
+        ),
+        $imports -> (config_load #$MUFL_STDLIB_PATH) $exports
+    ).
+}

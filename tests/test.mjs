@@ -1,0 +1,311 @@
+#!/usr/bin/env node
+// M2 loopback test suite for the core-3.0 ephemeral-invite redeem flow.
+// Asserts RECEIVER-SIDE outcomes (state), per the Critic requirement.
+import { resolve } from 'node:path';
+import * as fs from 'node:fs';
+import { adapt_wrapper } from '@adapt-toolkit/sdk/executables';
+import { PacketWrapperConfigurator } from '@adapt-toolkit/sdk/wrappers';
+import { object_to_adapt_value } from '@adapt-toolkit/sdk/wrapper';
+
+const BROKER_URL = process.env.BROKER_URL || 'ws://127.0.0.1:9790';
+const UNIT_DIR = resolve('.');
+const unitHash = fs.readdirSync(UNIT_DIR).find((f) => f.endsWith('.muflo')).slice(0, -'.muflo'.length);
+const UNIT = new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, `${unitHash}.muflo`)));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (...a) => process.stderr.write(`[t] ${a.join(' ')}\n`);
+const scorecard = [];
+let CUR = '';
+const ok = (c, m) => { if (!c) { scorecard.push(`✗ [${CUR}] ${m}`); console.log(`  ✗ FAIL: ${m}`); } else { console.log(`  ✓ ${m}`); } };
+const isT = (s) => /true/i.test(String(s));
+
+let wrapper;
+function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [] }; }
+function wire(id) {
+  id.pw.on_return_data = (d) => {
+    const kind = d.Reduce('kind').Visualize();
+    if (kind === 'save_state' || kind === 'notify_agent') return;
+    const p = id.pending.shift(); if (!p) return;
+    clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
+  };
+  id.pw.on_transaction_failure = (msg) => {
+    const p = id.pending.shift();
+    if (p) { clearTimeout(p.timer); p.reject(new Error(msg)); }
+    else { id.rejects.push(String(msg)); log(`${id.name} inbound rejected:`, String(msg).split('\n')[0]); }
+  };
+}
+function mutate(id, name, targ) {
+  return new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error(`${id.name}.${name} timed out`)), 20000);
+    id.pending.push({ resolve: res, reject: rej, timer });
+    id.pw.add_client_message(object_to_adapt_value({ name, targ }));
+  });
+}
+const ro = (id, name, targ) => id.pw.packet.ExecuteTransaction(object_to_adapt_value({ name, targ }));
+const binv = (id, buf) => id.pw.packet.NewBinaryFromBuffer(Buffer.from(buf));
+async function mkPacket(id, seed) {
+  const cfg = new PacketWrapperConfigurator();
+  cfg.process_arguments(['--unit_hash', unitHash, '--seed_phrase', seed, '--unit_dir_path', UNIT_DIR]);
+  await new Promise((res, rej) => {
+    const t = setTimeout(() => rej(new Error(`${id.name} create timeout`)), 30000);
+    wrapper.packet_manager.create_packet(cfg, (pw) => {
+      clearTimeout(t); id.pw = pw; id.cid = pw.packet.GetContainerID().Visualize(); wire(id);
+      log(`${id.name} cid ${id.cid.slice(0, 12)}…`); res();
+    }, UNIT);
+  });
+}
+const st = (id) => { const s = ro(id, '::actor::qa_state', undefined); return {
+  c: +s.Reduce('n_contacts').Visualize(), p: +s.Reduce('n_peer_ads').Visualize(),
+  pi: +s.Reduce('n_pending_invites').Visualize(), pr: +s.Reduce('n_pending_redemptions').Visualize(),
+  cr: +s.Reduce('n_contact_roots').Visualize() }; };
+const lc = (id) => ro(id, '::a2a_messaging::list_contacts', undefined).Visualize();
+const adBlob = (id) => Buffer.from(ro(id, '::actor::qa_export_ad', undefined).Reduce('ad').GetBinary());
+const setName = (id, n) => mutate(id, '::a2a_messaging::set_my_name', { name: n });
+
+async function delegate(root, role, roleName) {
+  const roleAd = Buffer.from(ro(role, '::actor::export_address_document', undefined).GetBinary());
+  const signed = await mutate(root, '::actor::sign_delegation', { role_ad: binv(root, roleAd), role_id: roleName });
+  const cert = Buffer.from(signed.Reduce('cert').GetBinary());
+  const prof = await mutate(root, '::actor::export_root_profile', {});
+  const profBlob = Buffer.from(prof.Reduce('profile').GetBinary());
+  const rootAd = Buffer.from(ro(root, '::actor::export_address_document', undefined).GetBinary());
+  await mutate(role, '::actor::set_delegation', { cert: binv(role, cert), root_ad: binv(role, rootAd), root_profile: binv(role, profBlob) });
+}
+
+async function main() {
+  wrapper = await adapt_wrapper.start(['--broker_address', BROKER_URL, '--test_mode',
+    '--logger_config', '--level', 'WARNING', '--stdout', 'stderr', '--logger_config_end']);
+  wrapper.start();
+  await sleep(1500);
+
+  const I = mk('I'); const R = mk('R'); const F = mk('F');
+  await mkPacket(I, 'eph-t-I-01'); await mkPacket(R, 'eph-t-R-02'); await mkPacket(F, 'eph-t-F-03');
+  await sleep(1200);
+  await setName(I, 'Inviter'); await setName(R, 'Responder'); await setName(F, 'Foreign');
+
+  // ---------- T1 happy-flat ----------
+  CUR = 'T1 happy-flat';
+  console.log('\n=== T1 happy-flat ===');
+  let m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'TheResponder' });
+  const blob1 = Buffer.from(m.Reduce('invite').GetBinary());
+  ok(st(I).pi === 1, `inviter has 1 pending_invite after mint`);
+  await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob1), name: 'MyInviter' });
+  await sleep(5000);
+  const i1 = st(I); const r1 = st(R);
+  log(`I=${JSON.stringify(i1)} R=${JSON.stringify(r1)}`);
+  ok(i1.pi === 0, `leg-2: inviter consumed pending_invites (${i1.pi})`);
+  ok(i1.c >= 1 && i1.p >= 1, `leg-2: inviter registered responder (c=${i1.c},peer_ads=${i1.p})`);
+  ok(r1.pr === 0, `leg-3: responder cleared pending_redemptions (${r1.pr})`);
+  ok(r1.c >= 1 && r1.p >= 1, `leg-3 RECEIVER-SIDE: responder DECRYPTED + registered inviter (c=${r1.c},peer_ads=${r1.p})`);
+  ok(new RegExp(I.cid).test(lc(R)), `responder list_contacts includes inviter cid`);
+  ok(new RegExp(R.cid).test(lc(I)), `inviter list_contacts includes responder cid`);
+  // bidirectional encrypted_channel round-trip
+  const smIR = await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'msg-I-to-R' });
+  const msgWireIR = smIR.Reduce('wire_id').Visualize();
+  await sleep(2500);
+  ok(/msg-I-to-R/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), `send_message I→R round-trips over encrypted_channel`);
+  await mutate(R, '::a2a_messaging::send_message', { contact: I.cid, text: 'msg-R-to-I' });
+  await sleep(2500);
+  ok(/msg-R-to-I/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()), `send_message R→I round-trips over encrypted_channel`);
+
+  // ---------- T1 file round-trip (send_file both directions) ----------
+  const sfIR = await mutate(I, '::a2a_messaging::send_file',
+    { contact: R.cid, filename: 'hello.png', mime: 'image/png', data: binv(I, Buffer.from('\x89PNG\r\n\x1a\nDATA')) });
+  const fileWireIR = sfIR.Reduce('wire_id').Visualize();
+  await sleep(2500);
+  {
+    const rf = ro(R, '::actor::list_incoming_files', undefined).Visualize();
+    ok(/hello\.png/.test(rf), `send_file I→R: responder received file hello.png`);
+    ok(/image\/png/.test(rf), `send_file I→R: responder sees mime image/png`);
+    ok(new RegExp(I.cid).test(rf), `send_file I→R: file is attributed to the inviter cid`);
+    ok(new RegExp(fileWireIR).test(rf), `send_file I→R: stored wire_id matches the send return`);
+  }
+  await mutate(R, '::a2a_messaging::send_file',
+    { contact: I.cid, filename: 'reply.txt', mime: 'text/plain', data: binv(R, Buffer.from('hi')) });
+  await sleep(2500);
+  ok(/reply\.txt/.test(ro(I, '::actor::list_incoming_files', undefined).Visualize()),
+    `send_file R→I: inviter received file reply.txt`);
+
+  // ---------- T1 file monitoring summary (metadata-only; never the bytes) ----------
+  {
+    const r = await mutate(I, '::actor::qa_file_summary',
+      { filename: 'hello.png', mime: 'image/png', data: binv(I, Buffer.from('ABCDE')) });
+    const summary = r.Reduce('summary').Visualize();
+    ok(summary === '[file] hello.png (image/png, 5 B)', `file monitor summary is metadata-only: "${summary}"`);
+    ok(!/ABCDE/.test(summary), `file monitor summary never carries the file bytes`);
+  }
+
+  // ---------- T1 cross-kind reply (one shared wire_id namespace) ----------
+  // A MESSAGE replying to a FILE: reply_to points at the file's wire_id (from I→R).
+  await mutate(R, '::a2a_messaging::send_message',
+    { contact: I.cid, text: 'reply-to-file', reply_to: { wire_id: fileWireIR } });
+  await sleep(2500);
+  {
+    const im = ro(I, '::actor::list_incoming_messages', undefined).Visualize();
+    ok(/reply-to-file/.test(im) && new RegExp(fileWireIR).test(im),
+      `a send_message can reply_to a FILE's wire_id (cross-kind, shared namespace)`);
+  }
+  // A FILE replying to a MESSAGE: reply_to points at the message's wire_id (from I→R).
+  await mutate(R, '::a2a_messaging::send_file',
+    { contact: I.cid, filename: 'answer.bin', mime: 'application/octet-stream',
+      data: binv(R, Buffer.from('Z')), reply_to: { wire_id: msgWireIR } });
+  await sleep(2500);
+  {
+    const ifs = ro(I, '::actor::list_incoming_files', undefined).Visualize();
+    ok(/answer\.bin/.test(ifs) && new RegExp(msgWireIR).test(ifs),
+      `a send_file can reply_to a MESSAGE's wire_id (cross-kind, shared namespace)`);
+  }
+
+  // ---------- T3 single-use (reuse blob1, already consumed) ----------
+  CUR = 'T3 single-use';
+  console.log('\n=== T3 single-use ===');
+  const before = st(I); const rej0 = I.rejects.length;
+  await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob1), name: 'again' });
+  await sleep(3000);
+  const after = st(I);
+  ok(I.rejects.slice(rej0).some((x) => /already-redeemed|Unknown or already/.test(x)), `2nd leg-1 for the same invite_id aborts "already-redeemed" at inviter`);
+  ok(after.c === before.c && after.pi === before.pi, `single-use: inviter state unchanged by replay (c=${after.c},pi=${after.pi})`);
+
+  // ---------- T4 invalid-then-valid (bad box must NOT consume) ----------
+  CUR = 'T4 invalid-then-valid';
+  console.log('\n=== T4 invalid-then-valid ===');
+  m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'P4' });
+  const blob4 = Buffer.from(m.Reduce('invite').GetBinary());
+  const piAfterMint = st(I).pi; const rejb = I.rejects.length;
+  await mutate(R, '::actor::qa_leg1_badbox', { invite: binv(R, blob4) });
+  await sleep(3000);
+  ok(I.rejects.slice(rejb).some((x) => /Decryption failed|crypto box|read/i.test(x)), `bad box: inviter leg-2 aborts at decrypt`);
+  ok(st(I).pi === piAfterMint, `bad box did NOT consume the invite (pi=${st(I).pi}, was ${piAfterMint})`);
+  // now redeem the SAME invite validly
+  await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob4), name: 'P4ok' });
+  await sleep(5000);
+  ok(st(I).pi === piAfterMint - 1, `valid redeem after the bad box consumed the invite (pi=${st(I).pi})`);
+
+  // ---------- T5 tamper (state-unchanged form) ----------
+  CUR = 'T5 tamper';
+  console.log('\n=== T5 tamper ===');
+  m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'P5' });
+  const blob5 = Buffer.from(m.Reduce('invite').GetBinary());
+  const s5 = st(I); const rej5 = I.rejects.length;
+  await mutate(R, '::actor::qa_leg1_badbox', { invite: binv(R, blob5) });
+  await sleep(3000);
+  ok(I.rejects.slice(rej5).some((x) => /Decryption failed|crypto box|read/i.test(x)), `tampered box aborts at inviter decrypt`);
+  const s5b = st(I);
+  ok(s5b.c === s5.c && s5b.p === s5.p && s5b.pi === s5.pi, `tamper mutated NO state (contacts/peer_ads/pending unchanged)`);
+
+  // ---------- T6 cid-bind leg-2 (foreign AD) ----------
+  CUR = 'T6 cid-bind-leg2';
+  console.log('\n=== T6 cid-bind leg-2 ===');
+  m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'P6' });
+  const blob6 = Buffer.from(m.Reduce('invite').GetBinary());
+  const s6 = st(I); const rej6 = I.rejects.length;
+  await mutate(R, '::actor::qa_leg1_foreign_ad', { invite: binv(R, blob6), foreign_ad: binv(R, adBlob(F)) });
+  await sleep(3000);
+  ok(I.rejects.slice(rej6).some((x) => /does not belong to the sender/.test(x)), `leg-2 cid-bind: foreign AD (cid≠sender) aborts`);
+  ok(st(I).pi === s6.pi && st(I).c === s6.c, `leg-2 cid-bind failure consumed/registered nothing`);
+
+  // ---------- T7 PoP leg-2 (forged AD) ----------
+  CUR = 'T7 PoP-leg2';
+  console.log('\n=== T7 PoP leg-2 ===');
+  m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'P7' });
+  const blob7 = Buffer.from(m.Reduce('invite').GetBinary());
+  const s7 = st(I); const rej7 = I.rejects.length;
+  await mutate(R, '::actor::qa_leg1_forged_ad', { invite: binv(R, blob7) });
+  await sleep(3000);
+  ok(I.rejects.slice(rej7).some((x) => /authoriz|signature|process|key/i.test(x)), `leg-2 PoP: forged AD (stripped self-sig) aborts in process_address_document`);
+  ok(st(I).pi === s7.pi && st(I).c === s7.c, `leg-2 PoP failure consumed/registered nothing`);
+
+  // ---------- T8 leg-3 gates (unexpected-inviter, cid-bind, PoP) ----------
+  CUR = 'T8 leg3-gates';
+  console.log('\n=== T8 leg-3 gates ===');
+  // helper: give R a LIVE pending redemption pinned to I.cid (a fake invite I never minted)
+  async function liveRedemption() {
+    const fk = await mutate(I, '::actor::qa_mint_fake_invite', { inviter_cid: I.cid });
+    const fblob = Buffer.from(fk.Reduce('blob').GetBinary());
+    const fid = fk.Reduce('invite_id').Visualize();
+    const ac = await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, fblob), name: 'leg3' });
+    await sleep(2500); // I's leg-2 aborts (unknown invite) → no real leg-3 → R's pend stays live
+    const rpk = ac.Reduce('resp_eph_pub');
+    return { fid, rpk };
+  }
+  // T8a unexpected-inviter: a DIFFERENT sender (F) → R aborts on the inviter-cid pin
+  {
+    const { fid, rpk } = await liveRedemption();
+    const rejx = R.rejects.length; const sR = st(R);
+    await mutate(F, '::actor::qa_send_complete', { target: R.cid, invite_id: fid, resp_eph_pub: rpk, mode: 'real', foreign_ad: binv(F, adBlob(F)) });
+    await sleep(3000);
+    ok(R.rejects.slice(rejx).some((x) => /unexpected inviter/i.test(x)), `leg-3 sender-pin: completion from a non-inviter aborts`);
+    ok(st(R).c === sR.c, `leg-3 unexpected-inviter registered nothing`);
+  }
+  // T8b cid-bind leg-3: real inviter (I) sends a FOREIGN AD → R aborts cid-bind
+  {
+    const { fid, rpk } = await liveRedemption();
+    const rejx = R.rejects.length; const sR = st(R);
+    await mutate(I, '::actor::qa_send_complete', { target: R.cid, invite_id: fid, resp_eph_pub: rpk, mode: 'foreign', foreign_ad: binv(I, adBlob(F)) });
+    await sleep(3000);
+    ok(R.rejects.slice(rejx).some((x) => /does not belong to the sender/.test(x)), `leg-3 cid-bind: inviter AD (cid≠sender) aborts`);
+    ok(st(R).c === sR.c, `leg-3 cid-bind registered nothing`);
+  }
+  // T8c PoP leg-3: real inviter (I) sends a FORGED AD (cid ok) → R aborts in process_address_document
+  {
+    const { fid, rpk } = await liveRedemption();
+    const rejx = R.rejects.length; const sR = st(R);
+    await mutate(I, '::actor::qa_send_complete', { target: R.cid, invite_id: fid, resp_eph_pub: rpk, mode: 'forged', foreign_ad: binv(I, adBlob(F)) });
+    await sleep(3000);
+    ok(R.rejects.slice(rejx).some((x) => /authoriz|signature|process|key/i.test(x)), `leg-3 PoP: forged inviter AD aborts in process_address_document`);
+    ok(st(R).c === sR.c, `leg-3 PoP registered nothing`);
+  }
+
+  // ---------- T9 export-secrecy ----------
+  CUR = 'T9 export-secrecy';
+  console.log('\n=== T9 export-secrecy ===');
+  await mutate(I, '::a2a_messaging::generate_invite', { name: 'P9' }); // ensure an outstanding invite (eph secret present)
+  const exp = ro(I, '::actor::qa_export_core', undefined).Reduce('core');
+  const expStr = exp.Serialize ? Buffer.from(exp.Serialize()).toString('latin1') : '';
+  const expVis = exp.Visualize();
+  ok(!/pending_invite_keys/.test(expVis), `export_core_state has NO pending_invite_keys field`);
+  ok(!/pending_redemption_keys/.test(expVis), `export_core_state has NO pending_redemption_keys field`);
+  // the exported pending_invites entry must carry only assigned/eph_pub/scheme (public) — not a secret field
+  ok(/eph_pub|\$eph_pub/.test(expVis) || /pending_invites/.test(expVis), `export carries the public pending_invites record (eph_pub/assigned/scheme only)`);
+
+  // ---------- T2 happy-role (chain verified BOTH legs) ----------
+  CUR = 'T2 happy-role';
+  console.log('\n=== T2 happy-role ===');
+  const rA = mk('rootA'); const lA = mk('roleA'); const rB = mk('rootB'); const lB = mk('roleB');
+  await mkPacket(rA, 'eph-t-rootA-1'); await mkPacket(lA, 'eph-t-roleA-1');
+  await mkPacket(rB, 'eph-t-rootB-1'); await mkPacket(lB, 'eph-t-roleB-1');
+  await sleep(1200);
+  await setName(rA, 'RootA'); await setName(lA, 'RoleA'); await setName(rB, 'RootB'); await setName(lB, 'RoleB');
+  await delegate(rA, lA, 'RoleA'); await delegate(rB, lB, 'RoleB');
+  log('delegations done');
+  const rm = await mutate(lA, '::a2a_messaging::generate_invite', { name: 'RoleB' });
+  const rblob = Buffer.from(rm.Reduce('invite').GetBinary());
+  await mutate(lB, '::a2a_messaging::add_contact', { invite: binv(lB, rblob), name: 'PeerRoleA' });
+  await sleep(5500);
+  const sA = st(lA); const sB = st(lB);
+  log(`roleA=${JSON.stringify(sA)} roleB=${JSON.stringify(sB)}`);
+  ok(sA.c >= 1 && sA.p >= 1, `role inviter registered role responder`);
+  ok(sB.c >= 1 && sB.p >= 1, `role responder registered role inviter (receiver-side)`);
+  ok(sA.cr >= 1, `leg-2: inviter pinned responder's root linkage (contact_roots=${sA.cr})`);
+  ok(sB.cr >= 1, `leg-3: responder pinned inviter's root linkage (contact_roots=${sB.cr})`);
+
+  // ---------- T10 import migration (state round-trips; pending_invites reset) ----------
+  CUR = 'T10 migration';
+  console.log('\n=== T10 import migration ===');
+  await mutate(I, '::a2a_messaging::generate_invite', { name: 'P10' }); // leave an outstanding invite
+  const exported = ro(I, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'mig.bin'), Buffer.from(exported.Serialize()));
+  const I2 = mk('I2'); await mkPacket(I2, 'eph-t-I2-mig'); await sleep(1000);
+  const adData = I2.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'mig.bin'))));
+  await mutate(I2, '::actor::import_state', adData);
+  const s10 = st(I2);
+  ok(s10.c >= 1 && s10.p >= 1, `import restored contacts + peer_ads (c=${s10.c},peer_ads=${s10.p})`);
+  ok(s10.pi === 0, `import reset pending_invites to empty (migration §4.4) → ${s10.pi}`);
+  ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
+
+  console.log('\n================ SCORECARD ================');
+  if (scorecard.length === 0) console.log('ALL TESTS PASSED');
+  else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
+  await sleep(500);
+  process.exit(scorecard.length === 0 ? 0 : 1);
+}
+main().catch((e) => { log('DRIVER ERR:', e.stack ?? e.message); process.exit(1); });
