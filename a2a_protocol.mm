@@ -147,16 +147,18 @@ library a2a_protocol loads library
     // ---- CP->root governance attestation (§3c, core 1.8) -----------------
     // NON-enforcing visibility only — the sole monitoring gate stays the 6-digit
     // proxy-bind ceremony. cid_cp is the CP's container_id, which IS the key-
-    // derived commitment over the CP key list (P3: container_id == _value_id of
-    // the key list), so pinning cid_cp pins the CP keys and lazy resolution
-    // cannot substitute a different CP without breaking it.
+    // derived commitment over the CP's SIGN key (P3, adapt-toolkit #77:
+    // container_id == key_storage::address_of_key(sign_pub), a hash of the SIGN
+    // key alone — NOT _value_id of the whole key_list), so pinning cid_cp pins
+    // the CP's signing key and lazy resolution cannot substitute a different CP
+    // without breaking it.
     metadef cp_attestation_commitment_t: (
         $version -> int,
         $cid_cp  -> global_id
     ).
 
     // The lazily-resolved full attestation: the CP signs the ROOT's container_id
-    // (the key-derived commitment over the root key list, P3) — key material,
+    // (the key-derived commitment over the root's SIGN key, P3) — key material,
     // never a label. cp_cid pins it to the same CP as the inline commitment.
     metadef cp_attestation_core_t: (
         $version  -> int,
@@ -165,19 +167,41 @@ library a2a_protocol loads library
     ).
     metadef cp_attestation_t: ($c -> cp_attestation_core_t, $s -> crypto_signature).
 
+    // P3 (adapt-toolkit #77): container_id == key_storage::address_of_key(sign_pub)
+    // — a hash of the SIGN key alone, not _value_id of the whole key_list. This
+    // re-derives that commitment from an identity's own key material so
+    // verify_cp_attestation below stays a SELF-CONTAINED check (independent of
+    // whatever the caller already validated), mirroring address_document.mm's
+    // own "container id does not commit to signing key" check and
+    // identity_proof_document_impl.mm::validate.
+    fn _address_of_signing_key (key_list: key_utils::t_publickey(,), default_keys: key_utils::t_function->>key_utils::t_key_id) -> global_id
+    {
+        sign_key_id = default_keys $SIGN.
+        sign_pub IS publickey_sign+ = NIL.
+        sc key_list -- (k->) {
+            if _crypto_get_key_id k == sign_key_id {
+                sign_pub -> k SAFE(publickey_sign).
+                break.
+            }
+        }
+        abort "verify_cp_attestation: SIGN key not found in cp_ad key_list" WHEN sign_pub == NIL.
+        return key_storage::address_of_key sign_pub?.
+    }
+
     // Verify a resolved §3c attestation. TRUE only when the commitment binds the
-    // CP keys (cp_ad's key-derived container_id AND its key-list hash both equal
-    // cid_cp), the attestation is pinned to that same CP, it attests the ACTUAL
-    // root, and it is CP-signed. The CALLER must have run process_address_document
-    // on cp_ad first (that enforces the CP AD proof-of-possession self-sig) and
-    // must render an UNRESOLVABLE cp_ad as present-but-unverified — never call
-    // this without a resolved, PoP-checked cp_ad.
+    // CP keys (cp_ad's key-derived container_id AND its own re-derived
+    // address-of-SIGN-key both equal cid_cp), the attestation is pinned to that
+    // same CP, it attests the ACTUAL root, and it is CP-signed. The CALLER must
+    // have run process_address_document on cp_ad first (that enforces the CP AD
+    // proof-of-possession self-sig) and must render an UNRESOLVABLE cp_ad as
+    // present-but-unverified — never call this without a resolved, PoP-checked
+    // cp_ad.
     fn verify_cp_attestation (commitment: cp_attestation_commitment_t, cp_ad: address_document_types::t_address_document, att: cp_attestation_t, root_cid: global_id) -> bool
     {
         return (commitment $version) == 1
             && (att $c $version) == 1
             && (cp_ad $identity $container_id) == (commitment $cid_cp)
-            && (_value_id (cp_ad $identity $key_list)) == (commitment $cid_cp)
+            && (_address_of_signing_key (cp_ad $identity $key_list) (cp_ad $identity $default_keys)) == (commitment $cid_cp)
             && (att $c $cp_cid) == (commitment $cid_cp)
             && (att $c $root_cid) == root_cid
             && key_storage::check_signature_new_container (_value_id (att $c)) (att $s) (cp_ad $identity $key_list) == TRUE.
