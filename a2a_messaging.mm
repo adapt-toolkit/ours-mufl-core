@@ -60,8 +60,9 @@ library a2a_messaging loads libraries
     // core 3.0 ephemeral-invite redeem legs. NEW surfaces (no legacy clients), so
     // both are LIBRARY-routed — no ::actor:: shim needed, unlike the pre-migration
     // names above. leg 1 (responder->inviter) is a BARE send carrying a box; leg 3
-    // (inviter->responder) rides the encrypted channel (responder is registered by
-    // then). See submit_invite_response / complete_invite below.
+    // (inviter->responder) is ALSO a bare boxed send (NOT encrypted_channel — the
+    // box to the responder's kept ephemeral key is the confidentiality/integrity).
+    // See submit_invite_response / complete_invite below.
     submit_invite_response_tx = "::a2a_messaging::submit_invite_response".
     complete_invite_tx        = "::a2a_messaging::complete_invite".
 
