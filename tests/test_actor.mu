@@ -28,6 +28,7 @@ application actor loads libraries
     a2a_protocol,
     a2a_messaging,
     current_transaction_info,
+    protocol_container,
     version
     uses transactions
 {
@@ -171,13 +172,24 @@ application actor loads libraries
             $n_peer_ads -> (_count a2a_messaging::peer_ads),
             $n_pending_invites -> (_count a2a_messaging::pending_invites),
             $n_pending_redemptions -> (_count a2a_messaging::pending_redemptions),
-            $n_contact_roots -> (_count a2a_messaging::contact_roots)
+            $n_contact_roots -> (_count a2a_messaging::contact_roots),
+            $n_pending_restores -> (_count a2a_messaging::pending_restores),
+            $n_restore_replies -> (_count a2a_messaging::pending_restore_replies),
+            $n_deferred -> (_count a2a_messaging::deferred_msgs)
         ).
     }
 
     // export-secrecy: hand back export_core_state so the driver confirms neither
     // ephemeral secret store appears in the portable export.
     trn readonly qa_export_core _ { return ($core -> (a2a_messaging::export_core_state NIL)). }
+
+    // Simulate a breaking-change migration that carried contacts but dropped the
+    // address documents (the spec's "degraded contact" state).
+    trn qa_strip_peer_ads _
+    {
+        a2a_messaging::peer_ads -> (,).
+        return transaction::success [ _return_data ($stripped -> TRUE) ].
+    }
 
     // ---- adversarial leg-1 senders (bare-send a crafted submit_invite_response) ----
     trn qa_leg1_badbox _:($invite -> blob: bin)
@@ -215,6 +227,31 @@ application actor loads libraries
         return transaction::success [
             transaction::action::send (inv $c) ($name -> "::a2a_messaging::submit_invite_response", $targ -> ($invite_id -> (inv $d), $epk -> (kpr $public_key), $v -> (inv $v), $data -> data)),
             _return_data ($sent -> TRUE)
+        ].
+    }
+
+    // Fire a leg-0 restore request at an arbitrary target (bypassing the
+    // degraded-contact trigger) — used to prove the responder's contacts gate.
+    trn qa_send_restore_request _:($target -> tgt: global_id)
+    {
+        actions is transaction::action::type[] = a2a_messaging::begin_contact_restore tgt.
+        actions (_count actions|) -> _return_data ($ok -> TRUE).
+        return transaction::success actions.
+    }
+
+    // Craft an unsolicited leg-1 (no matching pending_restores at the target).
+    trn qa_send_fake_restore_response _:($target -> tgt: global_id)
+    {
+        scheme = _crypto_default_scheme_id().
+        kp = _crypto_construct_encryption_keypair scheme.
+        payload = _write ($junk -> "x").
+        data = _crypto_encrypt_message (kp $secret_key) (kp $public_key) payload.
+        return transaction::success [
+            transaction::action::send tgt (
+                $name -> "::a2a_messaging::submit_restore_response",
+                $targ -> ($rid -> (_new_id "fake restore"), $epk -> (kp $public_key), $v -> scheme, $data -> data)
+            ),
+            _return_data ($ok -> TRUE)
         ].
     }
 

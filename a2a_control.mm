@@ -48,6 +48,7 @@ library a2a_control loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
         target_id = a2a_messaging::resolve_contact contact_ref.
+        abort "Contact is awaiting key restore (degraded) — control messages resume once the contact is restored." when (a2a_messaging::peer_ads target_id) == NIL.
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
