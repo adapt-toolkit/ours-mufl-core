@@ -65,6 +65,21 @@ library a2a_messaging loads libraries
     // See submit_invite_response / complete_invite below.
     submit_invite_response_tx = "::a2a_messaging::submit_invite_response".
     complete_invite_tx        = "::a2a_messaging::complete_invite".
+    // contact-restore wire names (LIBRARY-routed, new surface — no ::actor:: shims).
+    request_contact_restore_tx = "::a2a_messaging::request_contact_restore".
+    submit_restore_response_tx = "::a2a_messaging::submit_restore_response".
+    complete_restore_tx        = "::a2a_messaging::complete_restore".
+
+    // Version stamp of the portable export blob (see import_core_state for the
+    // migration contract). Bump ONLY on a breaking blob-shape change, together
+    // with a migration from the previous stamp.
+    core_format_version = 1.
+    // Give up re-requesting a restore after this many attempts per contact (the
+    // host sweep re-fires on its GC cadence; a peer that upgraded and came back
+    // online answers on the first post-upgrade attempt).
+    restore_max_attempts = 30.
+    // Per-contact cap on messages queued while its keys are being restored.
+    deferred_msgs_cap = 50.
 
     // 6-digit bind ceremony limits (code is generated host-side — MUFL has no
     // random source — and handed to set_proxy_pending).
@@ -95,6 +110,22 @@ library a2a_messaging loads libraries
     // invites do not survive a restart; see the 3.0 release note).
     metadef pending_redemption_t: ($inviter_cid -> global_id, $inviter_name -> str, $custom_name -> str).
     pending_redemptions is (global_id ->> pending_redemption_t) = (,).
+    // contact-restore (spec 2026-07-01): a DEGRADED contact is derivable state —
+    // cid present in `contacts`, absent from `peer_ads` (e.g. a breaking-change
+    // migration carried the contact but dropped its address document). These
+    // stores drive the self-heal handshake; see request_contact_restore below.
+    // Requester side, keyed by the TARGET cid. Non-secret half (the eph PRIVATE
+    // key lives in the hidden pending_restore_keys, INV-4).
+    metadef pending_restore_t: ($rid -> global_id, $eph_pub -> publickey_encrypt, $scheme -> int, $attempts -> int, $created -> time).
+    pending_restores is (global_id ->> pending_restore_t) = (,).
+    // Responder side, keyed by the REQUESTER cid — at most ONE outstanding reply
+    // per requester (bounded by the contacts set; a newer request replaces it).
+    metadef restore_reply_t: ($rid -> global_id, $scheme -> int, $created -> time).
+    pending_restore_replies is (global_id ->> restore_reply_t) = (,).
+    // Messages queued toward a degraded contact, flushed (host-driven,
+    // flush_deferred) once its AD is re-established. Plain data — EXPORTED.
+    metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time).
+    deferred_msgs is (global_id ->> deferred_msg_t[]) = (,).
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -190,6 +221,13 @@ library a2a_messaging loads libraries
         // Same INV-4 treatment as pending_invite_keys: hidden AND never exported;
         // consumed with pending_redemptions[id] on the leg-3 completion.
         pending_redemption_keys is (global_id ->> secretkey_encrypt) = (,).
+
+        // contact-restore ephemeral PRIVATE keys — same INV-4 treatment as the
+        // invite stores: hidden AND never exported; consumed with their public-half
+        // records on the first valid completion. Requester side keyed by target cid,
+        // responder side keyed by requester cid.
+        pending_restore_keys is (global_id ->> secretkey_encrypt) = (,).
+        pending_restore_reply_keys is (global_id ->> secretkey_encrypt) = (,).
 
         _read_or_abort is (bin->any) = fn (_: bin) { abort "_read_or_abort is unset in a2a_messaging (call a2a_messaging::init)." when TRUE. }
 
@@ -534,6 +572,57 @@ library a2a_messaging loads libraries
         ].
     }
 
+    // ---- shared identity-bundle helpers (invite legs + contact-restore legs) ----
+    // My identity bundle payload fields: my AD plus, when I am a delegated role,
+    // my chain blobs (cert / root profile / optional §3c cp binding). The caller
+    // appends its own correlation id ($invite_id or $rid) and _write's the record.
+    fn my_identity_bundle_fields (_) -> ($ad -> address_document_types::t_address_document, $cert -> bin+, $root_profile -> bin+, $cp_binding -> bin+)
+    {
+        my_cert_blob is bin+ = NIL.
+        my_rp_blob is bin+ = NIL.
+        my_rpb_blob is bin+ = NIL.
+        if delegation_cert != NIL && root_profile != NIL
+        {
+            my_cert_blob -> (_write delegation_cert?).
+            my_rp_blob -> (_write root_profile?).
+            if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
+        }
+        return ($ad -> address_document::get_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
+    }
+
+    // Verify a received identity bundle against the authenticated sender: D8
+    // cid-bind + PoP self-sig (process_address_document aborts on a forged or
+    // inconsistent document), then the OPTIONAL delegation chain (an invalid
+    // chain aborts; a verifying §3c cp binding is STAGED in the returned record,
+    // never written here — INV-5: the CALLER performs all registration writes
+    // together after every gate has passed).
+    metadef verified_bundle_t: ($ad -> address_document_types::t_address_document, $root -> a2a_protocol::contact_root_t+, $pin_binding -> a2a_protocol::root_cp_binding_t+, $pin_binding_root -> global_id+).
+    fn verify_identity_bundle (payload: any, sender_id: global_id) -> verified_bundle_t
+    {
+        ad = (payload $ad) safe address_document_types::t_address_document.
+        abort "Address document does not belong to the sender." when (ad $identity $container_id) != sender_id.
+        address_document::process_address_document ad TRUE.
+        peer_root is a2a_protocol::contact_root_t+ = NIL.
+        pin_binding is a2a_protocol::root_cp_binding_t+ = NIL.
+        pin_binding_root is global_id+ = NIL.
+        if (payload $cert) != NIL
+        {
+            cert = (_read_or_abort ((payload $cert) safe bin)) safe a2a_protocol::delegation_cert_t.
+            rp = (_read_or_abort ((payload $root_profile) safe bin)) safe a2a_protocol::root_profile_t.
+            peer_root -> a2a_protocol::verify_peer_delegation sender_id (_value_id ad) cert rp.
+            if (payload $cp_binding) != NIL
+            {
+                binding = (_read_or_abort ((payload $cp_binding) safe bin)) safe a2a_protocol::root_cp_binding_t.
+                if a2a_protocol::verify_root_cp_binding binding (rp $p $root_cid) (rp $p $keys) == TRUE
+                {
+                    pin_binding -> binding.
+                    pin_binding_root -> (rp $p $root_cid).
+                }
+            }
+        }
+        return ($ad -> ad, $root -> peer_root, $pin_binding -> pin_binding, $pin_binding_root -> pin_binding_root).
+    }
+
     // core 3.0: mint a SLIM ephemeral-key invite assigned to `assigned` (empty
     // string = no assigned name). Reusable fn so BOTH generate_invite (user trn)
     // and the core.cluster `contact` verb (a2a_cluster, which relays the blob
@@ -613,21 +702,12 @@ library a2a_messaging loads libraries
 
         // My identity bundle: my AD plus, if I am a delegated role, my chain so the
         // inviter learns my root linkage symmetrically. All inside the box.
-        my_ad = address_document::get_my_address_document().
-        my_cert_blob is bin+ = NIL.
-        my_rp_blob is bin+ = NIL.
-        my_rpb_blob is bin+ = NIL.
-        if delegation_cert != NIL && root_profile != NIL
-        {
-            my_cert_blob -> (_write delegation_cert?).
-            my_rp_blob -> (_write root_profile?).
-            if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
-        }
+        b = my_identity_bundle_fields NIL.
         payload = _write (
-            $ad -> my_ad,
-            $cert -> my_cert_blob,
-            $root_profile -> my_rp_blob,
-            $cp_binding -> my_rpb_blob,
+            $ad -> (b $ad),
+            $cert -> (b $cert),
+            $root_profile -> (b $root_profile),
+            $cp_binding -> (b $cp_binding),
             $invite_id -> invite_id
         ).
         data = _crypto_encrypt_message (kpr $secret_key) eph_pub_inviter payload.
@@ -663,6 +743,31 @@ library a2a_messaging loads libraries
         ].
     }
 
+    // Mint (or RE-mint) a restore request toward a degraded contact: fresh
+    // ephemeral keypair + correlation id, REPLACING any outstanding attempt (the
+    // superseded eph key makes a stale leg-1 reply fail both the rid check and
+    // the unbox). Returns the bare signed send action (leg 0); #77 signs every
+    // envelope, so the receiver authenticates us from the envelope alone. The
+    // CALLER emits _save_state.
+    fn begin_contact_restore (target: global_id) -> transaction::action::type[]
+    {
+        attempts is int = 0.
+        prev = pending_restores target.
+        if prev != NIL { attempts -> (prev? $attempts). }
+        scheme = _crypto_default_scheme_id().
+        kp = _crypto_construct_encryption_keypair scheme.
+        rid = _new_id "ours restore".
+        now = (current_transaction_info::get_transaction_time())?.
+        pending_restores target -> ($rid -> rid, $eph_pub -> (kp $public_key), $scheme -> scheme, $attempts -> attempts + 1, $created -> now).
+        pending_restore_keys target -> (kp $secret_key).
+        return [
+            transaction::action::send target (
+                $name -> request_contact_restore_tx,
+                $targ -> ($rid -> rid, $epk -> (kp $public_key), $v -> scheme)
+            )
+        ].
+    }
+
     // $reply_to is optional: when set, it points at the message this one
     // replies to (its stamped wire id + an optional sentence index). Every
     // message gets a fresh stringified wire id — the stable, cross-side handle
@@ -674,6 +779,25 @@ library a2a_messaging loads libraries
         target_id = resolve_contact contact_ref.
         sent_date = (current_transaction_info::get_transaction_time())?.
         wire_id = _str (_new_id "ours message").
+
+        // DEGRADED contact (known cid, no address document — e.g. a breaking-change
+        // migration dropped peer_ads): queue the message and (re)issue a restore
+        // request instead of failing the send. flush_deferred (host-driven, fired
+        // on the $contact_restored notify) drains the queue once the peer's AD is
+        // re-established.
+        if (peer_ads target_id) == NIL
+        {
+            q is deferred_msg_t[] = [].
+            cur = deferred_msgs target_id.
+            if cur != NIL { q -> cur?. }
+            abort "Deferred queue for this contact is full (" + (_str deferred_msgs_cap) + ") — contact restore still pending." when (_count q|) >= deferred_msgs_cap.
+            q (_count q|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date).
+            deferred_msgs target_id -> q.
+            actions is transaction::action::type[] = begin_contact_restore target_id.
+            actions (_count actions|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $deferred -> TRUE, $queued -> (_count q|)).
+            actions (_count actions|) -> _save_state NIL.
+            return transaction::success actions.
+        }
 
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             actions is transaction::action::type[] = [
@@ -716,6 +840,10 @@ library a2a_messaging loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
         target_id = resolve_contact contact_ref.
+        // Files do NOT queue (bulk binary); fail fast with the real reason instead
+        // of an opaque channel error. send_message toward this contact will queue
+        // and drive the restore.
+        abort "Contact \"" + contact_ref + "\" is awaiting key restore (degraded) — retry the file after a message to it is delivered." when (peer_ads target_id) == NIL.
         sent_date = (current_transaction_info::get_transaction_time())?.
         wire_id = _str (_new_id "ours file").
         mime_s is str = "".
@@ -763,6 +891,15 @@ library a2a_messaging loads libraries
         delete contacts target_id.
         if peer_ads target_id != NIL { delete peer_ads target_id. }
         if contact_roots target_id != NIL { delete contact_roots target_id. }
+
+        // Contact-restore stores too: an orphaned deferred queue would persist in
+        // every export and, on a later RE-ADD of the same peer, the boot/GC sweep
+        // would silently deliver the stale queued messages.
+        if (deferred_msgs target_id) != NIL { delete deferred_msgs target_id. }
+        if (pending_restores target_id) != NIL { delete pending_restores target_id. }
+        if (pending_restore_keys target_id) != NIL { delete pending_restore_keys target_id. }
+        if (pending_restore_replies target_id) != NIL { delete pending_restore_replies target_id. }
+        if (pending_restore_reply_keys target_id) != NIL { delete pending_restore_reply_keys target_id. }
 
         actions is transaction::action::type[] = [].
         sc on_contact_removed ($container_id -> target_id) -- ( -> a)
@@ -1348,42 +1485,18 @@ library a2a_messaging loads libraries
         ct = (args $data) safe crypto_message.
         // box-open: aborts on tamper / wrong key BEFORE anything is consumed.
         payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_r ct).
-        responder_ad = (payload $ad) safe address_document_types::t_address_document.
 
-        // D8 cid-bind + PoP self-sig (process_address_document aborts on a forged or
-        // inconsistent document). These are the last gates before registration.
-        abort "Address document does not belong to the sender." when (responder_ad $identity $container_id) != sender_id.
-        address_document::process_address_document responder_ad TRUE.
-
-        // optional delegation chain — verified here (an invalid chain aborts the
-        // redemption); the cp-binding to pin is STAGED, not written, until the gates
-        // are fully passed (INV-5 keeps all registration writes together below).
-        responder_root is a2a_protocol::contact_root_t+ = NIL.
-        pin_binding is a2a_protocol::root_cp_binding_t+ = NIL.
-        pin_binding_root is global_id+ = NIL.
-        if (payload $cert) != NIL
-        {
-            cert = (_read_or_abort ((payload $cert) safe bin)) safe a2a_protocol::delegation_cert_t.
-            rp = (_read_or_abort ((payload $root_profile) safe bin)) safe a2a_protocol::root_profile_t.
-            responder_root -> a2a_protocol::verify_peer_delegation sender_id (_value_id responder_ad) cert rp.
-            if (payload $cp_binding) != NIL
-            {
-                binding = (_read_or_abort ((payload $cp_binding) safe bin)) safe a2a_protocol::root_cp_binding_t.
-                if a2a_protocol::verify_root_cp_binding binding (rp $p $root_cid) (rp $p $keys) == TRUE
-                {
-                    pin_binding -> binding.
-                    pin_binding_root -> (rp $p $root_cid).
-                }
-            }
-        }
+        // D8 cid-bind + PoP self-sig, then the optional delegation chain — an
+        // invalid chain or forged/inconsistent AD aborts before any write.
+        vb = verify_identity_bundle payload sender_id.
 
         // --- all gates passed: register + single-use consume (INV-5) ---
         contact_name is str = (rec?) $assigned.
         if contact_name == "" { contact_name -> (_str sender_id). }
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
-        peer_ads sender_id -> responder_ad.
-        if responder_root != NIL { contact_roots sender_id -> responder_root?. }
-        if pin_binding != NIL { contact_cp_bindings pin_binding_root? -> pin_binding?. }
+        peer_ads sender_id -> (vb $ad).
+        if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
+        if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
         delete pending_invites invite_id.
         delete pending_invite_keys invite_id.
 
@@ -1395,22 +1508,13 @@ library a2a_messaging loads libraries
         // inviter ephemeral; the responder opens it with the ephemeral private key it
         // kept. encrypted_channel resumes for all post-contact traffic, both sides
         // being registered after leg 3.
-        my_ad = address_document::get_my_address_document().
-        my_cert_blob is bin+ = NIL.
-        my_rp_blob is bin+ = NIL.
-        my_rpb_blob is bin+ = NIL.
-        if delegation_cert != NIL && root_profile != NIL
-        {
-            my_cert_blob -> (_write delegation_cert?).
-            my_rp_blob -> (_write root_profile?).
-            if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
-        }
+        b = my_identity_bundle_fields NIL.
         kpi = _crypto_construct_encryption_keypair (rec? $scheme).
         leg3_payload = _write (
-            $ad -> my_ad,
-            $cert -> my_cert_blob,
-            $root_profile -> my_rp_blob,
-            $cp_binding -> my_rpb_blob,
+            $ad -> (b $ad),
+            $cert -> (b $cert),
+            $root_profile -> (b $root_profile),
+            $cp_binding -> (b $cp_binding),
             $invite_id -> invite_id
         ).
         leg3_data = _crypto_encrypt_message (kpi $secret_key) epk_r leg3_payload.
@@ -1453,28 +1557,10 @@ library a2a_messaging loads libraries
         ct = (args $data) safe crypto_message.
         // box-open with the kept responder ephemeral private key (aborts on tamper).
         payload = _read_or_abort (_crypto_decrypt_message eph_priv_r? epk_i ct).
-        inviter_ad = (payload $ad) safe address_document_types::t_address_document.
-        abort "Address document does not belong to the sender." when (inviter_ad $identity $container_id) != sender_id.
-        address_document::process_address_document inviter_ad TRUE.
 
-        inviter_root is a2a_protocol::contact_root_t+ = NIL.
-        pin_binding is a2a_protocol::root_cp_binding_t+ = NIL.
-        pin_binding_root is global_id+ = NIL.
-        if (payload $cert) != NIL
-        {
-            cert = (_read_or_abort ((payload $cert) safe bin)) safe a2a_protocol::delegation_cert_t.
-            rp = (_read_or_abort ((payload $root_profile) safe bin)) safe a2a_protocol::root_profile_t.
-            inviter_root -> a2a_protocol::verify_peer_delegation sender_id (_value_id inviter_ad) cert rp.
-            if (payload $cp_binding) != NIL
-            {
-                binding = (_read_or_abort ((payload $cp_binding) safe bin)) safe a2a_protocol::root_cp_binding_t.
-                if a2a_protocol::verify_root_cp_binding binding (rp $p $root_cid) (rp $p $keys) == TRUE
-                {
-                    pin_binding -> binding.
-                    pin_binding_root -> (rp $p $root_cid).
-                }
-            }
-        }
+        // D8 cid-bind + PoP self-sig, then the optional delegation chain — an
+        // invalid chain or forged/inconsistent AD aborts before any write.
+        vb = verify_identity_bundle payload sender_id.
 
         // --- all gates passed: register + clear the pending redemption ---
         // name: my chosen custom name, else the inviter's invite name, else its cid.
@@ -1482,9 +1568,9 @@ library a2a_messaging loads libraries
         if contact_name == "" { contact_name -> (pend?) $inviter_name. }
         if contact_name == "" { contact_name -> (_str sender_id). }
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
-        peer_ads sender_id -> inviter_ad.
-        if inviter_root != NIL { contact_roots sender_id -> inviter_root?. }
-        if pin_binding != NIL { contact_cp_bindings pin_binding_root? -> pin_binding?. }
+        peer_ads sender_id -> (vb $ad).
+        if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
+        if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
         delete pending_redemptions invite_id.
         delete pending_redemption_keys invite_id.
 
@@ -1504,6 +1590,265 @@ library a2a_messaging loads libraries
     trn complete_invite args: any
     {
         return handle_complete_invite args.
+    }
+
+    // ==== contact restore (spec 2026-07-01): re-run the key exchange between
+    // MUTUALLY KNOWN addresses after a breaking change dropped peer_ads. Same
+    // machinery as the eph-invite legs (bundle, box-to-eph-key, INV-5 gate
+    // ordering); the trust gate is "#77-origin-verified signed request from an
+    // address already in my contacts" instead of an OOB invite token.
+
+    // LEG 0 (responder): a contact lost my address document and asks me to
+    // re-exchange keys. BARE inbound — #77 signs every envelope and rejects
+    // unsigned/forged origin, so the envelope $from IS the authenticated
+    // requester. Gate: requester ∈ contacts, else a SILENT no-op (success with
+    // no actions — no error reply, so whether an address is known never leaks).
+    // NON-DESTRUCTIVE: nothing is installed or replaced here; my stored peer_ad
+    // for the requester (possibly stale, possibly absent) is only replaced at
+    // leg 2 after its bundle verifies. At most ONE outstanding reply record per
+    // requester — a newer request replaces it (bounded by the contacts set).
+    // Accepted trade-off: a replayed/duplicate leg 0 supersedes the previous
+    // reply record, so an in-flight leg 2 for the older rid then fails its gate
+    // — transient, self-heals on the next sweep; nothing is installable by the
+    // replayer.
+    fn handle_request_contact_restore (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        if (contacts sender_id) == NIL { return transaction::success []. }
+
+        rid = (args $rid) safe global_id.
+        epk_requester = (args $epk) safe publickey_encrypt.
+        scheme = (args $v) safe int.
+        now = (current_transaction_info::get_transaction_time())?.
+
+        kpr = _crypto_construct_encryption_keypair scheme.
+        pending_restore_replies sender_id -> ($rid -> rid, $scheme -> scheme, $created -> now).
+        pending_restore_reply_keys sender_id -> (kpr $secret_key).
+
+        b = my_identity_bundle_fields NIL.
+        payload = _write (
+            $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+            $cp_binding -> (b $cp_binding), $rid -> rid
+        ).
+        data = _crypto_encrypt_message (kpr $secret_key) epk_requester payload.
+        return transaction::success [
+            transaction::action::send sender_id (
+                $name -> submit_restore_response_tx,
+                $targ -> ($rid -> rid, $epk -> (kpr $public_key), $v -> scheme, $data -> data)
+            ),
+            _save_state NIL
+        ].
+    }
+
+    trn request_contact_restore args: any
+    {
+        return handle_request_contact_restore args.
+    }
+
+    // LEG 1 (requester): the contact answered with its identity bundle boxed to
+    // my leg-0 ephemeral pubkey. Gate discipline (INV-5): pend lookup -> rid pin
+    // -> decrypt -> cid-bind -> PoP -> chain, all before any write. Single-use:
+    // the first valid leg 1 consumes BOTH pending_restores and the hidden eph
+    // key; a failed gate consumes nothing. Replies leg 2 as a BARE BOXED send —
+    // the responder may not hold MY current AD until that bundle arrives, so the
+    // encrypted channel cannot carry it (same reasoning as the invite leg 3).
+    fn handle_submit_restore_response (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        rid = (args $rid) safe global_id.
+
+        // --- gates (no state mutation until all pass) ---
+        pend = pending_restores sender_id.
+        abort "Unsolicited restore response." when pend == NIL.
+        abort "Restore response does not match the outstanding request." when rid != ((pend?) $rid).
+        eph_priv = pending_restore_keys sender_id.
+        abort "Restore ephemeral key missing (superseded or already completed)." when eph_priv == NIL.
+        abort "Restore response from a removed contact." when (contacts sender_id) == NIL.
+
+        epk_r = (args $epk) safe publickey_encrypt.
+        scheme = (args $v) safe int.
+        ct = (args $data) safe crypto_message.
+        payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_r ct).
+        abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
+        vb = verify_identity_bundle payload sender_id.
+
+        // --- all gates passed: (re)install the peer's keys + single-use consume ---
+        peer_ads sender_id -> (vb $ad).
+        if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
+        if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
+        delete pending_restores sender_id.
+        delete pending_restore_keys sender_id.
+
+        b = my_identity_bundle_fields NIL.
+        kp2 = _crypto_construct_encryption_keypair scheme.
+        leg2_payload = _write (
+            $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+            $cp_binding -> (b $cp_binding), $rid -> rid
+        ).
+        leg2_data = _crypto_encrypt_message (kp2 $secret_key) epk_r leg2_payload.
+        contact_name = ((contacts sender_id)?) $name.
+        return transaction::success [
+            transaction::action::send sender_id (
+                $name -> complete_restore_tx,
+                $targ -> ($rid -> rid, $epk -> (kp2 $public_key), $v -> scheme, $data -> leg2_data)
+            ),
+            _notify_agent ($event -> $contact_restored, $name -> contact_name, $container_id -> sender_id),
+            _save_state NIL
+        ].
+    }
+
+    trn submit_restore_response args: any
+    {
+        return handle_submit_restore_response args.
+    }
+
+    // LEG 2 (responder): the requester completed with ITS bundle boxed to my
+    // leg-1 ephemeral pubkey. Same gate discipline; only HERE do I REPLACE my
+    // stored peer_ad for the requester — required even when one is present: a
+    // #77 reseed rolls the peer a fresh ENCRYPT key, so a surviving stale AD
+    // would break my sends toward it. Single-use consume of the reply stores.
+    fn handle_complete_restore (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        rid = (args $rid) safe global_id.
+
+        // --- gates (no state mutation until all pass) ---
+        pend = pending_restore_replies sender_id.
+        abort "Unsolicited restore completion." when pend == NIL.
+        abort "Restore completion does not match the outstanding reply." when rid != ((pend?) $rid).
+        eph_priv = pending_restore_reply_keys sender_id.
+        abort "Restore reply key missing (superseded or already completed)." when eph_priv == NIL.
+        abort "Restore completion from a removed contact." when (contacts sender_id) == NIL.
+
+        epk_i = (args $epk) safe publickey_encrypt.
+        ct = (args $data) safe crypto_message.
+        payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_i ct).
+        abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
+        vb = verify_identity_bundle payload sender_id.
+
+        // --- all gates passed: replace + single-use consume ---
+        peer_ads sender_id -> (vb $ad).
+        if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
+        if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
+        delete pending_restore_replies sender_id.
+        delete pending_restore_reply_keys sender_id.
+
+        contact_name = ((contacts sender_id)?) $name.
+        return transaction::success [
+            _notify_agent ($event -> $contact_restored, $name -> contact_name, $container_id -> sender_id),
+            _save_state NIL
+        ].
+    }
+
+    trn complete_restore args: any
+    {
+        return handle_complete_restore args.
+    }
+
+    metadef degraded_contact_t: ($container_id -> global_id, $name -> str, $attempts -> int, $queued -> int).
+    metadef deferred_queue_info_t: ($container_id -> global_id, $name -> str, $queued -> int, $degraded -> bool).
+
+    // Degraded contacts (known cid, no AD) with their restore-attempt counts and
+    // queued-message counts — the host's boot/GC sweep + list_contacts marker.
+    trn readonly list_degraded_contacts _
+    {
+        out is degraded_contact_t[] = [].
+        sc contacts -- (cid -> c) ?? (peer_ads cid) == NIL
+        {
+            att is int = 0.
+            pr = pending_restores cid.
+            if pr != NIL { att -> ((pr?) $attempts). }
+            nq is int = 0.
+            dq = deferred_msgs cid.
+            if dq != NIL { nq -> (_count dq?|). }
+            out (_count out|) -> ($container_id -> cid, $name -> (c $name), $attempts -> att, $queued -> nq).
+        }
+        return ($degraded -> out).
+    }
+
+    // Every non-empty deferred queue + whether its contact is still degraded —
+    // lets the host flush queues whose contact healed without a notify (e.g. a
+    // daemon restart between restore and flush).
+    trn readonly list_deferred_queues _
+    {
+        out is deferred_queue_info_t[] = [].
+        sc deferred_msgs -- (cid -> q) ?? (_count q|) > 0
+        {
+            nm is str = "".
+            c = contacts cid.
+            if c != NIL { nm -> ((c?) $name). }
+            out (_count out|) -> ($container_id -> cid, $name -> nm, $queued -> (_count q|), $degraded -> ((peer_ads cid) == NIL)).
+        }
+        return ($queues -> out).
+    }
+
+    // Host-fired sweep (boot + GC cadence): (re)issue a restore request for every
+    // degraded contact, up to restore_max_attempts each. A peer that is offline
+    // or not yet running a restore-capable version simply never answers — the
+    // sweep retries on the host's cadence; no reply is a normal condition.
+    trn restore_degraded_contacts _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        actions is transaction::action::type[] = [].
+        requested is int = 0.
+        exhausted is int = 0.
+        sc contacts -- (cid -> c) ?? (peer_ads cid) == NIL
+        {
+            prev = pending_restores cid.
+            if prev != NIL && ((prev?) $attempts) >= restore_max_attempts
+            {
+                exhausted -> exhausted + 1.
+            }
+            else
+            {
+                sc begin_contact_restore cid -- ( -> a) { actions (_count actions|) -> a. }
+                requested -> requested + 1.
+            }
+        }
+        actions (_count actions|) -> _return_data ($requested -> requested, $exhausted -> exhausted).
+        if requested > 0 { actions (_count actions|) -> _save_state NIL. }
+        return transaction::success actions.
+    }
+
+    // Drain the deferred queue toward a contact whose AD is re-established.
+    // HOST-DRIVEN (fired on the $contact_restored notify + the boot/GC sweep) so
+    // the encrypted sends never race the restore legs' bare sends on the wire —
+    // the host round-trip guarantees leg 2 delivery precedes the flush.
+    // Idempotent: an empty or still-degraded queue is a no-op result, not an error.
+    trn flush_deferred _:($contact -> contact_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        target_id = resolve_contact contact_ref.
+        q = deferred_msgs target_id.
+        if q == NIL || (_count q?|) == 0 { return transaction::success [ _return_data ($flushed -> 0) ]. }
+        if (peer_ads target_id) == NIL { return transaction::success [ _return_data ($flushed -> 0, $degraded -> TRUE) ]. }
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            actions is transaction::action::type[] = [].
+            sc q? -- ( -> m)
+            {
+                actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
+                    $name -> receive_message_tx,
+                    $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to))
+                ).
+                sc on_message_sent ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
+                {
+                    actions (_count actions|) -> a.
+                }
+                sc monitor_copy_actions "out" target_id (m $date) (m $text) -- ( -> a)
+                {
+                    actions (_count actions|) -> a.
+                }
+            }
+            n = _count q?|.
+            delete deferred_msgs target_id.
+            actions (_count actions|) -> _return_data ($flushed -> n).
+            actions (_count actions|) -> _save_state NIL.
+            return transaction::success actions.
+        }).
     }
 
     // Validation + contact resolution only; STORAGE is the app's, through the
@@ -1641,12 +1986,30 @@ library a2a_messaging loads libraries
             $managed_roots    -> managed_roots,
             $proxy_pending    -> proxy_pending,
             $monitoring_proxy -> monitoring_proxy,
-            $app_config       -> app_config
+            $app_config       -> app_config,
+            $format_version  -> core_format_version,
+            $deferred_msgs   -> deferred_msgs
         ).
     }
 
     fn import_core_state (data: any) -> nil
     {
+        // ---- format stamp + THE MIGRATION CONTRACT -------------------------------
+        // Absent stamp == version 0 (every pre-stamp blob); all shipped migrations so
+        // far are additive/field-optional, so 0 imports through the optional reads
+        // below. The stamp exists so a future BREAKING blob change dispatches on an
+        // explicit key instead of shape-sniffing. CONTRACT (binding on every future
+        // format bump): a migration from version N MUST carry forward `contacts`,
+        // `my_name`, `my_bio`, `my_persona` (and SHOULD carry contact_roots and the
+        // consumer app's inbox/files); `peer_ads` is BEST-EFFORT — when a crypto/AD
+        // change makes old documents unusable, DROP them: each dropped peer becomes a
+        // degraded contact (contacts entry, no peer_ads entry) and self-heals through
+        // request_contact_restore. NEVER let an incompatible optional field abort the
+        // whole import — degrade, don't reset.
+        fmt is int = 0.
+        if (data $format_version) != NIL { fmt -> (data $format_version) safe int. }
+        abort "State blob format_version " + (_str fmt) + " is newer than this code (supports up to " + (_str core_format_version) + ") — upgrade the software before importing." when fmt > core_format_version.
+
         // The original schema's fields are required; everything that arrived
         // with a later schema is optional and defaults stay in place when
         // absent (the whole point of code-independent state is that an old
@@ -1664,6 +2027,11 @@ library a2a_messaging loads libraries
         // here. Net: outstanding invites/redemptions are transient — they do not
         // survive export/import or a daemon restart, fail-closed (plan §4.4).
         pending_invites -> (,).
+        // Restore handshake state is transient exactly like pending_invites: the eph
+        // PRIVATE halves are hidden + never exported, so imported records would be
+        // unanswerable. The boot sweep (restore_degraded_contacts) re-mints them.
+        pending_restores -> (,).
+        pending_restore_replies -> (,).
         peer_ads        -> (data $peer_ads) safe (global_id ->> address_document_types::t_address_document).
 
         if (data $my_bio) != NIL
@@ -1718,6 +2086,10 @@ library a2a_messaging loads libraries
         if (data $app_config) != NIL
         {
             app_config -> (data $app_config) safe str.
+        }
+        if (data $deferred_msgs) != NIL
+        {
+            deferred_msgs -> (data $deferred_msgs) safe (global_id ->> deferred_msg_t[]).
         }
 
         // Re-register every peer's keys so encrypted channels keep working after

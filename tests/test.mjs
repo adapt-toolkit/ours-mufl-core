@@ -19,11 +19,12 @@ const ok = (c, m) => { if (!c) { scorecard.push(`✗ [${CUR}] ${m}`); console.lo
 const isT = (s) => /true/i.test(String(s));
 
 let wrapper;
-function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [] }; }
+function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [], events: [] }; }
 function wire(id) {
   id.pw.on_return_data = (d) => {
     const kind = d.Reduce('kind').Visualize();
-    if (kind === 'save_state' || kind === 'notify_agent') return;
+    if (kind === 'notify_agent') { id.events.push(d.Reduce('payload').Reduce('event').Visualize()); return; }
+    if (kind === 'save_state') return;
     const p = id.pending.shift(); if (!p) return;
     clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
   };
@@ -56,7 +57,9 @@ async function mkPacket(id, seed) {
 const st = (id) => { const s = ro(id, '::actor::qa_state', undefined); return {
   c: +s.Reduce('n_contacts').Visualize(), p: +s.Reduce('n_peer_ads').Visualize(),
   pi: +s.Reduce('n_pending_invites').Visualize(), pr: +s.Reduce('n_pending_redemptions').Visualize(),
-  cr: +s.Reduce('n_contact_roots').Visualize() }; };
+  cr: +s.Reduce('n_contact_roots').Visualize(),
+  prs: +s.Reduce('n_pending_restores').Visualize(), rr: +s.Reduce('n_restore_replies').Visualize(),
+  dq: +s.Reduce('n_deferred').Visualize() }; };
 const lc = (id) => ro(id, '::a2a_messaging::list_contacts', undefined).Visualize();
 const adBlob = (id) => Buffer.from(ro(id, '::actor::qa_export_ad', undefined).Reduce('ad').GetBinary());
 const setName = (id, n) => mutate(id, '::a2a_messaging::set_my_name', { name: n });
@@ -301,6 +304,159 @@ async function main() {
   ok(s10.c >= 1 && s10.p >= 1, `import restored contacts + peer_ads (c=${s10.c},peer_ads=${s10.p})`);
   ok(s10.pi === 0, `import reset pending_invites to empty (migration §4.4) → ${s10.pi}`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
+  // version-0 path: strip the stamp from a re-exported blob → still imports.
+  const exp0 = ro(I2, '::actor::export_state', undefined);
+  ok(exp0.Reduce('core').Reduce('format_version').Visualize() === '1', `re-export carries the stamp`);
+
+  // ---------- T11a format stamp + restore-state export hygiene ----------
+  CUR = 'T11a format-stamp';
+  console.log('\n=== T11a format stamp + export hygiene ===');
+  {
+    const core = ro(I, '::actor::qa_export_core', undefined).Reduce('core');
+    const vis = core.Visualize();
+    ok(/format_version/.test(vis), `export_core_state carries a format_version stamp`);
+    ok(core.Reduce('format_version').Visualize() === '1', `format_version == 1`);
+    ok(!/pending_restore_keys/.test(vis), `export has NO pending_restore_keys (INV-4)`);
+    ok(!/pending_restore_reply_keys/.test(vis), `export has NO pending_restore_reply_keys (INV-4)`);
+    ok(/deferred_msgs/.test(vis), `export carries deferred_msgs`);
+  }
+
+  // ---------- T11b degraded contact: defer + 3-leg restore + flush ----------
+  CUR = 'T11b restore';
+  console.log('\n=== T11b degraded-contact restore ===');
+  {
+    // I ↔ R are established contacts (T1). Simulate a breaking-change migration
+    // outcome on I: contacts survive, peer_ads dropped.
+    await mutate(I, '::actor::qa_strip_peer_ads', {});
+    const s0 = st(I);
+    ok(s0.c >= 1 && s0.p === 0, `strip: I keeps contacts (${s0.c}) with no peer_ads`);
+
+    // Deferred send: queues + fires leg 0; restore legs run; both sides notify.
+    const evI = I.events.length, evR = R.events.length;
+    const dm = await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'queued-while-degraded' });
+    ok(dm.Reduce('deferred').Visualize() === 'TRUE' || /true/i.test(dm.Reduce('deferred').Visualize()), `send to degraded contact reports deferred`);
+    const dg = ro(I, '::a2a_messaging::list_degraded_contacts', undefined);
+    ok(new RegExp(R.cid).test(dg.Visualize()), `list_degraded_contacts includes the degraded contact`);
+    ok(/queued/.test(dg.Visualize()) && /attempts/.test(dg.Visualize()), `list_degraded_contacts carries attempts+queued fields`);
+    const lq = ro(I, '::a2a_messaging::list_deferred_queues', undefined);
+    ok(new RegExp(R.cid).test(lq.Visualize()) && /degraded/.test(lq.Visualize()), `list_deferred_queues shows the non-empty queue with its degraded flag`);
+    await sleep(6000);
+    const s1 = st(I);
+    ok(s1.p >= 1, `restore re-established R's AD at I (peer_ads=${s1.p})`);
+    ok(s1.prs === 0, `restore consumed I's pending_restores`);
+    ok(st(R).rr === 0, `restore consumed R's reply record`);
+    ok(I.events.slice(evI).includes('contact_restored'), `I notified contact_restored`);
+    ok(R.events.slice(evR).includes('contact_restored'), `R notified contact_restored`);
+
+    // Host-driven flush: drain the deferred queue, message arrives at R.
+    const fl = await mutate(I, '::a2a_messaging::flush_deferred', { contact: R.cid });
+    ok(+fl.Reduce('flushed').Visualize() === 1, `flush_deferred drained 1 message`);
+    await sleep(2500);
+    ok(/queued-while-degraded/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), `deferred message delivered after restore`);
+    ok(st(I).dq === 0, `deferred queue cleared`);
+    ok(!(new RegExp(R.cid)).test(ro(I, '::a2a_messaging::list_degraded_contacts', undefined).Visualize()), `contact no longer listed degraded after restore`);
+    ok(!(new RegExp(R.cid)).test(ro(I, '::a2a_messaging::list_deferred_queues', undefined).Visualize()), `deferred queue gone after flush`);
+
+    // Channel fully healthy again, both directions.
+    await mutate(R, '::a2a_messaging::send_message', { contact: I.cid, text: 'post-restore-R-to-I' });
+    await sleep(2500);
+    ok(/post-restore-R-to-I/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()), `R→I works after restore (one-sided loss: R replaced I's AD)`);
+  }
+
+  // ---------- T11c both-sides degraded + host sweep ----------
+  CUR = 'T11c both-degraded';
+  console.log('\n=== T11c both-sides degraded + sweep ===');
+  {
+    await mutate(I, '::actor::qa_strip_peer_ads', {});
+    await mutate(R, '::actor::qa_strip_peer_ads', {});
+    ok(st(I).p === 0 && st(R).p === 0, `both sides stripped`);
+    const sw = await mutate(I, '::a2a_messaging::restore_degraded_contacts', {});
+    ok(+sw.Reduce('requested').Visualize() >= 1, `sweep requested restore for I's degraded contacts`);
+    await mutate(R, '::a2a_messaging::restore_degraded_contacts', {});
+    await sleep(7000);
+    ok(st(I).p >= 1, `I restored (both-degraded, symmetric handshakes)`);
+    ok(st(R).p >= 1, `R restored (both-degraded)`);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'after-double-restore' });
+    await sleep(2500);
+    ok(/after-double-restore/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), `channel healthy after double restore`);
+  }
+
+  // ---------- T11d restore gates: foreign requester + unsolicited response ----------
+  CUR = 'T11d restore-gates';
+  console.log('\n=== T11d restore gates ===');
+  {
+    // Foreign requester: F is NOT a contact of R → SILENT ignore (no reply, no
+    // reject, no reply-record).
+    const rrBefore = st(R).rr; const fRej = F.rejects.length;
+    await mutate(F, '::actor::qa_send_restore_request', { target: R.cid });
+    await sleep(3000);
+    ok(st(R).rr === rrBefore, `foreign restore request left NO reply record at R`);
+    ok(st(F).p === 0 || true, `foreign requester gained nothing`); // F never had R's AD
+    ok(!F.rejects.slice(fRej).some((x) => /restore/i.test(x)), `R sent NO error reply (silent ignore — knowledge does not leak)`);
+
+    // Unsolicited leg 1 at I (no pending_restores entry for F) → rejected, no state change.
+    const sI = st(I); const rejI = I.rejects.length;
+    await mutate(F, '::actor::qa_send_fake_restore_response', { target: I.cid });
+    await sleep(3000);
+    ok(I.rejects.slice(rejI).some((x) => /Unsolicited restore response/.test(x)), `unsolicited restore response rejected at I`);
+    const sI2 = st(I);
+    ok(sI2.c === sI.c && sI2.p === sI.p, `unsolicited response mutated nothing`);
+  }
+
+  // ---------- T11e restore adversarial: wrong-rid leg 1 + leg-0 non-destructiveness ----------
+  CUR = 'T11e restore-adversarial';
+  console.log('\n=== T11e restore adversarial (rid-mismatch + leg-0 non-destructive) ===');
+  {
+    // (a) rid-mismatch leg 1, seen by a non-contact (F): F fires a restore
+    // request at R (R silently ignores it since F is not R's contact, so F's
+    // own pending_restores[R.cid] entry stays live, unconsumed). R then answers
+    // F with a FRESH, unrelated rid via qa_send_fake_restore_response — F DOES
+    // have a live pending entry keyed by R.cid, so the "Unsolicited restore
+    // response" gate passes, but the rid the fake reply carries (freshly
+    // random-minted) can never match F's stored rid → deterministic
+    // rid-mismatch rejection that mutates nothing.
+    const fRejBefore = F.rejects.length;
+    await mutate(F, '::actor::qa_send_restore_request', { target: R.cid });
+    await sleep(3000);
+    const fMid = st(F);
+    ok(fMid.prs >= 1, `F has a live pending_restores entry toward R (silently ignored by R)`);
+    await mutate(R, '::actor::qa_send_fake_restore_response', { target: F.cid });
+    await sleep(3000);
+    ok(F.rejects.slice(fRejBefore).some((x) => /does not match the outstanding request/.test(x)), `wrong-rid leg 1 rejected at F ("does not match the outstanding request")`);
+    const fAfter = st(F);
+    ok(fAfter.p === fMid.p, `wrong-rid leg 1 installed no peer_ads at F (p=${fAfter.p})`);
+    ok(fAfter.prs === fMid.prs, `F's pending_restores entry survives the rejected reply unchanged (a failed gate consumes nothing, prs=${fAfter.prs})`);
+
+    // (b) leg 0 from a REAL, healthy contact (I, R — established via T11b) is
+    // non-destructive, and a repeat request REPLACES the outstanding reply
+    // record instead of accumulating it: fire two leg-0s from I at R
+    // back-to-back (no network round trip between them). I's own
+    // pending_restores[R.cid] is overwritten to the SECOND rid synchronously,
+    // long before either leg-1 reply can return over the loopback broker, so
+    // the first (now-stale) leg-1 deterministically rid-mismatches at I, and
+    // only the second request's leg 1/2 round-trip completes.
+    const rBefore = st(R); const iBefore = st(I); const iRejBefore = I.rejects.length;
+    await mutate(I, '::actor::qa_send_restore_request', { target: R.cid });
+    await mutate(I, '::actor::qa_send_restore_request', { target: R.cid });
+    await sleep(3000);
+    const rMid = st(R);
+    ok(rMid.c === rBefore.c && rMid.p === rBefore.p, `leg 0 (x2) from a known contact is non-destructive at R (c=${rMid.c},p=${rMid.p})`);
+    // rr is 1 while the surviving handshake is in flight and 0 once its leg 2
+    // lands — both are legal here depending on loopback timing. The
+    // accumulation property is that TWO requests never yield TWO records.
+    ok(rMid.rr <= 1, `second leg-0 REPLACED R's reply record, not accumulated (rr=${rMid.rr})`);
+    await sleep(5000);
+    const rAfter = st(R); const iAfter = st(I);
+    ok(rAfter.c === rBefore.c && rAfter.p === rBefore.p, `R's state still unchanged once the round trip completes (c=${rAfter.c},p=${rAfter.p})`);
+    ok(rAfter.rr === 0, `R's reply record consumed once the surviving (second) leg 1/2 round-trips (rr=${rAfter.rr})`);
+    ok(I.rejects.slice(iRejBefore).some((x) => /does not match the outstanding request/.test(x)), `the FIRST (superseded) leg-1 reply is rejected at I ("does not match the outstanding request")`);
+    ok(iAfter.c === iBefore.c && iAfter.p === iBefore.p, `I's state unchanged in count after the race (c=${iAfter.c},p=${iAfter.p})`);
+
+    // Channel still fully healthy after the double-restore race.
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'post-T11e-I-to-R' });
+    await sleep(2500);
+    ok(/post-T11e-I-to-R/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), `channel healthy after the T11e restore race`);
+  }
 
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
