@@ -351,6 +351,41 @@ async function main() {
   ok(new RegExp(nbob.cid).test(n2s), `sender_cid recorded from the signed envelope`);
   ok(/push\.example/.test(n2s.split('notif_log')[1] || ''), `hook received the recipient's current bindings`);
 
+  // ---------- N3 token rejection matrix + E9 (zero state change each) ----------
+  CUR = 'N3-rejections';
+  console.log('\n=== N3 rejection matrix ===');
+  for (const mode of ['flip_recipient', 'fake_token_id', 'foreign_service', 'flip_scope']) {
+    const before = nst(nsvc);
+    await mutate(nbob, '::actor::qa_post_tampered', { address: binv(nbob, naddr), mode });
+    await sleep(2000);
+    ok(nst(nsvc) === before, `tampered post (${mode}) aborts with zero state change`);
+  }
+  // E9: eve IS a contact of alice but neither pending nor her registered service.
+  const neve = mk('neve'); await mkPacket(neve, 'seed-neve'); await sleep(1000);
+  {
+    const im = await mutate(alice, '::a2a_messaging::generate_invite', { name: 'Eve' });
+    const iblob = Buffer.from(im.Reduce('invite').GetBinary());
+    await mutate(neve, '::a2a_messaging::add_contact', { invite: binv(neve, iblob), name: 'alice-target' });
+    await sleep(5000);
+  }
+  const aBefore = nst(alice);
+  const aRejx = alice.rejects.length;
+  await mutate(neve, '::actor::qa_send_fake_confirm', { target: alice.cid });
+  await sleep(2500);
+  ok(nst(alice) === aBefore && !/EVIL_VAPID/.test(nst(alice)), `unsolicited confirm_registration plants nothing (E9)`);
+  ok(alice.rejects.slice(aRejx).some((x) => /[Uu]nsolicited/.test(x)), `unsolicited confirm was rejected with the E9 abort`);
+
+  // ---------- N8 oversize payload (sender side + service side) ----------
+  CUR = 'N8-oversize';
+  console.log('\n=== N8 oversize payload ===');
+  const n8Before = nst(nsvc);
+  const senderErr = await mutate(nbob, '::a2a_notifications::send_notification',
+    { address: binv(nbob, naddr), payload: 'x'.repeat(4001) }).then(() => null, (e) => e.message);
+  ok(senderErr !== null && /exceeds/.test(senderErr), `sender-side oversize payload aborts locally (${(senderErr || '').split('\n')[0]})`);
+  await mutate(nbob, '::actor::qa_post_tampered', { address: binv(nbob, naddr), mode: 'oversize' });
+  await sleep(2000);
+  ok(nst(nsvc) === n8Before, `service-side oversize post aborts with zero state change`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

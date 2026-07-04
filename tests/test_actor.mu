@@ -267,6 +267,93 @@ application actor loads libraries
         ].
     }
 
+    // ---- adversarial notification senders (N3/N8) ----
+    // Emit the SAME bare send send_notification emits, with a corrupted artifact.
+    // modes: flip_recipient (different $recipient_cid, old $s — dies on the index
+    // match), fake_token_id (dies on the index lookup), foreign_service (dies on
+    // the minted-by-me check), flip_scope ($scope flipped, id/recipient intact —
+    // dies ONLY on the _value_id byte-equality), oversize (valid token, 4096-char
+    // payload — dies on the service-side cap).
+    trn qa_post_tampered _:($address -> blob: bin, $mode -> mode: str)
+    {
+        addr = (_read_or_abort blob) safe a2a_notifications::notify_address_t.
+        token is a2a_notifications::notify_token_t = addr $token.
+        old = token $c.
+        payload is str = "tampered".
+        if mode == "flip_recipient"
+        {
+            core is a2a_notifications::notify_token_core_t = (
+                $version -> (old $version), $service_cid -> (old $service_cid),
+                $recipient_cid -> _get_container_id(),
+                $token_id -> (old $token_id), $scope -> (old $scope), $iat -> (old $iat)
+            ).
+            token -> ($c -> core, $s -> (token $s)).
+        }
+        if mode == "fake_token_id"
+        {
+            core is a2a_notifications::notify_token_core_t = (
+                $version -> (old $version), $service_cid -> (old $service_cid),
+                $recipient_cid -> (old $recipient_cid),
+                $token_id -> _new_id "qa fake token id", $scope -> (old $scope), $iat -> (old $iat)
+            ).
+            token -> ($c -> core, $s -> (token $s)).
+        }
+        if mode == "foreign_service"
+        {
+            core is a2a_notifications::notify_token_core_t = (
+                $version -> (old $version), $service_cid -> _get_container_id(),
+                $recipient_cid -> (old $recipient_cid),
+                $token_id -> (old $token_id), $scope -> (old $scope), $iat -> (old $iat)
+            ).
+            token -> ($c -> core, $s -> (token $s)).
+        }
+        if mode == "flip_scope"
+        {
+            core is a2a_notifications::notify_token_core_t = (
+                $version -> (old $version), $service_cid -> (old $service_cid),
+                $recipient_cid -> (old $recipient_cid),
+                $token_id -> (old $token_id), $scope -> "evil", $iat -> (old $iat)
+            ).
+            token -> ($c -> core, $s -> (token $s)).
+        }
+        if mode == "oversize"
+        {
+            big is str = "x".
+            big -> big + big. big -> big + big. big -> big + big. big -> big + big.
+            big -> big + big. big -> big + big. big -> big + big. big -> big + big.
+            big -> big + big. big -> big + big. big -> big + big. big -> big + big.
+            payload -> big.   // 4096 chars > payload_max_bytes
+        }
+        return transaction::success [
+            transaction::action::send (addr $service_cid) (
+                $name -> "::a2a_notifications::post_notification",
+                $targ -> ($token -> token, $payload -> payload, $wire_id -> "qa-tamper")
+            ),
+            _return_data ($sent -> TRUE)
+        ].
+    }
+
+    // E9: a well-formed confirm_registration over a REAL channel, from a contact
+    // that is neither a pending nor a registered service of the target.
+    trn qa_send_fake_confirm _:($target -> target: global_id)
+    {
+        core is a2a_notifications::notify_token_core_t = (
+            $version -> 1, $service_cid -> _get_container_id(), $recipient_cid -> target,
+            $token_id -> _new_id "qa fake confirm token", $scope -> "",
+            $iat -> (current_transaction_info::get_transaction_time())?
+        ).
+        token is a2a_notifications::notify_token_t = ($c -> core, $s -> key_storage::default_sign (_value_id core)).
+        return encrypted_channel::execute_transaction target (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target (
+                    $name -> "::a2a_notifications::confirm_registration",
+                    $targ -> ($token -> token, $vapid_pub -> "EVIL_VAPID", $bindings -> NIL)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
     // ---- leg-3 isolation helpers ----
     // A fake invite carrying a chosen inviter cid; the named cid never minted it, so
     // its leg-2 aborts (unknown invite) and sends no real leg-3 — leaving the
