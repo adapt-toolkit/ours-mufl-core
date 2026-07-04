@@ -337,6 +337,20 @@ async function main() {
   ok(/push\.example/.test(nst(nsvc)), `service registration carries the replaced bindings`);
   ok(/push\.example/.test(nst(alice)), `client copy re-confirmed with the bindings`);
 
+  // ---------- N2 post happy path (bare signed send from a NON-contact) ----------
+  CUR = 'N2-post';
+  console.log('\n=== N2 post happy path ===');
+  const nbob = mk('nbob'); await mkPacket(nbob, 'seed-nbob'); await sleep(1000); // NEVER a contact of nsvc
+  const naddr = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                              { service: 'svc' }).Reduce('blob').GetBinary());
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, naddr), payload: 'hello, wake up' });
+  await sleep(2500);
+  const n2s = nst(nsvc);
+  ok(/hello, wake up/.test(n2s), `service hook received the payload`);
+  ok(new RegExp(nbob.cid).test(n2s), `sender_cid recorded from the signed envelope`);
+  ok(/push\.example/.test(n2s.split('notif_log')[1] || ''), `hook received the recipient's current bindings`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

@@ -260,6 +260,52 @@ library a2a_notifications loads libraries
         }).
     }
 
+    // Export the handout blob for my registration with a service ("to notify
+    // me: this service, this token"). Distribution is out of protocol — it
+    // rides ordinary send_message/send_file.
+    trn readonly export_notify_address _:($service -> service_ref: str)
+    {
+        target_id = a2a_messaging::resolve_contact service_ref.
+        reg = my_notify_registrations target_id.
+        abort "No notification registration with that service." when reg == NIL.
+        addr is notify_address_t = (
+            $version      -> 1,
+            $service_cid  -> (reg? $service_cid),
+            $service_name -> (reg? $service_name),
+            $token        -> (reg? $token)
+        ).
+        return ($blob -> (_write addr), $service_cid -> (_str (reg? $service_cid))).
+    }
+
+    // THE parallel of send_message, against a handout instead of a contact:
+    // parse the blob, stamp a wire_id from the shared _new_id namespace, and
+    // emit ONE BARE signed send of post_notification to the blob's service —
+    // deliberately NOT send_encrypted_tx (the sender never has a channel with
+    // the service; the token is the sole authorization) and deliberately NO
+    // monitoring copy (D-4: the forced-monitoring contract covers messages;
+    // notifications are wake-up signals). Fire-and-forget: no response leg.
+    trn send_notification _:($address -> address_blob: bin, $payload -> payload: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        addr = (_read_or_abort address_blob) safe notify_address_t.
+        abort "Unsupported notify address version." when (addr $version) != 1.
+        abort "Notification payload exceeds " + (_str payload_max_bytes) + " bytes." when (_strlen payload) > payload_max_bytes.
+
+        wire_id = _str (_new_id "ours notification").
+        return transaction::success [
+            transaction::action::send (addr $service_cid) (
+                $name -> post_notification_tx,
+                $targ -> (
+                    $token   -> (addr $token),
+                    $payload -> payload,
+                    $wire_id -> wire_id
+                )
+            ),
+            _return_data ($sent_to -> (addr $service_cid), $wire_id -> wire_id)
+        ].
+    }
+
     // ---- service transactions -------------------------------------------------
 
     // Host-fired at daemon boot: the VAPID PUBLIC key echoed in every confirm
@@ -387,10 +433,61 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: the notification ingest. The ONE inbound that accepts a
+    // BARE signed send (origin external, NO check_encrypted_or_abort — locked
+    // §0.2): the sender is typically a packet this service never met, and the
+    // token is the sole authorization. Validation order matters (abort on first
+    // failure, mutate nothing):
+    //   1. parse-safe + version   2. minted by THIS service   3. live index
+    //   entry matching $recipient_cid (rotation/unregister deletes entries, so
+    //   revocation is a state lookup)   4. byte-equality vs the STORED token
+    //   (_value_id) — forging any field, $scope included, requires possessing
+    //   the exact minted artifact; no signature re-verification is needed
+    //   because we compare against what we ourselves stored   5. payload cap.
+    // $sender_cid is the wrapper-verified envelope $from — informational only
+    // (E14), never authorization. Fire-and-forget: no reply leg.
+    fn handle_post_notification (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+
+        token = (args $token) safe notify_token_t.
+        abort "Unsupported notify token version." when (token $c $version) != 1.
+        abort "Token was not minted by this service." when (token $c $service_cid) != _get_container_id().
+        indexed = notify_token_index (token $c $token_id).
+        abort "Unknown or revoked notification token." when indexed == NIL.
+        abort "Token recipient does not match its index entry." when indexed? != (token $c $recipient_cid).
+        reg = notify_registrations (token $c $recipient_cid).
+        abort "No registration for the token's recipient." when reg == NIL.
+        abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id (reg? $token)).
+
+        payload = (args $payload) safe str.
+        abort "Notification payload exceeds " + (_str payload_max_bytes) + " bytes." when (_strlen payload) > payload_max_bytes.
+
+        wire_id is str = "".
+        if (args $wire_id) != NIL { wire_id -> (args $wire_id) safe str. }
+
+        notification is notification_t = (
+            $version       -> 1,
+            $notif_id      -> _str (_new_id "ours notif"),
+            $wire_id       -> wire_id,
+            $recipient_cid -> (token $c $recipient_cid),
+            $sender_cid    -> sender_id,
+            $payload       -> payload,
+            $date          -> (current_transaction_info::get_transaction_time())?
+        ).
+        return transaction::success (on_notification_posted (
+            $notification -> notification,
+            $bindings     -> (reg? $bindings)
+        )).
+    }
+
     // Inbound trn stubs (declared AFTER their handlers — define-before-use).
     trn register args: any { return handle_register args. }
     trn update_bindings args: any { return handle_update_bindings args. }
     trn confirm_registration args: any { return handle_confirm_registration args. }
+    trn post_notification args: any { return handle_post_notification args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state composes these with
