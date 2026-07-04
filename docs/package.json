@@ -1,0 +1,13 @@
+{
+  "name": "ours-mufl-core-docs",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "docs:dev": "vitepress dev .",
+    "docs:build": "vitepress build .",
+    "docs:check": "node scripts/check-citations.mjs && node scripts/check-denylist.mjs"
+  },
+  "devDependencies": {
+    "vitepress": "^1.6.0"
+  }
+}
