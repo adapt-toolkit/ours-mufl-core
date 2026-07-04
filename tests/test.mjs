@@ -446,6 +446,39 @@ async function main() {
     .then(() => null, (e) => e.message);
   ok(n6err !== null && /[Uu]nknown contact|[Nn]o notification registration/.test(n6err), `mark_read without a registration aborts locally`);
 
+  // ---------- N7 export/import round-trip (both halves; no secrets) ----------
+  CUR = 'N7-export-import';
+  console.log('\n=== N7 export/import ===');
+  const svcExpVis = ro(nsvc, '::actor::export_state', undefined).Visualize();
+  ok(/notify/.test(svcExpVis) && /recipient_cid/.test(svcExpVis), `service export composes the notify half (registrations present)`);
+  ok(!/secretkey/i.test(svcExpVis) && !/VAPID_PRIV/.test(svcExpVis), `service export carries no secret material`);
+  ok(/VAPID_PUB_TEST/.test(svcExpVis), `service export carries the PUBLIC vapid key`);
+  const aliceExpVis = ro(alice, '::actor::export_state', undefined).Visualize();
+  ok(/VAPID_PUB_TEST/.test(aliceExpVis) && !/secretkey/i.test(aliceExpVis), `client export carries my_regs (vapid pub) and no secret material`);
+  // Replacement packets, fresh seeds — the T10 migration pattern (the SDK's
+  // PacketManager refuses a duplicate cid in-process, so a SAME-identity
+  // restart cannot be driven here; the daemon-restart test in the service repo
+  // proves "post still lands after restart" on a true same-cid reboot). What
+  // this asserts: BYTE-FIDELITY of both halves through export→import.
+  const svcExpBin = ro(nsvc, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n7-svc.bin'), Buffer.from(svcExpBin.Serialize()));
+  const aliceExpBin = ro(alice, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n7-alice.bin'), Buffer.from(aliceExpBin.Serialize()));
+  const tokenOf = (vis) => (vis.split('token_index')[0].match(/token_id[^)]*\)/g) || []).join('|');
+  const nsvc2 = mk('nsvc2'); await mkPacket(nsvc2, 'seed-nsvc-mig'); await sleep(1000);
+  await mutate(nsvc2, '::actor::import_state',
+    nsvc2.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n7-svc.bin')))));
+  const n7s = nst(nsvc2);
+  ok(new RegExp(alice.cid).test(n7s) && /recipient_cid/.test(n7s), `service registrations restored on the replacement packet`);
+  ok(!(ro(nsvc2, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize().replace(/[(),\s]/g, '') === ''), `token index restored`);
+  ok(/VAPID_PUB_TEST/.test(n7s), `vapid public key restored`);
+  ok(tokenOf(n7s) !== '' && tokenOf(n7s) === tokenOf(nst(nsvc)), `stored token round-trips byte-stable (post would validate on a same-cid restart)`);
+  const alice2 = mk('alice2'); await mkPacket(alice2, 'seed-alice-mig'); await sleep(1000);
+  await mutate(alice2, '::actor::import_state',
+    alice2.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n7-alice.bin')))));
+  const n7a = nst(alice2);
+  ok(/VAPID_PUB_TEST/.test(n7a) && new RegExp(nsvc.cid).test(n7a), `client my_regs restored (vapid pub + service cid intact)`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

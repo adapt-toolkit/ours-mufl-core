@@ -184,11 +184,12 @@ application actor loads libraries
     // export/import wrappers (migration scenario): the core state under $core, as a
     // host would compose it. (The app inbox is not part of this suite's migration
     // assertions, so it is omitted to keep the fixture minimal.)
-    trn readonly export_state _ { return ($core -> (a2a_messaging::export_core_state NIL)). }
+    trn readonly export_state _ { return ($core -> (a2a_messaging::export_core_state NIL), $notify -> (a2a_notifications::export_notify_state NIL)). }
     trn import_state data: any
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         a2a_messaging::import_core_state (data $core).
+        if (data $notify) != NIL { a2a_notifications::import_notify_state (data $notify). }
         return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
     }
 
