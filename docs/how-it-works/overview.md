@@ -24,7 +24,7 @@ Your `config.mufl` loads it with `config_load #"core"`. The full setup is in
 ## Modules at a glance
 
 Seven `.mm` libraries and one config export. See [Modules](../reference/modules.md) for
-per-module transaction listings.
+per-module purpose and source links.
 
 | File | Role |
 |------|------|

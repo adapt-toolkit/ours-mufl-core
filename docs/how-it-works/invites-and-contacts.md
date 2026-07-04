@@ -28,6 +28,7 @@ Generate an invite with `generate_invite`. The returned blob is the value to sha
 |-----|-----------|-----------|------------|
 | OOB | inviter → responder | out-of-band | slim `invite_eph_t` blob |
 | Leg 1 | responder → inviter | BARE send (box to invite's eph pub) | responder identity bundle |
+| Leg 2 | inviter (receives leg 1) | verify bundle, consume invite, emit leg 3 | ← inviter now holds responder's verified AD |
 | Leg 3 | inviter → responder | BARE send (box to responder's eph pub) | inviter identity bundle |
 
 Both boxes carry the same identity bundle shape: address document + optional delegation cert +
@@ -39,7 +40,7 @@ Redeem an invite with `add_contact` (leg 1). The inviter processes the responder
 
 ## Single-use guarantee
 
-An invite is consumed on the first valid leg-2 reception. A second attempt for the same
+An invite is consumed at the first valid leg-2 (inviter's receipt of leg 1). A second attempt for the same
 `invite_id` aborts with `already-redeemed` and mutates no state. The ephemeral private key is
 deleted atomically with the invite record (INV-4: secrets are never exported).
 

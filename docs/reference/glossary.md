@@ -64,8 +64,9 @@ Requires both nodes to advertise `core.connect`.
 See [Invites & contacts](../how-it-works/invites-and-contacts.md).
 
 **invite leg**
-One directional hop of the three-leg invite redeem flow (OOB transfer, leg 1, leg 3). Each leg
-carries a different payload; legs 1 and 3 are encrypted boxes.
+One step of the invite redeem flow (OOB transfer, leg 1, leg 2, leg 3). Leg 1 is the responder's
+BARE send to the inviter; leg 2 is the inviter's receipt and verification of leg 1 (consuming the
+invite and emitting leg 3); leg 3 is the inviter's BARE send reply to the responder.
 See [Invites & contacts](../how-it-works/invites-and-contacts.md).
 
 **MAJ / MIN**

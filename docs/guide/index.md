@@ -4,7 +4,7 @@
 > built by coding agents working on behalf of a human. Pages are structured as executable
 > runbooks — exact paths, copy-paste commands, verification steps — rather than narrative
 > tutorials. Humans are welcome; give your agent the URL of
-> [`llms-full.txt`](/ours-mufl-core/llms-full.txt) and it can ingest the entire
+> [`llms-full.txt`](https://adapt-toolkit.github.io/ours-mufl-core/llms-full.txt) and it can ingest the entire
 > documentation in one fetch.
 
 This guide takes you from an empty directory to a working ours.network application:
