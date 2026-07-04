@@ -1,5 +1,31 @@
 {
   "how-it-works/overview.md": [
-    { "file": "README.md", "symbol": "config_load #\"core\"" }
+    { "file": "README.md", "symbol": "config_load #\"core\"" },
+    { "file": "README.md", "symbol": "identical wire" },
+    { "file": "README.md", "symbol": "git submodule add" },
+    { "file": "README.md", "symbol": "a2a_capabilities.mm" }
+  ],
+  "how-it-works/identity.md": [
+    { "file": "a2a_protocol.mm", "symbol": "verify_peer_delegation" },
+    { "file": "a2a_protocol.mm", "symbol": "verify_cp_attestation" },
+    { "file": "a2a_protocol.mm", "symbol": "verify_root_cp_binding" },
+    { "file": "a2a_protocol.mm", "symbol": "delegation_cert_t" }
+  ],
+  "how-it-works/invites-and-contacts.md": [
+    { "file": "a2a_messaging.mm", "symbol": "generate_invite" },
+    { "file": "a2a_messaging.mm", "symbol": "add_contact" },
+    { "file": "a2a_messaging.mm", "symbol": "already-redeemed" },
+    { "file": "a2a_messaging.mm", "symbol": "pending_redemptions" },
+    { "file": "a2a_messaging.mm", "symbol": "ingest_connect_descriptor" },
+    { "file": "tests/README.md", "symbol": "T1 | happy-flat" },
+    { "file": "tests/README.md", "symbol": "T3 | single-use" }
+  ],
+  "how-it-works/messaging.md": [
+    { "file": "a2a_messaging.mm", "symbol": "send_message" },
+    { "file": "a2a_messaging.mm", "symbol": "send_file" },
+    { "file": "a2a_messaging.mm", "symbol": "receive_message_tx" },
+    { "file": "a2a_messaging.mm", "symbol": "receive_file_tx" },
+    { "file": "a2a_messaging.mm", "symbol": "DEGRADED contact" },
+    { "file": "README.md", "symbol": "Contact and messaging transactions" }
   ]
 }
