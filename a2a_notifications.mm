@@ -283,6 +283,29 @@ library a2a_notifications loads libraries
         }).
     }
 
+    // Full teardown with a service: tell it to drop my registration, clear my
+    // local copy. (Revoke-without-replace == unregister; rotation is the
+    // keep-registered recovery path.)
+    trn notify_unregister _:($service -> service_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        if (my_notify_registrations target_id) != NIL { delete my_notify_registrations target_id. }
+        if (pending_notify_registers target_id) != NIL { delete pending_notify_registers target_id. }
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> unregister_tx,
+                    $targ -> (,)
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
     // Export the handout blob for my registration with a service ("to notify
     // me: this service, this token"). Distribution is out of protocol — it
     // rides ordinary send_message/send_file.
@@ -443,6 +466,30 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: full teardown for a registered sender — registration +
+    // token index entry removed, then the hook lets the daemon purge its log
+    // (hook actions before the save, the remove_contact composition).
+    fn handle_unregister (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        existing = notify_registrations recipient.
+        abort "No notification registration for this sender." when existing == NIL.
+
+        delete notify_token_index (existing? $token $c $token_id).
+        delete notify_registrations recipient.
+
+        actions is transaction::action::type[] = [].
+        sc on_unregistered ($recipient_cid -> recipient) -- ( -> a)
+        {
+            actions (_count actions|) -> a.
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
     // CLIENT inbound: a service confirmed (or refreshed) my registration. Only
     // a service I am PENDING with or ALREADY registered with may plant one —
     // an unsolicited confirm from any other contact aborts (E9).
@@ -538,6 +585,7 @@ library a2a_notifications loads libraries
     trn register args: any { return handle_register args. }
     trn update_bindings args: any { return handle_update_bindings args. }
     trn rotate_token args: any { return handle_rotate_token args. }
+    trn unregister args: any { return handle_unregister args. }
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
 

@@ -405,6 +405,22 @@ async function main() {
   await sleep(2000);
   ok(/post-rotate-ping/.test(nst(nsvc)), `new handout delivers after rotation`);
 
+  // ---------- N5 unregister (full teardown; posts die; hook fires) ----------
+  CUR = 'N5-unregister';
+  console.log('\n=== N5 unregister ===');
+  await mutate(alice, '::a2a_notifications::notify_unregister', { service: 'svc' });
+  await sleep(2500);
+  const n5s = nst(nsvc);
+  ok(!new RegExp(alice.cid).test(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('registrations').Visualize()), `service registration gone`);
+  ok(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize().replace(/[(),\s]/g, '') === '', `token index entry gone`);
+  ok(new RegExp(alice.cid).test(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('unregs_log').Visualize()), `on_unregistered fired with alice's cid`);
+  ok(ro(alice, '::actor::qa_notify_state', undefined).Reduce('my_regs').Visualize().replace(/[(),\s]/g, '') === '', `client my_regs cleared`);
+  const n5Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr2), payload: 'post-unregister-ping' });
+  await sleep(2000);
+  ok(nst(nsvc) === n5Before && !/post-unregister-ping/.test(nst(nsvc)), `post against a torn-down registration aborts, zero state change`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
