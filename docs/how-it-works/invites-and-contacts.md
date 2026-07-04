@@ -1,6 +1,6 @@
 # Invites & contacts
 
-Contact establishment uses a **slim ephemeral-key invite** (core 3.0). The invite blob carries
+Contact establishment uses a **slim ephemeral-key invite**. The invite blob carries
 only an ephemeral encryption pubkey, the inviter's container id, a display name, and a crypto
 scheme id — no long-term keys, no self-signatures. Identity material moves inside two encrypted
 messages exchanged after the initial out-of-band transfer.
@@ -34,8 +34,8 @@ Both boxes carry the same identity bundle shape: address document + optional del
 optional root profile + optional §3c CP binding. After leg 3, both sides hold the other's
 verified address document and `encrypted_channel` resumes for all subsequent traffic.
 
-Redeem an invite with `add_contact` (leg 1). The inviter processes the responder's leg 1 in
-`submit_invite_response` (leg 2 internally) and replies with leg 3 (`complete_invite`).
+Redeem an invite with `add_contact` (leg 1). The inviter processes the responder's leg 1 via
+`submit_invite_response` and replies with leg 3 (`complete_invite`).
 
 ## Single-use guarantee
 
