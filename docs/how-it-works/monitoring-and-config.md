@@ -55,10 +55,14 @@ entirely app-side; the core handles wire validation and contact checks.
 
 App configuration (`core.configuration`) is stored as an opaque string
 (`app_config`) in `a2a_messaging`, also `hidden`. The bound control plane writes
-it via `set_app_config` and reads it via `get_app_config`. The `authorize_control`
-function in `a2a_messaging` enforces that only the bound control plane (the same
-identity that passed the monitoring ceremony) may call these transactions — the
-configuration and monitoring authorities are the same party.
+it via the `set_config` verb and reads it via `get_config` — both
+`core.configuration` capability verbs authorized in
+`a2a_capabilities::control_auth_class`. (`get_app_config` is a local readonly
+transaction in `a2a_messaging` used only by the node's own wrapper.) The
+`authorize_control` function in `a2a_messaging` enforces that only the bound
+control plane (the same identity that passed the monitoring ceremony) may
+invoke these verbs — the configuration and monitoring authorities are the same
+party.
 
 The `$params` field in a `capability_t` descriptor carries the opaque config
 schema for a frontend to render; the core stores only the raw blob and never

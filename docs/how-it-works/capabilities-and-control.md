@@ -43,7 +43,8 @@ record and calls `dispatch`.
 before any handler runs:
 
 1. `control_auth_class($cap, $verb)` classifies the requested operation as
-   `"public"`, `"bootstrap"`, `"controller"`, or `"deny"`.
+   `"bootstrap"`, `"controller"`, or `"deny"`. (`get_manifest` is a standalone
+   `trn readonly` that never routes through dispatch and is not classified here.)
 2. `"controller"` verbs require the stateful `authorizer` gate (wired at init via
    `a2a_messaging::authorize_control`) to confirm the sender is the bound control
    plane. The gate is fail-closed: an unset authorizer aborts rather than
