@@ -1,0 +1,5 @@
+{
+  "how-it-works/overview.md": [
+    { "file": "README.md", "symbol": "config_load #\"core\"" }
+  ]
+}

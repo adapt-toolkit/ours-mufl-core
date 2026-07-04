@@ -1,6 +1,10 @@
 import { defineConfig } from 'vitepress'
+import llmstxt from 'vitepress-plugin-llms'
 
 export default defineConfig({
+  vite: {
+    plugins: [llmstxt()],
+  },
   title: 'ours-mufl-core',
   description: 'The shared agent-to-agent protocol core for ours.network — agent-centered documentation.',
   base: '/ours-mufl-core/',          // flip to '/' if/when docs.ours.network lands (SPEC Q2)

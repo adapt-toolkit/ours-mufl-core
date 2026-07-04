@@ -8,6 +8,7 @@
     "docs:check": "node scripts/check-citations.mjs && node scripts/check-denylist.mjs"
   },
   "devDependencies": {
-    "vitepress": "^1.6.0"
+    "vitepress": "^1.6.0",
+    "vitepress-plugin-llms": "^1.13.2"
   }
 }
