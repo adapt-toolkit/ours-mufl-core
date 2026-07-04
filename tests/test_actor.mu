@@ -28,6 +28,7 @@ application actor loads libraries
     a2a_protocol,
     a2a_messaging,
     current_transaction_info,
+    protocol_container,
     version
     uses transactions
 {

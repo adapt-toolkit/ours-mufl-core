@@ -29,16 +29,18 @@ BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir -p "$BUILD/core"
 cp "$CORE_DIR"/*.mm "$CORE_DIR"/config.mufl "$BUILD/core/"
-cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$BUILD/"
+cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$HERE/protocol_container.mm" "$BUILD/"
 ln -sfn "$SDK_NM" "$BUILD/node_modules"
-# Top-level compile config: merge the stdlib with this repo's core (the core/ subdir).
+# Top-level compile config: merge the stdlib with this repo's core (the core/ subdir),
+# plus the local protocol_container stub the ADAPT wrapper needs at packet boot
+# (::protocol_container::init_my_ipd — same stub every consumer carries, e.g. ours-mcp).
 cat > "$BUILD/config.mufl" <<'CFG'
 config script
 {
     stdlib_config = (config_load #$MUFL_STDLIB_PATH).
     core_config = (config_load #"core").
     (
-        $imports -> ( $libraries -> (stdlib_config $exports $libraries)'(core_config $exports $libraries), ),
+        $imports -> ( $libraries -> (stdlib_config $exports $libraries)'(core_config $exports $libraries)'($protocol_container -> #"protocol_container.mm"), ),
         $exports -> ( $libraries -> (,), $applications -> (,) )
     ).
 }
