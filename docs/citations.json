@@ -60,6 +60,36 @@
     { "file": "a2a_monitoring.mm", "symbol": "receive_monitoring_copy" },
     { "file": "a2a_monitoring.mm", "symbol": "on_monitoring_copy_received" }
   ],
+  "guide/index.md": [
+    { "file": "README.md", "symbol": "compiles it into its own packet" },
+    { "file": "README.md", "symbol": "config_load #\"core\"" }
+  ],
+  "guide/01-vendor-the-core.md": [
+    { "file": "README.md", "symbol": "git submodule add" }
+  ],
+  "guide/02-configure-and-compile.md": [
+    { "file": "config.mufl", "symbol": "$exports" },
+    { "file": "README.md", "symbol": "config_load #\"core\"" }
+  ],
+  "guide/03-wire-the-host.md": [
+    { "file": "tests/test_actor.mu", "symbol": "a2a_messaging::init" },
+    { "file": "tests/test_actor.mu", "symbol": "protocol_container" },
+    { "file": "tests/test_actor.mu", "symbol": "export_core_state" },
+    { "file": "a2a_messaging.mm", "symbol": "::actor::receive_message" },
+    { "file": "a2a_messaging.mm", "symbol": "handle_receive_message" }
+  ],
+  "guide/04-connect-and-message.md": [
+    { "file": "tests/test.mjs", "symbol": "generate_invite" },
+    { "file": "tests/test.mjs", "symbol": "add_contact" },
+    { "file": "tests/test.mjs", "symbol": "send_message" },
+    { "file": "tests/test_actor.mu", "symbol": "receive_message" }
+  ],
+  "guide/05-test-your-app.md": [
+    { "file": "tests/run.sh", "symbol": "OURS_SDK_NODE_MODULES" },
+    { "file": "tests/run.sh", "symbol": "PROTOCOL_CONTAINER_MM" },
+    { "file": "tests/README.md", "symbol": "SCORECARD" },
+    { "file": "tests/README.md", "symbol": "qa_*" }
+  ],
   "how-it-works/versioning.md": [
     { "file": "version.mm", "symbol": "version_t" },
     { "file": "version.mm", "symbol": "get_core_version" },

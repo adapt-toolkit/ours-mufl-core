@@ -20,14 +20,16 @@ for (const [page, cites] of Object.entries(manifest)) {
   }
 }
 
-// coverage: every how-it-works/ page that is no longer a stub must be in the manifest
+// coverage: every content page that is no longer a stub must be in the manifest
 const stubMarker = '*(content lands in Tasks'
-for (const f of readdirSync(join(docsRoot, 'how-it-works'))) {
-  if (!f.endsWith('.md')) continue
-  const rel = `how-it-works/${f}`
-  const body = readFileSync(join(docsRoot, rel), 'utf8')
-  if (!body.includes(stubMarker) && !(rel in manifest))
-    errors.push(`content page has no citations registered: ${rel}`)
+for (const dir of ['how-it-works', 'guide']) {
+  for (const f of readdirSync(join(docsRoot, dir))) {
+    if (!f.endsWith('.md')) continue
+    const rel = `${dir}/${f}`
+    const body = readFileSync(join(docsRoot, rel), 'utf8')
+    if (!body.includes(stubMarker) && !(rel in manifest))
+      errors.push(`content page has no citations registered: ${rel}`)
+  }
 }
 
 if (errors.length) { console.error('CITATION CHECK FAILED\n' + errors.join('\n')); process.exit(1) }
