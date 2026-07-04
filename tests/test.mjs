@@ -421,6 +421,31 @@ async function main() {
   await sleep(2000);
   ok(nst(nsvc) === n5Before && !/post-unregister-ping/.test(nst(nsvc)), `post against a torn-down registration aborts, zero state change`);
 
+  // ---------- N6 mark_read (ids subset + NIL=all; unregistered caller dies) ----------
+  CUR = 'N6-mark-read';
+  console.log('\n=== N6 mark_read ===');
+  // N5 tore alice down — re-register her first (fresh token, E8 path is dead).
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500);
+  const addr3 = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                               { service: 'svc' }).Reduce('blob').GetBinary());
+  await mutate(nbob, '::a2a_notifications::send_notification', { address: binv(nbob, addr3), payload: 'n6-one' });
+  await mutate(nbob, '::a2a_notifications::send_notification', { address: binv(nbob, addr3), payload: 'n6-two' });
+  await sleep(2000);
+  ok(/n6-one/.test(nst(nsvc)) && /n6-two/.test(nst(nsvc)), `two posts landed for the re-registered alice`);
+  await mutate(alice, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: ['qa-notif-id-1'] });
+  await sleep(2000);
+  const marks1 = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('marks_log').Visualize();
+  ok(/qa-notif-id-1/.test(marks1) && new RegExp(alice.cid).test(marks1), `ids-subset mark_read reached the hook with exactly the ids + caller cid`);
+  await mutate(alice, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: null });
+  await sleep(2000);
+  const marks2 = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('marks_log').Visualize();
+  ok(marks2 !== marks1 && !/qa-notif-id-2/.test(marks2), `NIL(=all) mark_read reached the hook as a second entry with NIL ids`);
+  // Negative: a packet with no registration cannot even fire the client trn.
+  const n6err = await mutate(nbob, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: null })
+    .then(() => null, (e) => e.message);
+  ok(n6err !== null && /[Uu]nknown contact|[Nn]o notification registration/.test(n6err), `mark_read without a registration aborts locally`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

@@ -283,6 +283,27 @@ library a2a_notifications loads libraries
         }).
     }
 
+    // Relay a mark-read to the service's daemon log. $notif_ids NIL means mark
+    // ALL my notifications read — the default an app fires on open. "Dismiss"
+    // == mark_read in v1 (one verb, no separate dismissed state).
+    trn notify_mark_read _:($service -> service_ref: str, $notif_ids -> notif_ids: str[]+)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> mark_read_tx,
+                    $targ -> ($notif_ids -> notif_ids)
+                ),
+                _return_data ($sent_to -> target_id)
+            ].
+        }).
+    }
+
     // Full teardown with a service: tell it to drop my registration, clear my
     // local copy. (Revoke-without-replace == unregister; rotation is the
     // keep-registered recovery path.)
@@ -490,6 +511,28 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: a registered sender marks its notifications read. The
+    // ids (or NIL = ALL) pass straight through to the daemon hook — the daemon
+    // updates its log and ignores non-matching ids (E7, idempotent). The hook
+    // only ever receives the CALLER's own recipient_cid, so one recipient can
+    // never mark another's notifications.
+    fn handle_mark_read (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        abort "No notification registration for this sender." when (notify_registrations recipient) == NIL.
+
+        notif_ids is str[]+ = NIL.
+        if (args $notif_ids) != NIL { notif_ids -> (args $notif_ids) safe (str[]). }
+
+        return transaction::success (on_notifications_marked_read (
+            $recipient_cid -> recipient,
+            $notif_ids     -> notif_ids
+        )).
+    }
+
     // CLIENT inbound: a service confirmed (or refreshed) my registration. Only
     // a service I am PENDING with or ALREADY registered with may plant one —
     // an unsolicited confirm from any other contact aborts (E9).
@@ -586,6 +629,7 @@ library a2a_notifications loads libraries
     trn update_bindings args: any { return handle_update_bindings args. }
     trn rotate_token args: any { return handle_rotate_token args. }
     trn unregister args: any { return handle_unregister args. }
+    trn mark_read args: any { return handle_mark_read args. }
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
 
