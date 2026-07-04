@@ -27,5 +27,44 @@
     { "file": "a2a_messaging.mm", "symbol": "receive_file_tx" },
     { "file": "a2a_messaging.mm", "symbol": "DEGRADED contact" },
     { "file": "README.md", "symbol": "Contact and messaging transactions" }
+  ],
+  "how-it-works/capabilities-and-control.md": [
+    { "file": "a2a_capabilities.mm", "symbol": "control_envelope_t" },
+    { "file": "a2a_capabilities.mm", "symbol": "cap_configuration" },
+    { "file": "a2a_capabilities.mm", "symbol": "cap_monitoring" },
+    { "file": "a2a_capabilities.mm", "symbol": "cap_connect" },
+    { "file": "a2a_capabilities.mm", "symbol": "cap_cluster" },
+    { "file": "a2a_capabilities.mm", "symbol": "dispatch" },
+    { "file": "a2a_control.mm", "symbol": "send_control" },
+    { "file": "a2a_control.mm", "symbol": "control_message" },
+    { "file": "a2a_control.mm", "symbol": "on_control_received" }
+  ],
+  "how-it-works/cluster.md": [
+    { "file": "a2a_cluster.mm", "symbol": "cluster_members" },
+    { "file": "a2a_cluster.mm", "symbol": "member_t" },
+    { "file": "a2a_cluster.mm", "symbol": "cluster_handler" },
+    { "file": "a2a_cluster.mm", "symbol": "register_provisioned_child" },
+    { "file": "a2a_cluster.mm", "symbol": "confirm_child_destroyed" },
+    { "file": "a2a_cluster.mm", "symbol": "register_child_invite" },
+    { "file": "a2a_cluster.mm", "symbol": "confirm_child_monitoring" },
+    { "file": "a2a_cluster.mm", "symbol": "reconcile" },
+    { "file": "a2a_capabilities.mm", "symbol": "cap_cluster" }
+  ],
+  "how-it-works/monitoring-and-config.md": [
+    { "file": "a2a_messaging.mm", "symbol": "monitoring_proxy" },
+    { "file": "a2a_messaging.mm", "symbol": "monitor_copy_actions" },
+    { "file": "a2a_messaging.mm", "symbol": "set_proxy_pending" },
+    { "file": "a2a_messaging.mm", "symbol": "verify_proxy_code" },
+    { "file": "a2a_messaging.mm", "symbol": "authorize_control" },
+    { "file": "a2a_messaging.mm", "symbol": "set_app_config" },
+    { "file": "a2a_monitoring.mm", "symbol": "receive_monitoring_copy" },
+    { "file": "a2a_monitoring.mm", "symbol": "on_monitoring_copy_received" }
+  ],
+  "how-it-works/versioning.md": [
+    { "file": "version.mm", "symbol": "version_t" },
+    { "file": "version.mm", "symbol": "get_core_version" },
+    { "file": "version.mm", "symbol": "core_version" },
+    { "file": "version.mm", "symbol": "MUST be updated every time we update ANY code" },
+    { "file": "README.md", "symbol": "get_version" }
   ]
 }
