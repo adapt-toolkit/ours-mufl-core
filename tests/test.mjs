@@ -302,6 +302,15 @@ async function main() {
   ok(s10.pi === 0, `import reset pending_invites to empty (migration §4.4) → ${s10.pi}`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
 
+  // ================= a2a_notifications scenarios (N-series) =================
+
+  // ---------- N0 skeleton (folded into N1 once the flow lands) ----------
+  CUR = 'N0-skeleton';
+  console.log('\n=== N0 skeleton ===');
+  const nsvc = mk('nsvc'); await mkPacket(nsvc, 'seed-nsvc'); await sleep(1000);
+  const nstate = ro(nsvc, '::actor::qa_notify_state', undefined).Visualize();
+  ok(/registrations/.test(nstate), `notify state probe answers with empty stores`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

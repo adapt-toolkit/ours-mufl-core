@@ -27,6 +27,7 @@ application actor loads libraries
     encrypted_channel,
     a2a_protocol,
     a2a_messaging,
+    a2a_notifications,
     current_transaction_info,
     protocol_container,
     version
@@ -81,6 +82,37 @@ application actor loads libraries
                 return [ _notify_agent ($event -> $file_received), _save_state NIL ].
             },
             $on_file_sent -> fn (_: any) -> transaction::action::type[] { return []. }
+        ).
+
+        // Notification hook logs (the app owns notification storage; the core
+        // calls the hooks). Plain observable lists the qa probes expose.
+        notif_log is any[] = [].
+        marks_log is any[] = [].
+        unregs_log is any[] = [].
+        regconfirm_log is any[] = [].
+
+        a2a_notifications::init (
+            $_read_or_abort -> _read_or_abort,
+            $on_notification_posted -> fn (arg: any) -> transaction::action::type[]
+            {
+                notif_log (_count notif_log|) -> arg.
+                return [ _notify_agent ($event -> $notification_posted), _save_state NIL ].
+            },
+            $on_notifications_marked_read -> fn (arg: any) -> transaction::action::type[]
+            {
+                marks_log (_count marks_log|) -> arg.
+                return [ _save_state NIL ].
+            },
+            $on_unregistered -> fn (arg: any) -> transaction::action::type[]
+            {
+                unregs_log (_count unregs_log|) -> arg.
+                return [ _save_state NIL ].
+            },
+            $on_notify_registration -> fn (arg: any) -> transaction::action::type[]
+            {
+                regconfirm_log (_count regconfirm_log|) -> arg.
+                return [ _save_state NIL ].
+            }
         ).
     }
 
@@ -179,6 +211,22 @@ application actor loads libraries
     // export-secrecy: hand back export_core_state so the driver confirms neither
     // ephemeral secret store appears in the portable export.
     trn readonly qa_export_core _ { return ($core -> (a2a_messaging::export_core_state NIL)). }
+
+    // Notification state + hook logs — for receiver-side assertions (N-series).
+    trn readonly qa_notify_state _
+    {
+        return (
+            $registrations -> a2a_notifications::notify_registrations,
+            $token_index   -> a2a_notifications::notify_token_index,
+            $my_regs       -> a2a_notifications::my_notify_registrations,
+            $pending       -> a2a_notifications::pending_notify_registers,
+            $vapid_pub     -> a2a_notifications::vapid_public_key,
+            $notif_log     -> notif_log,
+            $marks_log     -> marks_log,
+            $unregs_log    -> unregs_log,
+            $regconfirm_log -> regconfirm_log
+        ).
+    }
 
     // ---- adversarial leg-1 senders (bare-send a crafted submit_invite_response) ----
     trn qa_leg1_badbox _:($invite -> blob: bin)
