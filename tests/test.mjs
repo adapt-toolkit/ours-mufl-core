@@ -303,13 +303,39 @@ async function main() {
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
 
   // ================= a2a_notifications scenarios (N-series) =================
+  const nst = (id) => ro(id, '::actor::qa_notify_state', undefined).Visualize();
 
-  // ---------- N0 skeleton (folded into N1 once the flow lands) ----------
-  CUR = 'N0-skeleton';
-  console.log('\n=== N0 skeleton ===');
-  const nsvc = mk('nsvc'); await mkPacket(nsvc, 'seed-nsvc'); await sleep(1000);
-  const nstate = ro(nsvc, '::actor::qa_notify_state', undefined).Visualize();
-  ok(/registrations/.test(nstate), `notify state probe answers with empty stores`);
+  // ---------- N1 register + confirm round-trip ----------
+  CUR = 'N1-register';
+  console.log('\n=== N1 register+confirm ===');
+  const nsvc = mk('nsvc'); const alice = mk('alice');
+  await mkPacket(nsvc, 'seed-nsvc'); await mkPacket(alice, 'seed-alice'); await sleep(1000);
+  await setName(nsvc, 'NotifyService'); await setName(alice, 'Alice');
+  ok(/registrations/.test(nst(nsvc)), `notify state probe answers with empty stores`);
+  // alice must be a contact of the service (normal invite machinery).
+  {
+    const im = await mutate(nsvc, '::a2a_messaging::generate_invite', { name: 'Alice' });
+    const iblob = Buffer.from(im.Reduce('invite').GetBinary());
+    await mutate(alice, '::a2a_messaging::add_contact', { invite: binv(alice, iblob), name: 'svc' });
+    await sleep(5000);
+  }
+  await mutate(nsvc, '::a2a_notifications::set_vapid_public_key', { key: 'VAPID_PUB_TEST' });
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500); // register -> confirm round-trip over the broker
+  const n1s = nst(nsvc);
+  ok(/recipient_cid/.test(n1s), `service stores a registration`);
+  ok(new RegExp(alice.cid).test(n1s), `service registration is keyed to alice's cid`);
+  const n1a = nst(alice);
+  ok(/VAPID_PUB_TEST/.test(n1a), `client registration holds the vapid pub`);
+  ok(!/TRUE/.test(ro(alice, '::actor::qa_notify_state', undefined).Reduce('pending').Visualize()), `pending cleared on confirm`);
+  ok(/regconfirm/.test(n1a) && new RegExp(nsvc.cid).test(n1a), `on_notify_registration hook fired with the service cid`);
+  // bindings management (replace-all + re-confirm):
+  await mutate(alice, '::a2a_notifications::notify_update_bindings', { service: 'svc',
+    bindings: [{ version: 1, binding_id: 'b1', endpoint: 'https://push.example/x',
+                 p256dh: 'PK', auth: 'AS' }] });
+  await sleep(2500);
+  ok(/push\.example/.test(nst(nsvc)), `service registration carries the replaced bindings`);
+  ok(/push\.example/.test(nst(alice)), `client copy re-confirmed with the bindings`);
 
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');

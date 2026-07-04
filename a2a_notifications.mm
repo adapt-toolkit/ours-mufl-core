@@ -177,6 +177,221 @@ library a2a_notifications loads libraries
     fn _save_state (_) = (transaction::action::return_data ($kind -> $save_state)).
     fn _return_data (payload: any) = (transaction::action::return_data ($kind -> $data, $payload -> payload)).
 
+    // ---- service-side helpers ----------------------------------------------
+
+    // Mint the shared token for one recipient: versioned core + detached
+    // signature over its _value_id (the delegation_cert_t signing idiom). The
+    // CALLER stores the registration + index entry.
+    fn mint_notify_token (recipient: global_id) -> notify_token_t
+    {
+        core is notify_token_core_t = (
+            $version       -> 1,
+            $service_cid   -> _get_container_id(),
+            $recipient_cid -> recipient,
+            $token_id      -> _new_id "ours notify token",
+            $scope         -> "",
+            $iat           -> (current_transaction_info::get_transaction_time())?
+        ).
+        return ($c -> core, $s -> key_storage::default_sign (_value_id core)).
+    }
+
+    // The confirm leg every service-side mutator replies with (register /
+    // update_bindings / rotate_token — idempotent): the stored token + this
+    // service's VAPID public key + the registration's current bindings, over
+    // the already-established encrypted channel.
+    fn confirm_actions (recipient: global_id) -> transaction::action::type[]
+    {
+        reg = notify_registrations recipient.
+        abort "No registration to confirm." when reg == NIL.
+        return [
+            encrypted_channel::send_encrypted_tx recipient (
+                $name -> confirm_registration_tx,
+                $targ -> (
+                    $token     -> (reg? $token),
+                    $vapid_pub -> vapid_public_key,
+                    $bindings  -> (reg? $bindings)
+                )
+            )
+        ].
+    }
+
+    // ---- client transactions (user-origin) -----------------------------------
+
+    // Enroll with a notification service (must already be a contact — the
+    // normal invite/introduction machinery; no new connection flow). $bindings
+    // may be NIL: register first, add bindings once the browser subscribed
+    // (E11 — zero bindings is a valid registration).
+    trn notify_register _:($service -> service_ref: str, $bindings -> bindings: webpush_binding_t[]+)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        pending_notify_registers target_id -> TRUE.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> register_tx,
+                    $targ -> ($bindings -> bindings)
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
+    // Replace-all bindings update (the service re-confirms, which refreshes the
+    // client copy too). Requires an existing registration with that service.
+    trn notify_update_bindings _:($service -> service_ref: str, $bindings -> bindings: webpush_binding_t[])
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> update_bindings_tx,
+                    $targ -> ($bindings -> bindings)
+                ),
+                _return_data ($sent_to -> target_id)
+            ].
+        }).
+    }
+
+    // ---- service transactions -------------------------------------------------
+
+    // Host-fired at daemon boot: the VAPID PUBLIC key echoed in every confirm
+    // (the browser needs it as applicationServerKey). The PRIVATE key stays in
+    // the daemon's env/file — it must never enter packet state.
+    trn set_vapid_public_key _:($key -> key: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        vapid_public_key -> key.
+        return transaction::success [
+            _return_data ($ok -> TRUE),
+            _save_state NIL
+        ].
+    }
+
+    // SERVICE inbound: enroll the channel-authenticated sender. Re-register is
+    // idempotent recovery (E8): the token is KEPT (already-distributed handouts
+    // stay valid) and bindings are replaced only when provided; the confirm is
+    // re-sent either way.
+    fn handle_register (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        bindings is webpush_binding_t[] = [].
+        if (args $bindings) != NIL { bindings -> (args $bindings) safe (webpush_binding_t[]). }
+
+        existing = notify_registrations recipient.
+        if existing != NIL
+        {
+            // E8: keep the token; replace bindings only when the caller sent some.
+            if (args $bindings) != NIL
+            {
+                notify_registrations recipient -> (
+                    $version       -> (existing? $version),
+                    $recipient_cid -> (existing? $recipient_cid),
+                    $token         -> (existing? $token),
+                    $bindings      -> bindings,
+                    $created_at    -> (existing? $created_at)
+                ).
+            }
+        }
+        else
+        {
+            token = mint_notify_token recipient.
+            notify_registrations recipient -> (
+                $version       -> 1,
+                $recipient_cid -> recipient,
+                $token         -> token,
+                $bindings      -> bindings,
+                $created_at    -> (current_transaction_info::get_transaction_time())?
+            ).
+            notify_token_index (token $c $token_id) -> recipient.
+        }
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    // SERVICE inbound: replace-all bindings for a registered sender; re-confirm.
+    fn handle_update_bindings (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        existing = notify_registrations recipient.
+        abort "No notification registration for this sender." when existing == NIL.
+
+        bindings is webpush_binding_t[] = [].
+        if (args $bindings) != NIL { bindings -> (args $bindings) safe (webpush_binding_t[]). }
+        notify_registrations recipient -> (
+            $version       -> (existing? $version),
+            $recipient_cid -> (existing? $recipient_cid),
+            $token         -> (existing? $token),
+            $bindings      -> bindings,
+            $created_at    -> (existing? $created_at)
+        ).
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    // CLIENT inbound: a service confirmed (or refreshed) my registration. Only
+    // a service I am PENDING with or ALREADY registered with may plant one —
+    // an unsolicited confirm from any other contact aborts (E9).
+    fn handle_confirm_registration (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        abort "Unsolicited registration confirm." when (pending_notify_registers sender_id) == NIL && (my_notify_registrations sender_id) == NIL.
+
+        token = (args $token) safe notify_token_t.
+        abort "Unsupported notify token version." when (token $c $version) != 1.
+        vapid_pub = (args $vapid_pub) safe str.
+        bindings is webpush_binding_t[] = [].
+        if (args $bindings) != NIL { bindings -> (args $bindings) safe (webpush_binding_t[]). }
+
+        service_name is str = "".
+        c = a2a_messaging::contacts sender_id.
+        if c != NIL { service_name -> c? $name. }
+
+        myreg is my_registration_t = (
+            $service_cid  -> sender_id,
+            $service_name -> service_name,
+            $token        -> token,
+            $vapid_pub    -> vapid_pub,
+            $bindings     -> bindings,
+            $created_at   -> (current_transaction_info::get_transaction_time())?
+        ).
+        my_notify_registrations sender_id -> myreg.
+        if (pending_notify_registers sender_id) != NIL { delete pending_notify_registers sender_id. }
+
+        actions is transaction::action::type[] = [].
+        sc on_notify_registration ($service_cid -> sender_id, $registration -> myreg) -- ( -> a)
+        {
+            actions (_count actions|) -> a.
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    // Inbound trn stubs (declared AFTER their handlers — define-before-use).
+    trn register args: any { return handle_register args. }
+    trn update_bindings args: any { return handle_update_bindings args. }
+    trn confirm_registration args: any { return handle_confirm_registration args. }
+
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state composes these with
     // its other state (the export_core_state contract). No secret material lives
