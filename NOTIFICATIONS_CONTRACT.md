@@ -1,4 +1,4 @@
-# NOTIFICATIONS_CONTRACT — the `a2a_notifications` v1 surface (core 0.1)
+# NOTIFICATIONS_CONTRACT — the `a2a_notifications` v1 surface (core 0.3)
 
 The frozen protocol contract for Notifications-as-a-Service: a
 protocol-defined **notification-service node** (an always-online packet any
