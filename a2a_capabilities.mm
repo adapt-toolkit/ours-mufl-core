@@ -29,6 +29,7 @@ library a2a_capabilities loads libraries
     cap_configuration = "core.configuration".
     cap_monitoring    = "core.monitoring".
     cap_connect       = "core.connect".
+    cap_notifications = "core.notifications". // NaaS node surface (a2a_notifications.mm; NOTIFICATIONS_CONTRACT.md) — reserved id, no control verbs in v1.
     // core.cluster (core 2.3): promotes cluster/subagent management from private
     // a2a_messaging plumbing to a FIRST-CLASS, app-reusable capability. It owns
     // child/subagent lifecycle, per-child monitoring authorization, the host-local

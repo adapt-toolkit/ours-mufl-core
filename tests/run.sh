@@ -29,15 +29,11 @@ BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir -p "$BUILD/core"
 cp "$CORE_DIR"/*.mm "$CORE_DIR"/config.mufl "$BUILD/core/"
-cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$BUILD/"
-# SDK 0.6.x (adapt #77) runs ::protocol_container::init_my_ipd on every packet
-# during broker registration — the harness needs the same stub the consumers
-# ship. Prefer a checkout-local copy; fall back to the ours-mcp one.
-PC_STUB=${PROTOCOL_CONTAINER_MM:-/home/shakhvit/work/adapt/ours.network/ours-mcp/packages/core/mufl_code/protocol_container.mm}
-[ -e "$PC_STUB" ] || { echo "MISSING: $PC_STUB (set PROTOCOL_CONTAINER_MM)"; exit 2; }
-cp "$PC_STUB" "$BUILD/protocol_container.mm"
+cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$HERE/protocol_container.mm" "$BUILD/"
 ln -sfn "$SDK_NM" "$BUILD/node_modules"
-# Top-level compile config: merge the stdlib with this repo's core (the core/ subdir).
+# Top-level compile config: merge the stdlib with this repo's core (the core/ subdir),
+# plus the local protocol_container stub the ADAPT wrapper needs at packet boot
+# (::protocol_container::init_my_ipd — same stub every consumer carries, e.g. ours-mcp).
 cat > "$BUILD/config.mufl" <<'CFG'
 config script
 {
