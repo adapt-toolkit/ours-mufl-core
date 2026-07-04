@@ -260,6 +260,29 @@ library a2a_notifications loads libraries
         }).
     }
 
+    // Replace the shared token (rotation IS revocation — D-3): the old handout
+    // dies the moment the service processes this; senders keep working only
+    // after I redistribute the new handout. Recovery path for a leaked token.
+    trn notify_rotate_token _:($service -> service_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+        pending_notify_registers target_id -> TRUE.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> rotate_token_tx,
+                    $targ -> (,)
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
     // Export the handout blob for my registration with a service ("to notify
     // me: this service, this token"). Distribution is out of protocol — it
     // rides ordinary send_message/send_file.
@@ -392,6 +415,34 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: atomically replace a registered sender's token — delete
+    // the old index entry (posts against the old handout die on the lookup from
+    // this transaction on — E4), mint + store + index a fresh token, re-confirm.
+    fn handle_rotate_token (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        existing = notify_registrations recipient.
+        abort "No notification registration for this sender." when existing == NIL.
+
+        delete notify_token_index (existing? $token $c $token_id).
+        token = mint_notify_token recipient.
+        notify_registrations recipient -> (
+            $version       -> (existing? $version),
+            $recipient_cid -> (existing? $recipient_cid),
+            $token         -> token,
+            $bindings      -> (existing? $bindings),
+            $created_at    -> (existing? $created_at)
+        ).
+        notify_token_index (token $c $token_id) -> recipient.
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
     // CLIENT inbound: a service confirmed (or refreshed) my registration. Only
     // a service I am PENDING with or ALREADY registered with may plant one —
     // an unsolicited confirm from any other contact aborts (E9).
@@ -486,6 +537,7 @@ library a2a_notifications loads libraries
     // Inbound trn stubs (declared AFTER their handlers — define-before-use).
     trn register args: any { return handle_register args. }
     trn update_bindings args: any { return handle_update_bindings args. }
+    trn rotate_token args: any { return handle_rotate_token args. }
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
 

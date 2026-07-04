@@ -386,6 +386,25 @@ async function main() {
   await sleep(2000);
   ok(nst(nsvc) === n8Before, `service-side oversize post aborts with zero state change`);
 
+  // ---------- N4 rotate (old handout dies atomically, new one works) ----------
+  CUR = 'N4-rotate';
+  console.log('\n=== N4 rotate ===');
+  const addr1 = naddr; // pre-rotation handout
+  await mutate(alice, '::a2a_notifications::notify_rotate_token', { service: 'svc' });
+  await sleep(2500);
+  const addr2 = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                               { service: 'svc' }).Reduce('blob').GetBinary());
+  ok(!addr1.equals(addr2), `rotation minted a different token (handout bytes differ)`);
+  const n4Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr1), payload: 'stale-handout-ping' });
+  await sleep(2000);
+  ok(nst(nsvc) === n4Before && !/stale-handout-ping/.test(nst(nsvc)), `old handout is rejected after rotation (E4)`);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr2), payload: 'post-rotate-ping' });
+  await sleep(2000);
+  ok(/post-rotate-ping/.test(nst(nsvc)), `new handout delivers after rotation`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
