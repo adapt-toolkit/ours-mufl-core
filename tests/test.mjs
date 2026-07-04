@@ -302,6 +302,183 @@ async function main() {
   ok(s10.pi === 0, `import reset pending_invites to empty (migration §4.4) → ${s10.pi}`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
 
+  // ================= a2a_notifications scenarios (N-series) =================
+  const nst = (id) => ro(id, '::actor::qa_notify_state', undefined).Visualize();
+
+  // ---------- N1 register + confirm round-trip ----------
+  CUR = 'N1-register';
+  console.log('\n=== N1 register+confirm ===');
+  const nsvc = mk('nsvc'); const alice = mk('alice');
+  await mkPacket(nsvc, 'seed-nsvc'); await mkPacket(alice, 'seed-alice'); await sleep(1000);
+  await setName(nsvc, 'NotifyService'); await setName(alice, 'Alice');
+  ok(/registrations/.test(nst(nsvc)), `notify state probe answers with empty stores`);
+  // alice must be a contact of the service (normal invite machinery).
+  {
+    const im = await mutate(nsvc, '::a2a_messaging::generate_invite', { name: 'Alice' });
+    const iblob = Buffer.from(im.Reduce('invite').GetBinary());
+    await mutate(alice, '::a2a_messaging::add_contact', { invite: binv(alice, iblob), name: 'svc' });
+    await sleep(5000);
+  }
+  await mutate(nsvc, '::a2a_notifications::set_vapid_public_key', { key: 'VAPID_PUB_TEST' });
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500); // register -> confirm round-trip over the broker
+  const n1s = nst(nsvc);
+  ok(/recipient_cid/.test(n1s), `service stores a registration`);
+  ok(new RegExp(alice.cid).test(n1s), `service registration is keyed to alice's cid`);
+  const n1a = nst(alice);
+  ok(/VAPID_PUB_TEST/.test(n1a), `client registration holds the vapid pub`);
+  ok(!/TRUE/.test(ro(alice, '::actor::qa_notify_state', undefined).Reduce('pending').Visualize()), `pending cleared on confirm`);
+  ok(/regconfirm/.test(n1a) && new RegExp(nsvc.cid).test(n1a), `on_notify_registration hook fired with the service cid`);
+  // bindings management (replace-all + re-confirm):
+  await mutate(alice, '::a2a_notifications::notify_update_bindings', { service: 'svc',
+    bindings: [{ version: 1, binding_id: 'b1', endpoint: 'https://push.example/x',
+                 p256dh: 'PK', auth: 'AS' }] });
+  await sleep(2500);
+  ok(/push\.example/.test(nst(nsvc)), `service registration carries the replaced bindings`);
+  ok(/push\.example/.test(nst(alice)), `client copy re-confirmed with the bindings`);
+
+  // ---------- N2 post happy path (bare signed send from a NON-contact) ----------
+  CUR = 'N2-post';
+  console.log('\n=== N2 post happy path ===');
+  const nbob = mk('nbob'); await mkPacket(nbob, 'seed-nbob'); await sleep(1000); // NEVER a contact of nsvc
+  const naddr = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                              { service: 'svc' }).Reduce('blob').GetBinary());
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, naddr), payload: 'hello, wake up' });
+  await sleep(2500);
+  const n2s = nst(nsvc);
+  ok(/hello, wake up/.test(n2s), `service hook received the payload`);
+  ok(new RegExp(nbob.cid).test(n2s), `sender_cid recorded from the signed envelope`);
+  ok(/push\.example/.test(n2s.split('notif_log')[1] || ''), `hook received the recipient's current bindings`);
+
+  // ---------- N3 token rejection matrix + E9 (zero state change each) ----------
+  CUR = 'N3-rejections';
+  console.log('\n=== N3 rejection matrix ===');
+  for (const mode of ['flip_recipient', 'fake_token_id', 'foreign_service', 'flip_scope']) {
+    const before = nst(nsvc);
+    await mutate(nbob, '::actor::qa_post_tampered', { address: binv(nbob, naddr), mode });
+    await sleep(2000);
+    ok(nst(nsvc) === before, `tampered post (${mode}) aborts with zero state change`);
+  }
+  // E9: eve IS a contact of alice but neither pending nor her registered service.
+  const neve = mk('neve'); await mkPacket(neve, 'seed-neve'); await sleep(1000);
+  {
+    const im = await mutate(alice, '::a2a_messaging::generate_invite', { name: 'Eve' });
+    const iblob = Buffer.from(im.Reduce('invite').GetBinary());
+    await mutate(neve, '::a2a_messaging::add_contact', { invite: binv(neve, iblob), name: 'alice-target' });
+    await sleep(5000);
+  }
+  const aBefore = nst(alice);
+  const aRejx = alice.rejects.length;
+  await mutate(neve, '::actor::qa_send_fake_confirm', { target: alice.cid });
+  await sleep(2500);
+  ok(nst(alice) === aBefore && !/EVIL_VAPID/.test(nst(alice)), `unsolicited confirm_registration plants nothing (E9)`);
+  ok(alice.rejects.slice(aRejx).some((x) => /[Uu]nsolicited/.test(x)), `unsolicited confirm was rejected with the E9 abort`);
+
+  // ---------- N8 oversize payload (sender side + service side) ----------
+  CUR = 'N8-oversize';
+  console.log('\n=== N8 oversize payload ===');
+  const n8Before = nst(nsvc);
+  const senderErr = await mutate(nbob, '::a2a_notifications::send_notification',
+    { address: binv(nbob, naddr), payload: 'x'.repeat(4001) }).then(() => null, (e) => e.message);
+  ok(senderErr !== null && /exceeds/.test(senderErr), `sender-side oversize payload aborts locally (${(senderErr || '').split('\n')[0]})`);
+  await mutate(nbob, '::actor::qa_post_tampered', { address: binv(nbob, naddr), mode: 'oversize' });
+  await sleep(2000);
+  ok(nst(nsvc) === n8Before, `service-side oversize post aborts with zero state change`);
+
+  // ---------- N4 rotate (old handout dies atomically, new one works) ----------
+  CUR = 'N4-rotate';
+  console.log('\n=== N4 rotate ===');
+  const addr1 = naddr; // pre-rotation handout
+  await mutate(alice, '::a2a_notifications::notify_rotate_token', { service: 'svc' });
+  await sleep(2500);
+  const addr2 = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                               { service: 'svc' }).Reduce('blob').GetBinary());
+  ok(!addr1.equals(addr2), `rotation minted a different token (handout bytes differ)`);
+  const n4Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr1), payload: 'stale-handout-ping' });
+  await sleep(2000);
+  ok(nst(nsvc) === n4Before && !/stale-handout-ping/.test(nst(nsvc)), `old handout is rejected after rotation (E4)`);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr2), payload: 'post-rotate-ping' });
+  await sleep(2000);
+  ok(/post-rotate-ping/.test(nst(nsvc)), `new handout delivers after rotation`);
+
+  // ---------- N5 unregister (full teardown; posts die; hook fires) ----------
+  CUR = 'N5-unregister';
+  console.log('\n=== N5 unregister ===');
+  await mutate(alice, '::a2a_notifications::notify_unregister', { service: 'svc' });
+  await sleep(2500);
+  const n5s = nst(nsvc);
+  ok(!new RegExp(alice.cid).test(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('registrations').Visualize()), `service registration gone`);
+  ok(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize().replace(/[(),\s]/g, '') === '', `token index entry gone`);
+  ok(new RegExp(alice.cid).test(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('unregs_log').Visualize()), `on_unregistered fired with alice's cid`);
+  ok(ro(alice, '::actor::qa_notify_state', undefined).Reduce('my_regs').Visualize().replace(/[(),\s]/g, '') === '', `client my_regs cleared`);
+  const n5Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, addr2), payload: 'post-unregister-ping' });
+  await sleep(2000);
+  ok(nst(nsvc) === n5Before && !/post-unregister-ping/.test(nst(nsvc)), `post against a torn-down registration aborts, zero state change`);
+
+  // ---------- N6 mark_read (ids subset + NIL=all; unregistered caller dies) ----------
+  CUR = 'N6-mark-read';
+  console.log('\n=== N6 mark_read ===');
+  // N5 tore alice down — re-register her first (fresh token, E8 path is dead).
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500);
+  const addr3 = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+                               { service: 'svc' }).Reduce('blob').GetBinary());
+  await mutate(nbob, '::a2a_notifications::send_notification', { address: binv(nbob, addr3), payload: 'n6-one' });
+  await mutate(nbob, '::a2a_notifications::send_notification', { address: binv(nbob, addr3), payload: 'n6-two' });
+  await sleep(2000);
+  ok(/n6-one/.test(nst(nsvc)) && /n6-two/.test(nst(nsvc)), `two posts landed for the re-registered alice`);
+  await mutate(alice, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: ['qa-notif-id-1'] });
+  await sleep(2000);
+  const marks1 = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('marks_log').Visualize();
+  ok(/qa-notif-id-1/.test(marks1) && new RegExp(alice.cid).test(marks1), `ids-subset mark_read reached the hook with exactly the ids + caller cid`);
+  await mutate(alice, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: null });
+  await sleep(2000);
+  const marks2 = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('marks_log').Visualize();
+  ok(marks2 !== marks1 && !/qa-notif-id-2/.test(marks2), `NIL(=all) mark_read reached the hook as a second entry with NIL ids`);
+  // Negative: a packet with no registration cannot even fire the client trn.
+  const n6err = await mutate(nbob, '::a2a_notifications::notify_mark_read', { service: 'svc', notif_ids: null })
+    .then(() => null, (e) => e.message);
+  ok(n6err !== null && /[Uu]nknown contact|[Nn]o notification registration/.test(n6err), `mark_read without a registration aborts locally`);
+
+  // ---------- N7 export/import round-trip (both halves; no secrets) ----------
+  CUR = 'N7-export-import';
+  console.log('\n=== N7 export/import ===');
+  const svcExpVis = ro(nsvc, '::actor::export_state', undefined).Visualize();
+  ok(/notify/.test(svcExpVis) && /recipient_cid/.test(svcExpVis), `service export composes the notify half (registrations present)`);
+  ok(!/secretkey/i.test(svcExpVis) && !/VAPID_PRIV/.test(svcExpVis), `service export carries no secret material`);
+  ok(/VAPID_PUB_TEST/.test(svcExpVis), `service export carries the PUBLIC vapid key`);
+  const aliceExpVis = ro(alice, '::actor::export_state', undefined).Visualize();
+  ok(/VAPID_PUB_TEST/.test(aliceExpVis) && !/secretkey/i.test(aliceExpVis), `client export carries my_regs (vapid pub) and no secret material`);
+  // Replacement packets, fresh seeds — the T10 migration pattern (the SDK's
+  // PacketManager refuses a duplicate cid in-process, so a SAME-identity
+  // restart cannot be driven here; the daemon-restart test in the service repo
+  // proves "post still lands after restart" on a true same-cid reboot). What
+  // this asserts: BYTE-FIDELITY of both halves through export→import.
+  const svcExpBin = ro(nsvc, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n7-svc.bin'), Buffer.from(svcExpBin.Serialize()));
+  const aliceExpBin = ro(alice, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n7-alice.bin'), Buffer.from(aliceExpBin.Serialize()));
+  const tokenOf = (vis) => (vis.split('token_index')[0].match(/token_id[^)]*\)/g) || []).join('|');
+  const nsvc2 = mk('nsvc2'); await mkPacket(nsvc2, 'seed-nsvc-mig'); await sleep(1000);
+  await mutate(nsvc2, '::actor::import_state',
+    nsvc2.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n7-svc.bin')))));
+  const n7s = nst(nsvc2);
+  ok(new RegExp(alice.cid).test(n7s) && /recipient_cid/.test(n7s), `service registrations restored on the replacement packet`);
+  ok(!(ro(nsvc2, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize().replace(/[(),\s]/g, '') === ''), `token index restored`);
+  ok(/VAPID_PUB_TEST/.test(n7s), `vapid public key restored`);
+  ok(tokenOf(n7s) !== '' && tokenOf(n7s) === tokenOf(nst(nsvc)), `stored token round-trips byte-stable (post would validate on a same-cid restart)`);
+  const alice2 = mk('alice2'); await mkPacket(alice2, 'seed-alice-mig'); await sleep(1000);
+  await mutate(alice2, '::actor::import_state',
+    alice2.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n7-alice.bin')))));
+  const n7a = nst(alice2);
+  ok(/VAPID_PUB_TEST/.test(n7a) && new RegExp(nsvc.cid).test(n7a), `client my_regs restored (vapid pub + service cid intact)`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
