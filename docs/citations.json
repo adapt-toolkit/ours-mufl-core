@@ -96,5 +96,25 @@
     { "file": "version.mm", "symbol": "core_version" },
     { "file": "version.mm", "symbol": "MUST be updated every time we update ANY code" },
     { "file": "README.md", "symbol": "get_version" }
+  ],
+  "reference/modules.md": [
+    { "file": "a2a_capabilities.mm", "symbol": "Shared ours capabilities library" },
+    { "file": "a2a_protocol.mm", "symbol": "Shared ours protocol library" },
+    { "file": "a2a_messaging.mm", "symbol": "Shared ours messaging library" },
+    { "file": "a2a_cluster.mm", "symbol": "Shared ours cluster library" },
+    { "file": "a2a_monitoring.mm", "symbol": "Shared ours monitoring library" },
+    { "file": "a2a_control.mm", "symbol": "Shared ours control-plane library" },
+    { "file": "version.mm", "symbol": "get_core_version" },
+    { "file": "config.mufl", "symbol": "$exports" }
+  ],
+  "reference/implementations.md": [
+    { "file": "README.md", "symbol": "MCP agent server" },
+    { "file": "README.md", "symbol": "Telegram connector" }
+  ],
+  "reference/glossary.md": [
+    { "file": "README.md", "symbol": "identical wire" }
+  ],
+  "reference/contributing.md": [
+    { "file": "CONTRIBUTING.md", "symbol": "CLA" }
   ]
 }

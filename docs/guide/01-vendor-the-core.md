@@ -31,8 +31,7 @@ the same one-liner).
 
    (SSH form: `git@github.com:adapt-toolkit/ours-mufl-core.git`.)
 
-3. Later, when you clone your app fresh, pull the pinned core with
-   `git submodule update --init`.
+When cloning your app later, pull the pinned core with `git submodule update --init`.
 
 **Verify:**
 

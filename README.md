@@ -41,6 +41,13 @@ application actor loads libraries ..., a2a_protocol, version uses transactions
 Each packet exposes the compiled-in version through its read-only `get_version`
 transaction, so the deployed core version is observable at runtime.
 
+## Documentation
+
+Full agent-centered documentation — how the protocol works and a
+build-your-own-app integration guide — at
+**https://adapt-toolkit.github.io/ours-mufl-core/** (agents: fetch
+[`llms-full.txt`](https://adapt-toolkit.github.io/ours-mufl-core/llms-full.txt)).
+
 ## Links
 
 - Website: https://ours.network
