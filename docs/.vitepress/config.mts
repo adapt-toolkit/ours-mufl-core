@@ -6,7 +6,7 @@ export default defineConfig({
   base: '/ours-mufl-core/',          // flip to '/' if/when docs.ours.network lands (SPEC Q2)
   ignoreDeadLinks: false,            // dead internal links fail the build (SPEC C4/NFR4)
   markdown: {
-    languageAlias: { mufl: 'txt' }   // render ```mufl fences verbatim (SPEC C5)
+    languageAlias: { mufl: 'log' }   // render ```mufl fences verbatim (SPEC C5)
   },
   themeConfig: {
     search: { provider: 'local' },
