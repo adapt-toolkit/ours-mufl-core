@@ -148,6 +148,23 @@ application actor loads libraries
     {
         return ($store -> notify_addr_store, $count -> notify_addr_recv_count).
     }
+    // LEGACY notify-address SENDER — byte-for-byte the deployed fan-out targ
+    // shape ($address only, no $gen). Lets the engine rig prove a pre-engine
+    // peer's handout still lands at a v2 messenger (which must store it and
+    // send no ack).
+    trn qa_send_legacy_notify_address _:($target -> tgt: global_id, $address -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::actor::receive_notify_address",
+                    $targ -> ($address -> blob)
+                ),
+                _return_data ($sent_to -> tgt)
+            ].
+        }).
+    }
     // Exercises the metadata-only file monitoring summary directly (the loopback has
     // no bound control plane, so the format + byte-secrecy are asserted on the helper).
     trn qa_file_summary _:($filename -> f: str, $mime -> m: str, $data -> d: bin)
