@@ -91,6 +91,13 @@ application actor loads libraries
         unregs_log is any[] = [].
         regconfirm_log is any[] = [].
 
+        // Deployed-messenger emulation (LEGACY receive_notify_address): stores
+        // the blob, counts receipts, sends NO ack — exactly the pre-engine peer
+        // shape. Feeds the control-plane engine rig's byte-compat + retry-cap
+        // tests (notif-v2 DoD 9/10).
+        notify_addr_store is (global_id ->> bin) = (,).
+        notify_addr_recv_count is int = 0.
+
         a2a_notifications::init (
             $_read_or_abort -> _read_or_abort,
             $on_notification_posted -> fn (arg: any) -> transaction::action::type[]
@@ -122,6 +129,25 @@ application actor loads libraries
     trn receive_message args: any { return a2a_messaging::handle_receive_message args. }
     trn readonly list_incoming_messages _ { return ($inbox -> inbox). }
     trn readonly list_incoming_files _ { return ($files -> files). }
+
+    // LEGACY notify-address receiver — byte-for-byte the DEPLOYED messenger
+    // targ shape ($address only, required bin). Stores + counts, never acks.
+    // An engine sender's additive $gen field must route here unchanged
+    // (notif-v2 DoD 10 byte-compat obligation).
+    trn receive_notify_address _:($address -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort ().
+
+        from = current_transaction_info::get_external_envelope_or_abort() $from.
+        notify_addr_store from -> blob.
+        notify_addr_recv_count -> notify_addr_recv_count + 1.
+        return transaction::success [ _save_state NIL ].
+    }
+    trn readonly qa_notify_addr_store _
+    {
+        return ($store -> notify_addr_store, $count -> notify_addr_recv_count).
+    }
     // Exercises the metadata-only file monitoring summary directly (the loopback has
     // no bound control plane, so the format + byte-secrecy are asserted on the helper).
     trn qa_file_summary _:($filename -> f: str, $mime -> m: str, $data -> d: bin)
