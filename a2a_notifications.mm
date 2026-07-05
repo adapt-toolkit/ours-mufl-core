@@ -4,20 +4,25 @@
 // pattern):
 //
 //   - CLIENT half (compiled into every consumer): register with a notification
-//     service, hold the returned shared token, export the handout blob
-//     (notify_address_t), send_notification to any handout, relay mark_read.
+//     service, request per-contact scoped tokens (issue_tokens), export a
+//     per-contact handout blob (notify_address_t), send_notification to any
+//     handout, relay mark_read.
 //   - SERVICE half (exercised only by a notifier packet): registration + token
 //     state, post_notification ingest, and the app hooks a host daemon consumes
 //     for storage + WebPush egress. A packet "is" a notification service by
 //     USING this half and advertising cap_notifications — no node-type enum.
 //
-// Trust model (v1, owner-locked): the payload is NOT end-to-end private — the
+// Trust model (owner-locked): the payload is NOT end-to-end private — the
 // service reads every payload and delivers plaintext to the device (transport
-// legs are encrypted by the wire and by WebPush itself). Sender authorization
-// is possession of the service-minted shared token alone: post_notification
-// arrives as a BARE signed send from a packet the service never met (the
-// invite-leg precedent), NOT over an encrypted channel. There is no anti-spam;
-// rotating the token is the recovery path for a leaked/spammed handout.
+// legs are encrypted by the wire and by WebPush itself). Tokens are PER-CONTACT
+// scoped: every token names the one sender ($scope == _str sender_cid) it was
+// issued for, and sender authorization is possession of that scoped token PLUS
+// sender binding (the signature-verified envelope $from must equal $scope), so
+// a stolen token is useless without the named contact's signing key.
+// post_notification arrives as a BARE signed send from a packet the service
+// never met (the invite-leg precedent), NOT over an encrypted channel. There
+// is no anti-spam; per-contact rotation/revocation is the recovery path for a
+// leaked/spammed handout — a leak only ever exposes one relationship's channel.
 //
 // Delivery/storage stay APP-SIDE (the core's architectural rule): this library
 // validates + resolves and hands (notification, bindings) to injected hooks;
@@ -43,7 +48,6 @@ library a2a_notifications loads libraries
     post_notification_tx    = "::a2a_notifications::post_notification".
     mark_read_tx            = "::a2a_notifications::mark_read".
     issue_tokens_tx         = "::a2a_notifications::issue_tokens".
-    retire_shared_tx        = "::a2a_notifications::retire_shared".
     set_sender_muted_tx     = "::a2a_notifications::set_sender_muted".
     revoke_sender_tokens_tx = "::a2a_notifications::revoke_sender_tokens".
     // Maximum senders per issue_tokens call (V12 batch cap — the client wrapper
@@ -56,18 +60,18 @@ library a2a_notifications loads libraries
 
     // ---- wire shapes (all versioned; $c/$s signed-artifact idiom) ----------
 
-    // The shared sender token, minted and signed by the SERVICE. One token per
-    // recipient in v1 ($scope always ""); $token_id is the rotation/revocation
-    // handle (revocation is a service-side index lookup, not a signature
-    // question). The signature lets a CLIENT verify a handout against the
-    // service's pinned keys (check_signature_new_container idiom) — the service
-    // itself validates presented tokens by byte-equality against what it stored.
+    // The per-contact sender token, minted and signed by the SERVICE. One token
+    // per (recipient, sender) pair; $token_id is the rotation/revocation handle
+    // (revocation is a service-side index lookup, not a signature question).
+    // The signature lets a CLIENT verify a handout against the service's pinned
+    // keys (check_signature_new_container idiom) — the service itself validates
+    // presented tokens by byte-equality against what it stored.
     metadef notify_token_core_t: (
         $version       -> int,        // 1
         $service_cid   -> global_id,  // the issuing service (binds token to one N)
         $recipient_cid -> global_id,  // whom it notifies
         $token_id      -> global_id,  // rotation/revocation handle
-        $scope         -> str,        // v1 always "" (shared); reserved for per-sender/group later
+        $scope         -> str,        // _str of the SENDER cid this token is issued to
         $iat           -> time
     ).
     metadef notify_token_t: ($c -> notify_token_core_t, $s -> crypto_signature).
@@ -89,11 +93,12 @@ library a2a_notifications loads libraries
         $token        -> notify_token_t
     ).
 
-    // SERVICE-side registration record (core state on N).
+    // SERVICE-side registration record (core state on N). Registration carries
+    // NO token — per-contact tokens live in notify_sender_tokens, minted only
+    // by issue_tokens.
     metadef registration_t: (
         $version       -> int,       // 1
         $recipient_cid -> global_id,
-        $token         -> notify_token_t,
         $bindings      -> webpush_binding_t[],
         $created_at    -> time
     ).
@@ -102,7 +107,6 @@ library a2a_notifications loads libraries
     metadef my_registration_t: (
         $service_cid  -> global_id,
         $service_name -> str,
-        $token        -> notify_token_t,
         $vapid_pub    -> str,        // service's VAPID public key (browser subscribe param)
         $bindings     -> webpush_binding_t[],
         $created_at   -> time
@@ -140,18 +144,19 @@ library a2a_notifications loads libraries
     // only — the VAPID PRIVATE key never enters packet state.
     vapid_public_key is str = "".
 
-    // ---- service half v2: per-sender scoped token maps (DoD 1/5/6) -----------
+    // ---- service half: per-sender scoped token maps ---------------------------
     // notify_sender_tokens[recipient][sender]: scoped token minted by issue_tokens
     // (E8 idempotent — re-issue keeps existing token; scope == _str sender).
+    // The ONLY token store — registration carries no token.
     notify_sender_tokens is (global_id ->> (global_id ->> notify_token_t)) = (,).
-    // notify_sender_muted[recipient][sender]: mute flag set by future mute_sender
-    // inbound (a later task). Declared here so confirm_actions can mirror it.
+    // notify_sender_muted[recipient][sender]: receive-mute flag set by
+    // set_sender_muted. Stores FALSE when muted; ABSENT = enabled (§7).
     notify_sender_muted  is (global_id ->> (global_id ->> bool)) = (,).
 
-    // ---- client half v2: mirror of the per-sender tokens from the last confirm
+    // ---- client half: mirror of the per-sender tokens from the last confirm
     // my_notify_contact_tokens[service][sender]: the scoped token the service
-    // returned for that sender in the confirm_registration; populated wholesale
-    // from $sender_tokens in each confirm (mute-flag consumption is a later task).
+    // returned for that sender in the confirm_registration; replaced wholesale
+    // from $sender_tokens in each confirm (the confirm is the source of truth).
     my_notify_contact_tokens is (global_id ->> (global_id ->> notify_token_t)) = (,).
 
     hidden
@@ -173,9 +178,13 @@ library a2a_notifications loads libraries
         // on_unregistered ($recipient_cid): SERVICE side — registration torn
         //   down; the daemon may purge that recipient's log.
         on_unregistered is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { abort "on_unregistered hook is unset in a2a_notifications (call a2a_notifications::init)." when TRUE. return []. }
-        // on_notify_registration ($service_cid, $registration -> my_registration_t):
+        // on_notify_registration ($service_cid, $registration -> my_registration_t,
+        //   $sender_tokens -> (global_id ->> notify_token_t),
+        //   $sender_muted -> (global_id ->> bool)):
         //   CLIENT side — a confirm landed; the host surfaces $vapid_pub so the
-        //   browser can create/refresh its WebPush subscription.
+        //   browser can create/refresh its WebPush subscription. $sender_tokens/
+        //   $sender_muted are the full per-contact maps from the confirm so a
+        //   consumer (the messenger's distribution engine) can diff/mirror them.
         on_notify_registration is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { abort "on_notify_registration hook is unset in a2a_notifications (call a2a_notifications::init)." when TRUE. return []. }
     }
 
@@ -200,10 +209,10 @@ library a2a_notifications loads libraries
 
     // ---- service-side helpers ----------------------------------------------
 
-    // Mint a token for one recipient with an explicit scope. Scope "" is the
-    // v1/shared-token path; scope == _str sender is the v2 per-sender path.
-    // Detached signature over _value_id (the delegation_cert_t signing idiom).
-    // The CALLER stores the registration + index entry.
+    // Mint a per-contact token for one (recipient, sender) pair: scope is
+    // always _str of the sender cid the token is issued to. Detached signature
+    // over _value_id (the delegation_cert_t signing idiom). The CALLER stores
+    // the notify_sender_tokens slot + index entry.
     fn mint_notify_token_scoped (recipient: global_id, scope: str) -> notify_token_t
     {
         core is notify_token_core_t = (
@@ -217,24 +226,16 @@ library a2a_notifications loads libraries
         return ($c -> core, $s -> key_storage::default_sign (_value_id core)).
     }
 
-    // Backward-compat shim: callers that don't need a scope (register /
-    // rotate_token) keep minting with scope "" so nothing changes for v1 consumers.
-    fn mint_notify_token (recipient: global_id) -> notify_token_t
-    {
-        return mint_notify_token_scoped recipient "".
-    }
-
     // The confirm leg every service-side mutator replies with (register /
-    // update_bindings / rotate_token — idempotent): the stored token + this
-    // service's VAPID public key + the registration's current bindings, over
-    // the already-established encrypted channel.
+    // update_bindings / issue_tokens / rotate_token / … — idempotent): this
+    // service's VAPID public key, the registration's current bindings, and the
+    // full per-sender token + mute maps (the client mirrors them wholesale —
+    // re-confirms are idempotent replays), over the already-established
+    // encrypted channel.
     fn confirm_actions (recipient: global_id) -> transaction::action::type[]
     {
         reg = notify_registrations recipient.
         abort "No registration to confirm." when reg == NIL.
-        // v2 DoD 5: carry the per-sender token and mute maps so the client can
-        // mirror them. Additive-only — a v1-shaped consumer reading only
-        // $token/$vapid_pub/$bindings still parses correctly.
         sender_tokens_map is (global_id ->> notify_token_t) = (,).
         if (notify_sender_tokens recipient) != NIL { sender_tokens_map -> (notify_sender_tokens recipient)?. }
         sender_muted_map is (global_id ->> bool) = (,).
@@ -243,7 +244,6 @@ library a2a_notifications loads libraries
             encrypted_channel::send_encrypted_tx recipient (
                 $name -> confirm_registration_tx,
                 $targ -> (
-                    $token         -> (reg? $token),
                     $vapid_pub     -> vapid_public_key,
                     $bindings      -> (reg? $bindings),
                     $sender_tokens -> sender_tokens_map,
@@ -298,10 +298,10 @@ library a2a_notifications loads libraries
         }).
     }
 
-    // Replace a single sender's scoped token OR the shared token plus all scoped
-    // tokens (§5.4 / §8 / Q9). $contact present → rotate ONLY that sender's slot;
-    // $contact NIL → v1 behavior for the legacy shared token PLUS rotate ALL scoped
-    // slots (panic button). Recovery path for a leaked token or wholesale reset.
+    // Replace a single sender's scoped token OR all scoped tokens (§5.4 / §8 /
+    // Q9). $contact present → rotate ONLY that sender's slot; $contact NIL →
+    // rotate ALL scoped slots (panic button). Recovery path for a leaked token
+    // or wholesale reset.
     trn notify_rotate_token _:($service -> service_ref: str, $contact -> contact_ref: str+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
@@ -463,45 +463,26 @@ library a2a_notifications loads libraries
         }).
     }
 
-    // Retire the shared (legacy scope-"") token for my registration with a
-    // service: tells the service to delete the shared token's index entry
-    // (revocation by index removal — E4; registration record stays inert so
-    // the service still knows me). Idempotent: second call is a no-op (the
-    // service-side delete silently skips an already-gone entry — E4 discipline).
-    // After retirement the shared handout is permanently dead; scoped tokens
-    // for the same registration keep working normally.
-    trn notify_retire_shared _:($service -> service_ref: str)
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
-
-        target_id = a2a_messaging::resolve_contact service_ref.
-        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
-
-        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
-            return transaction::success [
-                encrypted_channel::send_encrypted_tx target_id (
-                    $name -> retire_shared_tx,
-                    $targ -> (,)
-                ),
-                _return_data ($sent_to -> target_id),
-                _save_state NIL
-            ].
-        }).
-    }
-
-    // Export the handout blob for my registration with a service ("to notify
-    // me: this service, this token"). Distribution is out of protocol — it
-    // rides ordinary send_message/send_file.
-    trn readonly export_notify_address _:($service -> service_ref: str)
+    // Export the per-contact handout blob for one contact ("to notify me: this
+    // service, this contact's scoped token"). The token must already exist in
+    // my_notify_contact_tokens (i.e. a confirm after notify_issue_tokens has
+    // landed). Distribution is out of protocol — it rides ordinary
+    // send_message/send_file or the messenger's distribution engine.
+    trn readonly export_notify_address _:($service -> service_ref: str, $contact -> contact_ref: str)
     {
         target_id = a2a_messaging::resolve_contact service_ref.
         reg = my_notify_registrations target_id.
         abort "No notification registration with that service." when reg == NIL.
+        contact_id = a2a_messaging::resolve_contact contact_ref.
+        outer = my_notify_contact_tokens target_id.
+        abort "No scoped token for that contact — call notify_issue_tokens first." when outer == NIL.
+        tok = (outer?) contact_id.
+        abort "No scoped token for that contact — call notify_issue_tokens first." when tok == NIL.
         addr is notify_address_t = (
             $version      -> 1,
             $service_cid  -> (reg? $service_cid),
             $service_name -> (reg? $service_name),
-            $token        -> (reg? $token)
+            $token        -> tok?
         ).
         return ($blob -> (_write addr), $service_cid -> (_str (reg? $service_cid))).
     }
@@ -550,10 +531,11 @@ library a2a_notifications loads libraries
         ].
     }
 
-    // SERVICE inbound: enroll the channel-authenticated sender. Re-register is
-    // idempotent recovery (E8): the token is KEPT (already-distributed handouts
-    // stay valid) and bindings are replaced only when provided; the confirm is
-    // re-sent either way.
+    // SERVICE inbound: enroll the channel-authenticated sender. Registration
+    // mints NO token — per-contact scoped tokens are minted exclusively by
+    // issue_tokens. Re-register is idempotent recovery (E8): existing scoped
+    // tokens stay untouched (already-distributed handouts stay valid) and
+    // bindings are replaced only when provided; the confirm is re-sent either way.
     fn handle_register (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -566,13 +548,13 @@ library a2a_notifications loads libraries
         existing = notify_registrations recipient.
         if existing != NIL
         {
-            // E8: keep the token; replace bindings only when the caller sent some.
+            // E8: replace bindings only when the caller sent some. Registration
+            // mints NOTHING — per-contact tokens come only from issue_tokens.
             if (args $bindings) != NIL
             {
                 notify_registrations recipient -> (
                     $version       -> (existing? $version),
                     $recipient_cid -> (existing? $recipient_cid),
-                    $token         -> (existing? $token),
                     $bindings      -> bindings,
                     $created_at    -> (existing? $created_at)
                 ).
@@ -580,15 +562,12 @@ library a2a_notifications loads libraries
         }
         else
         {
-            token = mint_notify_token recipient.
             notify_registrations recipient -> (
                 $version       -> 1,
                 $recipient_cid -> recipient,
-                $token         -> token,
                 $bindings      -> bindings,
                 $created_at    -> (current_transaction_info::get_transaction_time())?
             ).
-            notify_token_index (token $c $token_id) -> recipient.
         }
 
         actions is transaction::action::type[] = confirm_actions recipient.
@@ -611,7 +590,6 @@ library a2a_notifications loads libraries
         notify_registrations recipient -> (
             $version       -> (existing? $version),
             $recipient_cid -> (existing? $recipient_cid),
-            $token         -> (existing? $token),
             $bindings      -> bindings,
             $created_at    -> (existing? $created_at)
         ).
@@ -668,50 +646,13 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
-    // SERVICE inbound: retire the shared (scope-"") token for a registered
-    // sender — delete its notify_token_index entry so future posts using the
-    // old shared handout abort at step 3 (index lookup, "Unknown or revoked").
-    // The registration_t.$token field stays inert; the registration record
-    // itself is NOT removed (scoped tokens and re-confirm keep working).
-    // Idempotent (E4 discipline): if the index entry is already gone (second
-    // call, or after a rotation that replaced the shared token), the delete is
-    // a no-op — no abort is raised (§12.4 "tolerate/no-op" framing).
-    fn handle_retire_shared (args: any) -> transaction::results::type
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
-        encrypted_channel::check_encrypted_or_abort().
-
-        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
-        existing = notify_registrations recipient.
-        abort "No notification registration for this sender." when existing == NIL.
-
-        // One index delete — revocation by index removal (E4).
-        // delete on an absent key is a no-op, so this is naturally idempotent.
-        shared_tid = (existing? $token $c $token_id).
-        if (notify_token_index shared_tid) != NIL
-        {
-            delete notify_token_index shared_tid.
-        }
-
-        // Re-confirm so the client mirror stays coherent with the service state
-        // (consistent with all other service-side mutators).
-        actions is transaction::action::type[] = confirm_actions recipient.
-        actions (_count actions|) -> _save_state NIL.
-        return transaction::success actions.
-    }
-
     // SERVICE inbound: atomically replace tokens — two paths (§5.4):
     // · $sender present → per-sender path (DoD 3): rotate ONLY that sender's scoped
     //   token; old token_id dies on index delete; fresh scoped token minted / stored /
-    //   indexed in the same transaction. Shared token and other senders untouched.
-    // · $sender absent/NIL → rotate-all (Q9 panic button): v1 shared-token rotation
-    //   PLUS every scoped slot in notify_sender_tokens.
-    //   - Shared: retire-aware — if the shared token was NOT indexed before this call
-    //     (retired via notify_retire_shared), mint / store but keep the new token
-    //     unindexed — do NOT un-retire (V5 — rotate-all does not resurrect a retired
-    //     shared token's index entry).
-    //   - Scoped: keys collected first to avoid mutation-while-iterating; each old
-    //     index entry deleted and new token minted / stored / indexed.
+    //   indexed in the same transaction. Other senders untouched.
+    // · $sender absent/NIL → rotate-all (Q9 panic button): every scoped slot in
+    //   notify_sender_tokens. Keys collected first to avoid mutation-while-iterating;
+    //   each old index entry deleted and new token minted / stored / indexed.
     fn handle_rotate_token (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -740,30 +681,10 @@ library a2a_notifications loads libraries
         }
         else
         {
-            // Rotate-all path (Q9): shared token + ALL scoped tokens.
-            //
-            // Shared token: check index state BEFORE deleting so the new token
-            // follows the same indexed / unindexed discipline. If retire_shared
-            // already removed the entry (shared_was_indexed == FALSE), mint and
-            // store the new token in the registration record but do NOT re-index it
-            // (V5 — rotate-all must not un-retire a deliberately retired shared token).
-            shared_tid = (existing? $token $c $token_id).
-            shared_was_indexed = (notify_token_index shared_tid) != NIL.
-            if shared_was_indexed { delete notify_token_index shared_tid. }
-            new_shared = mint_notify_token recipient.
-            notify_registrations recipient -> (
-                $version       -> (existing? $version),
-                $recipient_cid -> (existing? $recipient_cid),
-                $token         -> new_shared,
-                $bindings      -> (existing? $bindings),
-                $created_at    -> (existing? $created_at)
-            ).
-            // Re-index ONLY when the old shared token was indexed — if retire_shared
-            // removed the entry, rotating does not resurrect it (V5).
-            if shared_was_indexed { notify_token_index (new_shared $c $token_id) -> recipient. }
-
-            // Scoped tokens: collect all sender keys first (two-pass — avoid
-            // mutation-while-iterating the map), then rotate each slot atomically.
+            // Rotate-all path (Q9 panic button): every scoped slot. Keys are
+            // collected first (two-pass — avoid mutation-while-iterating the
+            // map), then each slot rotates atomically. No scoped tokens yet →
+            // no-op rotate; the confirm still replays the (empty) maps.
             if (notify_sender_tokens recipient) != NIL
             {
                 existing_map is (global_id ->> notify_token_t) = (,).
@@ -866,9 +787,11 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
-    // SERVICE inbound: full teardown for a registered sender — registration +
-    // token index entry removed, then the hook lets the daemon purge its log
-    // (hook actions before the save, the remove_contact composition).
+    // SERVICE inbound: full teardown for a registered sender — registration,
+    // every scoped token (slot + index entry) and the mute map removed, then
+    // the hook lets the daemon purge its log (hook actions before the save,
+    // the remove_contact composition). Re-register + issue_tokens starts from
+    // a clean slate (old handouts die at the index lookup — E4).
     fn handle_unregister (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -878,7 +801,21 @@ library a2a_notifications loads libraries
         existing = notify_registrations recipient.
         abort "No notification registration for this sender." when existing == NIL.
 
-        delete notify_token_index (existing? $token $c $token_id).
+        // Revoke every scoped token: two-pass (collect keys, then delete) to
+        // avoid mutation-while-iterating.
+        if (notify_sender_tokens recipient) != NIL
+        {
+            token_map is (global_id ->> notify_token_t) = (notify_sender_tokens recipient)?.
+            sender_keys is global_id[] = [].
+            sc token_map -- (s -> _) { sender_keys (_count sender_keys|) -> s. }
+            sc sender_keys -- ( -> s)
+            {
+                tok = token_map s.
+                if tok != NIL { delete notify_token_index (tok? $c $token_id). }
+            }
+            delete notify_sender_tokens recipient.
+        }
+        if (notify_sender_muted recipient) != NIL { delete notify_sender_muted recipient. }
         delete notify_registrations recipient.
 
         actions is transaction::action::type[] = [].
@@ -923,8 +860,6 @@ library a2a_notifications loads libraries
         sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
         abort "Unsolicited registration confirm." when (pending_notify_registers sender_id) == NIL && (my_notify_registrations sender_id) == NIL.
 
-        token = (args $token) safe notify_token_t.
-        abort "Unsupported notify token version." when (token $c $version) != 1.
         vapid_pub = (args $vapid_pub) safe str.
         bindings is webpush_binding_t[] = [].
         if (args $bindings) != NIL { bindings -> (args $bindings) safe (webpush_binding_t[]). }
@@ -936,7 +871,6 @@ library a2a_notifications loads libraries
         myreg is my_registration_t = (
             $service_cid  -> sender_id,
             $service_name -> service_name,
-            $token        -> token,
             $vapid_pub    -> vapid_pub,
             $bindings     -> bindings,
             $created_at   -> (current_transaction_info::get_transaction_time())?
@@ -944,15 +878,25 @@ library a2a_notifications loads libraries
         my_notify_registrations sender_id -> myreg.
         if (pending_notify_registers sender_id) != NIL { delete pending_notify_registers sender_id. }
 
-        // v2 DoD 5/6: replace the contact-token mirror from the confirm wholesale.
-        // Absent on v1-era confirms → guard keeps existing (empty-default) map.
+        // Replace the contact-token mirror from the confirm wholesale — the
+        // confirm is the single source of truth; re-confirms are idempotent
+        // replays. The mute map is passed through to the hook so a consumer
+        // (e.g. the messenger's distribution engine) can mirror it too.
+        sender_tokens_map is (global_id ->> notify_token_t) = (,).
         if (args $sender_tokens) != NIL
         {
-            my_notify_contact_tokens sender_id -> (args $sender_tokens) safe (global_id ->> notify_token_t).
+            sender_tokens_map -> (args $sender_tokens) safe (global_id ->> notify_token_t).
+        }
+        my_notify_contact_tokens sender_id -> sender_tokens_map.
+        sender_muted_map is (global_id ->> bool) = (,).
+        if (args $sender_muted) != NIL
+        {
+            sender_muted_map -> (args $sender_muted) safe (global_id ->> bool).
         }
 
         actions is transaction::action::type[] = [].
-        sc on_notify_registration ($service_cid -> sender_id, $registration -> myreg) -- ( -> a)
+        sc on_notify_registration ($service_cid -> sender_id, $registration -> myreg,
+                                   $sender_tokens -> sender_tokens_map, $sender_muted -> sender_muted_map) -- ( -> a)
         {
             actions (_count actions|) -> a.
         }
@@ -966,13 +910,19 @@ library a2a_notifications loads libraries
     // token is the sole authorization. Validation order matters (abort on first
     // failure, mutate nothing):
     //   1. parse-safe + version   2. minted by THIS service   3. live index
-    //   entry matching $recipient_cid (rotation/unregister deletes entries, so
-    //   revocation is a state lookup)   4. byte-equality vs the STORED token
-    //   (_value_id) — forging any field, $scope included, requires possessing
-    //   the exact minted artifact; no signature re-verification is needed
-    //   because we compare against what we ourselves stored   5. payload cap.
-    // $sender_cid is the wrapper-verified envelope $from — informational only
-    // (E14), never authorization. Fire-and-forget: no reply leg.
+    //   entry matching $recipient_cid (rotation/revocation/unregister deletes
+    //   entries, so revocation is a state lookup)   4. sender binding — the
+    //   signature-verified envelope $from must equal the token's $scope
+    //   (evaluated before byte-equality: mufl has no reverse _str() to recover
+    //   a global_id from the scope string; observably equivalent to the SPEC
+    //   order)   5. byte-equality vs the STORED token in
+    //   notify_sender_tokens[recipient][sender] (_value_id) — forging any
+    //   field, $scope included, requires possessing the exact minted artifact;
+    //   no signature re-verification is needed because we compare against what
+    //   we ourselves stored   6. mute check (FALSE stored = muted, absent =
+    //   enabled)   7. payload cap.
+    // All checks precede hook/store writes (NFR-6). Fire-and-forget: no reply
+    // leg — an aborted post is invisible to the sender (mute is unprobeable).
     fn handle_post_notification (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -988,40 +938,23 @@ library a2a_notifications loads libraries
         reg = notify_registrations (token $c $recipient_cid).
         abort "No registration for the token's recipient." when reg == NIL.
 
-        // Step 4 — dispatch on $scope: "" = v1/legacy path (shared token);
-        // non-empty = v2/scoped path (per-sender token, steps 4-6 extended).
-        token_scope = (token $c $scope).
-        if token_scope == ""
+        // Sender binding (Q1 strict): envelope $from must equal the token's
+        // $scope. A token with any other scope — including the empty string —
+        // is not bound to this sender and dies here.
+        abort "Token is not bound to this sender." when (token $c $scope) != _str sender_id.
+        // Byte-equality vs notify_sender_tokens[recipient][sender]. Absent
+        // outer map or absent sender slot both abort (never-issued or revoked).
+        scoped_outer = notify_sender_tokens (token $c $recipient_cid).
+        abort "Token is not bound to this sender." when scoped_outer == NIL.
+        scoped_tok_entry = (scoped_outer?) sender_id.
+        abort "Token is not bound to this sender." when scoped_tok_entry == NIL.
+        abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id scoped_tok_entry?).
+        // Mute check: FALSE stored = muted per §4.1; absent = enabled.
+        muted_outer = notify_sender_muted (token $c $recipient_cid).
+        if muted_outer != NIL
         {
-            // V1/legacy path: byte-equality vs the stored shared token in
-            // registration_t.$token. Shared token validates exactly as v1
-            // while its index entry is live (step 3 above kills it after retire).
-            abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id (reg? $token)).
-        }
-        else
-        {
-            // V2/scoped path —
-            // Step 5 (evaluated first in code — no reverse _str() to recover a
-            // global_id from scope; Q1 strict binding per §16): envelope $from
-            // must equal the token's $scope string. This also means a v1 sender
-            // posting a scoped token (it treats the blob as opaque) passes as long
-            // as it posts from the cid the token was issued to — happy path intact.
-            abort "Token is not bound to this sender." when token_scope != _str sender_id.
-            // Step 4 (scoped): byte-equality vs notify_sender_tokens[recipient][sender].
-            // Absent outer map or absent sender slot both abort (never-issued or revoked).
-            scoped_outer = notify_sender_tokens (token $c $recipient_cid).
-            abort "Token is not bound to this sender." when scoped_outer == NIL.
-            scoped_tok_entry = (scoped_outer?) sender_id.
-            abort "Token is not bound to this sender." when scoped_tok_entry == NIL.
-            abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id scoped_tok_entry?).
-            // Step 6 — mute check (scoped only): FALSE stored = muted per §4.1;
-            // absent = enabled. All checks precede hook/store writes — NFR-6.
-            muted_outer = notify_sender_muted (token $c $recipient_cid).
-            if muted_outer != NIL
-            {
-                muted_entry = muted_outer? sender_id.
-                abort "Notifications from this sender are disabled." when muted_entry != NIL.
-            }
+            muted_entry = muted_outer? sender_id.
+            abort "Notifications from this sender are disabled." when muted_entry != NIL.
         }
 
         payload = (args $payload) safe str.
@@ -1054,7 +987,6 @@ library a2a_notifications loads libraries
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
     trn issue_tokens args: any { return handle_issue_tokens args. }
-    trn retire_shared args: any { return handle_retire_shared args. }
     trn set_sender_muted args: any { return handle_set_sender_muted args. }
     trn revoke_sender_tokens args: any { return handle_revoke_sender_tokens args. }
 

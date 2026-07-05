@@ -436,7 +436,7 @@ application actor loads libraries
         ].
     }
 
-    // ---- N17-N22 probes (v2 validation + retire_shared) ----
+    // ---- N17+ probes (per-contact validation) ----
 
     // Export a notify_address_t blob using a scoped (per-sender) token from
     // my_notify_contact_tokens[service][sender]. Lets a sender post via the
@@ -494,14 +494,15 @@ application actor loads libraries
         return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
     }
 
-    // Return the token_id of this actor's client-side shared-token registration
-    // mirror (my_notify_registrations[$service].$token.$c.$token_id). Used in N24
-    // to assert that rotate-all after retire does NOT re-index the new shared token.
-    trn readonly qa_client_reg_token_id _:($service -> svc: global_id)
+    // Return exactly the $sender_muted map the LAST on_notify_registration hook
+    // call carried (the engine-mirror feed). Precise probe — avoids grepping
+    // the whole regconfirm_log dump.
+    trn readonly qa_last_confirm_muted _
     {
-        reg = a2a_notifications::my_notify_registrations svc.
-        abort "No registration for this service." when reg == NIL.
-        return ($token_id -> (reg? $token $c $token_id)).
+        found is any = NIL.
+        sc regconfirm_log -- ( -> entry) { found -> entry. }
+        abort "No confirms logged." when found == NIL.
+        return ($sender_muted -> (found $sender_muted)).
     }
 
     // Send set_sender_muted directly to the service without going through the
@@ -525,17 +526,11 @@ application actor loads libraries
     // that is neither a pending nor a registered service of the target.
     trn qa_send_fake_confirm _:($target -> target: global_id)
     {
-        core is a2a_notifications::notify_token_core_t = (
-            $version -> 1, $service_cid -> _get_container_id(), $recipient_cid -> target,
-            $token_id -> _new_id "qa fake confirm token", $scope -> "",
-            $iat -> (current_transaction_info::get_transaction_time())?
-        ).
-        token is a2a_notifications::notify_token_t = ($c -> core, $s -> key_storage::default_sign (_value_id core)).
         return encrypted_channel::execute_transaction target (fn (_) -> transaction::results::type {
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target (
                     $name -> "::a2a_notifications::confirm_registration",
-                    $targ -> ($token -> token, $vapid_pub -> "EVIL_VAPID", $bindings -> NIL)
+                    $targ -> ($vapid_pub -> "EVIL_VAPID", $bindings -> NIL, $sender_tokens -> (,), $sender_muted -> (,))
                 ),
                 _return_data ($sent -> TRUE)
             ].
