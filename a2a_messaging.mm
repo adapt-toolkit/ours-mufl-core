@@ -708,7 +708,8 @@ library a2a_messaging loads libraries
             $cert -> (b $cert),
             $root_profile -> (b $root_profile),
             $cp_binding -> (b $cp_binding),
-            $invite_id -> invite_id
+            $invite_id -> invite_id,
+            $name -> my_name
         ).
         data = _crypto_encrypt_message (kpr $secret_key) eph_pub_inviter payload.
 
@@ -1492,7 +1493,11 @@ library a2a_messaging loads libraries
 
         // --- all gates passed: register + single-use consume (INV-5) ---
         contact_name is str = (rec?) $assigned.
-        if contact_name == "" { contact_name -> (_str sender_id). }
+        if contact_name == ""
+        {
+            joiner_name is str = (payload $name) safe str.
+            contact_name -> (joiner_name == "" ?? (_str sender_id) ; joiner_name).
+        }
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
