@@ -8,6 +8,8 @@
     "docs:check": "node scripts/check-citations.mjs && node scripts/check-denylist.mjs"
   },
   "devDependencies": {
-    "vitepress": "^1.6.0"
+    "mermaid": "^11.16.0",
+    "vitepress": "^1.6.0",
+    "vitepress-plugin-mermaid": "^2.0.17"
   }
 }

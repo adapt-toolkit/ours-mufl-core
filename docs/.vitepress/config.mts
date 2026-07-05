@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitepress'
+import { withMermaid } from 'vitepress-plugin-mermaid'
 
-export default defineConfig({
+export default withMermaid(defineConfig({
   title: 'ours-mufl-core',
   description: 'The shared agent-to-agent protocol core for ours.network — agent-centered documentation.',
   base: '/ours-mufl-core/',          // flip to '/' if/when docs.ours.network lands (SPEC Q2)
@@ -12,6 +13,7 @@ export default defineConfig({
     search: { provider: 'local' },
     nav: [
       { text: 'How it works', link: '/how-it-works/overview' },
+      { text: 'Transaction flows', link: '/workflows/' },
       { text: 'Build on it', link: '/guide/' },
       { text: 'Reference', link: '/reference/modules' }
     ],
@@ -25,6 +27,16 @@ export default defineConfig({
         { text: 'Cluster', link: '/how-it-works/cluster' },
         { text: 'Monitoring & config', link: '/how-it-works/monitoring-and-config' },
         { text: 'Versioning', link: '/how-it-works/versioning' }
+      ]}],
+      '/workflows/': [{ text: 'Transaction flows', items: [
+        { text: 'How to read these diagrams', link: '/workflows/' },
+        { text: 'Contact exchange (invite)', link: '/workflows/contact-exchange' },
+        { text: 'Send & receive messages', link: '/workflows/messaging' },
+        { text: 'Contact restore', link: '/workflows/contact-restore' },
+        { text: 'Monitoring bind & copies', link: '/workflows/monitoring' },
+        { text: 'Control-plane verb calls', link: '/workflows/control-verbs' },
+        { text: 'Introductions (core.connect)', link: '/workflows/introductions' },
+        { text: 'Cluster lifecycle', link: '/workflows/cluster' }
       ]}],
       '/guide/': [{ text: 'Build your own app', items: [
         { text: 'Start here', link: '/guide/' },
@@ -43,4 +55,4 @@ export default defineConfig({
     },
     socialLinks: [{ icon: 'github', link: 'https://github.com/adapt-toolkit/ours-mufl-core' }]
   }
-})
+}))

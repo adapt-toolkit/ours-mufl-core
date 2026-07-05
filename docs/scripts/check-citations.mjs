@@ -22,7 +22,7 @@ for (const [page, cites] of Object.entries(manifest)) {
 
 // coverage: every content page that is no longer a stub must be in the manifest
 const stubMarker = '*(content lands in Tasks'
-for (const dir of ['how-it-works', 'guide', 'reference']) {
+for (const dir of ['how-it-works', 'workflows', 'guide', 'reference']) {
   for (const f of readdirSync(join(docsRoot, dir))) {
     if (!f.endsWith('.md')) continue
     const rel = `${dir}/${f}`

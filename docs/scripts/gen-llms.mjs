@@ -10,6 +10,8 @@ const SITE = 'https://adapt-toolkit.github.io/ours-mufl-core'
 const ORDER = ['index.md',
   ...['overview','identity','invites-and-contacts','messaging','capabilities-and-control',
       'cluster','monitoring-and-config','versioning'].map(p => `how-it-works/${p}.md`),
+  ...['index','contact-exchange','messaging','contact-restore','monitoring',
+      'control-verbs','introductions','cluster'].map(p => `workflows/${p}.md`),
   ...['index','01-vendor-the-core','02-configure-and-compile','03-wire-the-host',
       '04-connect-and-message','05-test-your-app'].map(p => `guide/${p}.md`),
   ...['modules','implementations','glossary','contributing'].map(p => `reference/${p}.md`)]

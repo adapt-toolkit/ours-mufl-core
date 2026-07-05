@@ -6,6 +6,8 @@ scheme id — no long-term keys, no self-signatures. Identity material moves ins
 messages exchanged after the initial out-of-band transfer.
 
 Source: [`a2a_messaging.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_messaging.mm).
+Sequence diagrams: [Contact exchange](../workflows/contact-exchange.md) and
+[Introductions](../workflows/introductions.md).
 
 ## Invite shape
 

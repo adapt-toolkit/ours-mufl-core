@@ -9,6 +9,9 @@ Module description: [`README.md`](https://github.com/adapt-toolkit/ours-mufl-cor
 — "Contact and messaging transactions (generate invite, add/remove contact, send message, send
 file, inbound receive) and the introduction flow."
 
+Sequence diagrams: [Send & receive messages](../workflows/messaging.md) and
+[Contact restore](../workflows/contact-restore.md).
+
 ## Outbound
 
 - **`send_message`** — sends text to a named or container-id-referenced contact. Accepts an
