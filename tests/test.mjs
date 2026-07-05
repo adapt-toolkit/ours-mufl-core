@@ -582,6 +582,8 @@ async function main() {
   ok(ro(nsvc, '::actor::qa_notify_state_v2', undefined).Reduce('sender_tokens').Visualize().replace(/[(),\s]/g, '') === '', `scoped token slots purged on unregister`);
   ok(new RegExp(alice.cid).test(ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('unregs_log').Visualize()), `on_unregistered fired with alice's cid`);
   ok(ro(alice, '::actor::qa_notify_state', undefined).Reduce('my_regs').Visualize().replace(/[(),\s]/g, '') === '', `client my_regs cleared`);
+  ok(ro(alice, '::actor::qa_notify_state_v2', undefined).Reduce('contact_tokens').Visualize().replace(/[(),\s]/g, '') === '',
+    `client contact-token mirror cleared on unregister (no stale-token source)`);
   const n5Before = nst(nsvc);
   await mutate(nbob, '::a2a_notifications::send_notification',
                { address: binv(nbob, addr2), payload: 'post-unregister-ping' });

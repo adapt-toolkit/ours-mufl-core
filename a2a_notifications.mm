@@ -409,6 +409,11 @@ library a2a_notifications loads libraries
         target_id = a2a_messaging::resolve_contact service_ref.
         if (my_notify_registrations target_id) != NIL { delete my_notify_registrations target_id. }
         if (pending_notify_registers target_id) != NIL { delete pending_notify_registers target_id. }
+        // The contact-token mirror goes with the registration: the service
+        // purges its token store on unregister, so a kept mirror would be a
+        // stale-token source (e.g. a distribution engine rebuilding handout
+        // blobs from it after the tokens died at the service).
+        if (my_notify_contact_tokens target_id) != NIL { delete my_notify_contact_tokens target_id. }
 
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             return transaction::success [
@@ -1011,10 +1016,13 @@ library a2a_notifications loads libraries
 
     fn import_notify_state (data: any) -> nil
     {
-        // Every field is optional (an export that predates this library imports
-        // unchanged — defaults stay in place when absent). pending_notify_registers
-        // is transient by design: an in-flight register/rotate does not survive an
-        // export/import (re-register is idempotent and keeps the token — E8).
+        // Every field is optional (an export that predates this LIBRARY —
+        // i.e. carries no notify fields at all — imports unchanged with the
+        // defaults in place; 0.3-era exports with token-bearing registration
+        // records are NOT a supported input, no such deployments exist).
+        // pending_notify_registers is transient by design: an in-flight
+        // register/rotate does not survive an export/import (re-register is
+        // idempotent — E8).
         if (data $my_notify_registrations) != NIL
         {
             my_notify_registrations -> (data $my_notify_registrations) safe (global_id ->> my_registration_t).
