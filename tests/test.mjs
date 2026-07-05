@@ -1040,8 +1040,16 @@ async function main() {
   // alice's my_notify_registrations[nsvc] is updated by the rotate-all confirm with the new shared token.
   const n24RetiredTokId = ro(alice, '::actor::qa_client_reg_token_id',
     { service: nsvc.cid }).Reduce('token_id').Visualize();
-  const n24IdxStr = ro(nsvc, '::actor::qa_notify_state', undefined).Visualize();
-  ok(n24RetiredTokId !== '' && !n24IdxStr.includes(n24RetiredTokId),
+  // Per SPEC §4.1/§12.4 the record keeps an inert $token — the new shared token MUST be
+  // minted + stored in notify_registrations (record-shape stability) but must NOT be
+  // re-indexed. Assert each half against its own state slice: the tid IS in the
+  // registration record, and is NOT in notify_token_index. (Grepping the whole
+  // qa_notify_state dump would always find the tid in $registrations by mandate.)
+  const n24RegStr = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('registrations').Visualize();
+  const n24IdxStr = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize();
+  ok(n24RetiredTokId !== '' && n24RegStr.includes(n24RetiredTokId),
+    `V5: rotate-all after retire re-mints + stores the inert shared token in the registration record (§4.1)`);
+  ok(!n24IdxStr.includes(n24RetiredTokId),
     `V5: rotate-all after retire does NOT re-index the new shared token (tid=${n24RetiredTokId})`);
 
   // ---------- N25 revoke (DoD 3 — revoke-without-replace) ----------
