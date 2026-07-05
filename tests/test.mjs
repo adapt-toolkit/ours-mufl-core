@@ -838,23 +838,35 @@ async function main() {
   ok(nst(nsvc) === n18Before, `$from≠$scope: service rejects (step 5 binding check), zero state change`);
   ok(!/evil-neve/.test(nst(nsvc)), `$from≠$scope: payload does not appear in log`);
 
-  // ---------- N19 muted sender ----------
+  // ---------- N19 muted sender (DoD 4 — real set_sender_muted round-trip) ----------
   CUR = 'N19-muted';
   console.log('\n=== N19 muted sender ===');
-  // Set mute: write FALSE into notify_sender_muted[alice][nbob] via qa probe.
-  await mutate(nsvc, '::actor::qa_notify_set_muted', { recipient: alice.cid, sender: nbob.cid });
+  // Capture nbob's scoped token_id BEFORE the mute cycle to assert no re-issue (DoD 4).
+  const n19TokIdBefore = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: nbob.cid }).Reduce('token_id').Visualize();
+  // Mute via the REAL service inbound (§5.2 round-trip): alice tells nsvc to mute nbob.
+  await mutate(alice, '::a2a_notifications::notify_set_sender_muted',
+    { service: 'svc', contact: nbob.cid, muted: true });
+  await sleep(2500);
   const n19Before = nst(nsvc);
   await mutate(nbob, '::a2a_notifications::send_notification',
                { address: binv(nbob, n17ScopedAddrBlob), payload: 'muted-ping' });
   await sleep(2500);
   ok(nst(nsvc) === n19Before, `muted: post from muted sender aborts (step 6), no hook fired, zero state change`);
   ok(!/muted-ping/.test(nst(nsvc)), `muted: payload does not appear in log`);
-  // Unmute: delete the entry (absent = enabled per §7). Same token delivers without re-issue.
-  await mutate(nsvc, '::actor::qa_notify_clear_muted', { recipient: alice.cid, sender: nbob.cid });
+  // Unmute via the REAL service inbound ($muted FALSE → delete entry; absent = enabled §7).
+  await mutate(alice, '::a2a_notifications::notify_set_sender_muted',
+    { service: 'svc', contact: nbob.cid, muted: false });
+  await sleep(2500);
   await mutate(nbob, '::a2a_notifications::send_notification',
                { address: binv(nbob, n17ScopedAddrBlob), payload: 'unmuted-ping' });
   await sleep(2500);
   ok(/unmuted-ping/.test(nst(nsvc)), `unmuted: same token delivers after mute cleared (no re-issue needed)`);
+  // DoD 4: token_id must be byte-identical across the mute/unmute cycle — no re-issue.
+  const n19TokIdAfter = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: nbob.cid }).Reduce('token_id').Visualize();
+  ok(n19TokIdBefore !== '' && n19TokIdBefore === n19TokIdAfter,
+    `DoD4: token_id unchanged across mute/unmute cycle (no re-issue: ${n19TokIdBefore})`);
 
   // ---------- N20 legacy token + notify_retire_shared ----------
   CUR = 'N20-retire-shared';
@@ -913,6 +925,187 @@ async function main() {
     .then(() => null, (e) => e.message || String(e));
   ok(n22Err !== null, `retire gate: unregistered caller aborts (client-side gate)`);
   ok(/No notification registration/.test(n22Err || ''), `retire gate: abort is "No notification registration with that service."`);
+
+  // ====== v2 N23-N26: per-sender rotation, revocation, receive-mute (DoD 3/4) ======
+
+  // ---------- N23 per-sender rotate (DoD 3) ----------
+  CUR = 'N23-per-sender-rotate';
+  console.log('\n=== N23 per-sender rotate (DoD 3) ===');
+  // N23 setup: re-register alice (N22 unregistered her) then issue scoped tokens for neve and nbob.
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500);
+  await mutate(alice, '::a2a_notifications::notify_issue_tokens',
+    { service: 'svc', contacts: [neve.cid, nbob.cid] });
+  await sleep(2500);
+  // Capture token_ids (qa_scoped_token_id reads notify_sender_tokens[alice][sender].$c.$token_id).
+  const n23NeveTokId1 = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: neve.cid }).Reduce('token_id').Visualize();
+  const n23NbobTokId1 = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: nbob.cid }).Reduce('token_id').Visualize();
+  ok(n23NeveTokId1 !== '' && n23NbobTokId1 !== '', `N23 setup: both scoped token_ids available before rotation`);
+  // Export neve's current blob from alice's contact-token mirror (used for old-blob abort test).
+  const n23NeveBlob1 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: neve.cid }).Reduce('blob').GetBinary()
+  );
+  const n23NbobBlob = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: nbob.cid }).Reduce('blob').GetBinary()
+  );
+  // Per-sender rotate: rotate ONLY neve's token (contact = neve.cid).
+  await mutate(alice, '::a2a_notifications::notify_rotate_token',
+    { service: 'svc', contact: neve.cid });
+  await sleep(2500);
+  // DoD 3: neve's token_id must change; nbob's must be unchanged.
+  const n23NeveTokId2 = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: neve.cid }).Reduce('token_id').Visualize();
+  const n23NbobTokId2 = ro(nsvc, '::actor::qa_scoped_token_id',
+    { recipient: alice.cid, sender: nbob.cid }).Reduce('token_id').Visualize();
+  ok(n23NeveTokId2 !== '' && n23NeveTokId2 !== n23NeveTokId1,
+    `DoD3: neve's token_id changed after per-sender rotate`);
+  ok(n23NbobTokId2 !== '' && n23NbobTokId2 === n23NbobTokId1,
+    `DoD3: nbob's token_id unchanged after rotating only neve`);
+  // neve's OLD blob must abort at index lookup (old token_id deleted from notify_token_index).
+  const n23Before = nst(nsvc);
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n23NeveBlob1), payload: 'neve-old-token-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n23Before, `DoD3: neve's old scoped blob aborts after per-sender rotate (zero state change)`);
+  ok(!/neve-old-token-ping/.test(nst(nsvc)), `DoD3: neve old payload absent`);
+  // neve's NEW blob (from alice's updated contact-token mirror) must deliver.
+  const n23NeveBlob2 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: neve.cid }).Reduce('blob').GetBinary()
+  );
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n23NeveBlob2), payload: 'neve-new-token-ping' });
+  await sleep(2500);
+  ok(/neve-new-token-ping/.test(nst(nsvc)), `DoD3: neve's new scoped blob delivers after per-sender rotation`);
+  // nbob's blob is unchanged — must still deliver (only neve's token was rotated).
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n23NbobBlob), payload: 'nbob-unrotated-ping' });
+  await sleep(2500);
+  ok(/nbob-unrotated-ping/.test(nst(nsvc)), `DoD3: nbob's token unaffected by neve's per-sender rotation`);
+
+  // ---------- N24 rotate-all (Q9 panic button) + V5 retired-shared invariant ----------
+  CUR = 'N24-rotate-all';
+  console.log('\n=== N24 rotate-all (Q9) + V5 retired-shared invariant ===');
+  // Export current neve and nbob blobs from alice's updated mirror (after N23 rotation of neve).
+  const n24NeveBlob1 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: neve.cid }).Reduce('blob').GetBinary()
+  );
+  const n24NbobBlob1 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: nbob.cid }).Reduce('blob').GetBinary()
+  );
+  // Rotate-all: $contact absent → rotate shared token + ALL scoped slots (Q9).
+  await mutate(alice, '::a2a_notifications::notify_rotate_token', { service: 'svc' });
+  await sleep(2500);
+  // OLD neve and nbob scoped blobs must abort (old token_ids deleted from index).
+  const n24Before = nst(nsvc);
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n24NeveBlob1), payload: 'neve-rotate-all-old-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n24Before, `rotate-all: neve's old scoped blob aborts after rotate-all (zero state change)`);
+  ok(!/neve-rotate-all-old-ping/.test(nst(nsvc)), `rotate-all: neve old payload absent`);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n24NbobBlob1), payload: 'nbob-rotate-all-old-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n24Before, `rotate-all: nbob's old scoped blob aborts after rotate-all (zero state change)`);
+  ok(!/nbob-rotate-all-old-ping/.test(nst(nsvc)), `rotate-all: nbob old payload absent`);
+  // NEW blobs (from alice's updated mirror, populated by the rotate-all confirm) must deliver.
+  const n24NeveBlob2 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: neve.cid }).Reduce('blob').GetBinary()
+  );
+  const n24NbobBlob2 = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: nbob.cid }).Reduce('blob').GetBinary()
+  );
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n24NeveBlob2), payload: 'neve-rotate-all-new-ping' });
+  await sleep(2500);
+  ok(/neve-rotate-all-new-ping/.test(nst(nsvc)), `rotate-all: neve's new scoped blob delivers`);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n24NbobBlob2), payload: 'nbob-rotate-all-new-ping' });
+  await sleep(2500);
+  ok(/nbob-rotate-all-new-ping/.test(nst(nsvc)), `rotate-all: nbob's new scoped blob delivers`);
+  // V5: retire shared token, then rotate-all → the new shared token must NOT be re-indexed
+  // (rotate-all does not un-retire a deliberately retired shared token).
+  await mutate(alice, '::a2a_notifications::notify_retire_shared', { service: 'svc' });
+  await sleep(2500);
+  await mutate(alice, '::a2a_notifications::notify_rotate_token', { service: 'svc' });
+  await sleep(2500);
+  // alice's my_notify_registrations[nsvc] is updated by the rotate-all confirm with the new shared token.
+  const n24RetiredTokId = ro(alice, '::actor::qa_client_reg_token_id',
+    { service: nsvc.cid }).Reduce('token_id').Visualize();
+  const n24IdxStr = ro(nsvc, '::actor::qa_notify_state', undefined).Visualize();
+  ok(n24RetiredTokId !== '' && !n24IdxStr.includes(n24RetiredTokId),
+    `V5: rotate-all after retire does NOT re-index the new shared token (tid=${n24RetiredTokId})`);
+
+  // ---------- N25 revoke (DoD 3 — revoke-without-replace) ----------
+  CUR = 'N25-revoke';
+  console.log('\n=== N25 revoke (DoD 3 — revoke-without-replace) ===');
+  // Export current neve and nbob blobs (from alice's mirror after N24 rotate-all).
+  const n25NeveBlob = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: neve.cid }).Reduce('blob').GetBinary()
+  );
+  const n25NbobBlob = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: nbob.cid }).Reduce('blob').GetBinary()
+  );
+  // Revoke neve's token (no re-mint): alice tells nsvc to delete neve's index entry + slot.
+  await mutate(alice, '::a2a_notifications::notify_revoke_contact_tokens',
+    { service: 'svc', contacts: [neve.cid] });
+  await sleep(2500);
+  // neve's posts must abort (index entry deleted, slot gone, no re-mint — DoD 3).
+  const n25Before = nst(nsvc);
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n25NeveBlob), payload: 'revoked-neve-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n25Before, `DoD3: neve's posts abort after revoke (index gone, zero state change)`);
+  ok(!/revoked-neve-ping/.test(nst(nsvc)), `DoD3: revoked neve payload absent`);
+  // DoD 3: no re-mint — alice's contact_token mirror must no longer contain neve's entry.
+  const n25Alice = nst2(alice);
+  ok(!new RegExp(neve.cid).test(n25Alice),
+    `DoD3: neve absent from alice's contact_token mirror after revoke (confirm contains no neve re-mint)`);
+  // nbob still delivers (unaffected by revoke of neve).
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n25NbobBlob), payload: 'post-revoke-nbob-ping' });
+  await sleep(2500);
+  ok(/post-revoke-nbob-ping/.test(nst(nsvc)), `DoD3: nbob unaffected by neve revoke, still delivers`);
+  // Revoke of never-issued sender: no-op success (E4/E8 — delete of absent slot tolerated).
+  const n25V2Before = nst2(nsvc);
+  const n25RejBefore = nsvc.rejects.length;
+  await mutate(alice, '::a2a_notifications::notify_revoke_contact_tokens',
+    { service: 'svc', contacts: [v1Fresh.cid] });
+  await sleep(2500);
+  ok(nst2(nsvc) === n25V2Before,
+    `revoke never-issued sender: no-op (E4/E8) — service v2 state unchanged`);
+  ok(nsvc.rejects.length === n25RejBefore,
+    `revoke never-issued sender: no rejection (success response, idempotent)`);
+
+  // ---------- N26 service-side gate (registered-recipient, set_sender_muted) ----------
+  CUR = 'N26-service-gate';
+  console.log('\n=== N26 service-side gate (set_sender_muted, unregistered caller) ===');
+  // Unregister alice so the service has no registration for her.
+  await mutate(alice, '::a2a_notifications::notify_unregister', { service: 'svc' });
+  await sleep(2500);
+  const n26V1Before = nst(nsvc);
+  const n26V2Before = nst2(nsvc);
+  const n26RejBefore = nsvc.rejects.length;
+  // qa_set_sender_muted_direct bypasses the client-side registration check and injects
+  // set_sender_muted directly over alice's encrypted channel with nsvc.
+  // Service gate: "No notification registration for this sender." must abort and mutate nothing.
+  await mutate(alice, '::actor::qa_set_sender_muted_direct',
+    { service: nsvc.cid, sender: nbob.cid, muted: true });
+  await sleep(2500);
+  ok(nst(nsvc) === n26V1Before && nst2(nsvc) === n26V2Before,
+    `service gate: set_sender_muted from unregistered caller: zero service state change`);
+  ok(nsvc.rejects.slice(n26RejBefore).some((m) => /No notification registration/i.test(m)),
+    `service gate: set_sender_muted from unregistered caller aborts at registered-recipient gate`);
 
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');

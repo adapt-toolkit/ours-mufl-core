@@ -44,6 +44,8 @@ library a2a_notifications loads libraries
     mark_read_tx            = "::a2a_notifications::mark_read".
     issue_tokens_tx         = "::a2a_notifications::issue_tokens".
     retire_shared_tx        = "::a2a_notifications::retire_shared".
+    set_sender_muted_tx     = "::a2a_notifications::set_sender_muted".
+    revoke_sender_tokens_tx = "::a2a_notifications::revoke_sender_tokens".
     // Maximum senders per issue_tokens call (V12 batch cap — the client wrapper
     // pages >256 into multiple calls automatically).
     issue_max_senders       = 256.
@@ -296,10 +298,11 @@ library a2a_notifications loads libraries
         }).
     }
 
-    // Replace the shared token (rotation IS revocation — D-3): the old handout
-    // dies the moment the service processes this; senders keep working only
-    // after I redistribute the new handout. Recovery path for a leaked token.
-    trn notify_rotate_token _:($service -> service_ref: str)
+    // Replace a single sender's scoped token OR the shared token plus all scoped
+    // tokens (§5.4 / §8 / Q9). $contact present → rotate ONLY that sender's slot;
+    // $contact NIL → v1 behavior for the legacy shared token PLUS rotate ALL scoped
+    // slots (panic button). Recovery path for a leaked token or wholesale reset.
+    trn notify_rotate_token _:($service -> service_ref: str, $contact -> contact_ref: str+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
@@ -307,11 +310,67 @@ library a2a_notifications loads libraries
         abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
         pending_notify_registers target_id -> TRUE.
 
+        // Resolve the optional $contact before entering the execute_transaction lambda
+        // (resolve_contact reads state; resolving inside the callback is not needed).
+        // sender_id NIL → rotate-all path on the service; non-NIL → per-sender path.
+        sender_id is global_id+ = NIL.
+        if contact_ref != NIL { sender_id -> a2a_messaging::resolve_contact (contact_ref?). }
+
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            // Build $targ: $sender present → service picks per-sender path;
+            // absent (empty tuple) → service picks rotate-all path.
+            targ is any = (,).
+            if sender_id != NIL { targ -> ($sender -> sender_id?). }
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> rotate_token_tx,
-                    $targ -> (,)
+                    $targ -> targ
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
+    // Tell the service to mute or unmute notifications from a given sender (§5.2 / §7).
+    // $muted TRUE → block; FALSE → unblock (delete entry — absent = enabled, §7).
+    // Runtime-only: no token change, no re-index. Service re-confirms so alice's state
+    // mirror stays coherent. $contact is the sender's global_id (cid string accepted by SDK).
+    trn notify_set_sender_muted _:($service -> service_ref: str, $contact -> contact_id: global_id, $muted -> muted: bool)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> set_sender_muted_tx,
+                    $targ -> ($sender -> contact_id, $muted -> muted)
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
+    // Tell the service to revoke the scoped tokens for each listed contact — no
+    // re-mint (revoke-without-replace, §5.4 / DoD 3). Service deletes each sender's
+    // index entry and notify_sender_tokens slot; posts against those token_ids abort at
+    // step 3 (index lookup). Empty list / unknown-sender slots: tolerated (E4/E8).
+    trn notify_revoke_contact_tokens _:($service -> service_ref: str, $contacts -> contacts: global_id[])
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> revoke_sender_tokens_tx,
+                    $targ -> ($senders -> contacts)
                 ),
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
@@ -641,9 +700,18 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
-    // SERVICE inbound: atomically replace a registered sender's token — delete
-    // the old index entry (posts against the old handout die on the lookup from
-    // this transaction on — E4), mint + store + index a fresh token, re-confirm.
+    // SERVICE inbound: atomically replace tokens — two paths (§5.4):
+    // · $sender present → per-sender path (DoD 3): rotate ONLY that sender's scoped
+    //   token; old token_id dies on index delete; fresh scoped token minted / stored /
+    //   indexed in the same transaction. Shared token and other senders untouched.
+    // · $sender absent/NIL → rotate-all (Q9 panic button): v1 shared-token rotation
+    //   PLUS every scoped slot in notify_sender_tokens.
+    //   - Shared: retire-aware — if the shared token was NOT indexed before this call
+    //     (retired via notify_retire_shared), mint / store but keep the new token
+    //     unindexed — do NOT un-retire (V5 — rotate-all does not resurrect a retired
+    //     shared token's index entry).
+    //   - Scoped: keys collected first to avoid mutation-while-iterating; each old
+    //     index entry deleted and new token minted / stored / indexed.
     fn handle_rotate_token (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -653,16 +721,145 @@ library a2a_notifications loads libraries
         existing = notify_registrations recipient.
         abort "No notification registration for this sender." when existing == NIL.
 
-        delete notify_token_index (existing? $token $c $token_id).
-        token = mint_notify_token recipient.
-        notify_registrations recipient -> (
-            $version       -> (existing? $version),
-            $recipient_cid -> (existing? $recipient_cid),
-            $token         -> token,
-            $bindings      -> (existing? $bindings),
-            $created_at    -> (existing? $created_at)
-        ).
-        notify_token_index (token $c $token_id) -> recipient.
+        sender is global_id+ = NIL.
+        if (args $sender) != NIL { sender -> (args $sender) safe global_id. }
+
+        if sender != NIL
+        {
+            // Per-sender path: rotate exactly one scoped token atomically (§5.4).
+            sender_cid = sender?.
+            existing_map is (global_id ->> notify_token_t) = (,).
+            if (notify_sender_tokens recipient) != NIL { existing_map -> (notify_sender_tokens recipient)?. }
+            old_tok = existing_map sender_cid.
+            abort "No scoped token for this sender." when old_tok == NIL.
+            delete notify_token_index (old_tok? $c $token_id).
+            new_tok = mint_notify_token_scoped recipient (_str sender_cid).
+            existing_map sender_cid -> new_tok.
+            notify_sender_tokens recipient -> existing_map.
+            notify_token_index (new_tok $c $token_id) -> recipient.
+        }
+        else
+        {
+            // Rotate-all path (Q9): shared token + ALL scoped tokens.
+            //
+            // Shared token: check index state BEFORE deleting so the new token
+            // follows the same indexed / unindexed discipline. If retire_shared
+            // already removed the entry (shared_was_indexed == FALSE), mint and
+            // store the new token in the registration record but do NOT re-index it
+            // (V5 — rotate-all must not un-retire a deliberately retired shared token).
+            shared_tid = (existing? $token $c $token_id).
+            shared_was_indexed = (notify_token_index shared_tid) != NIL.
+            if shared_was_indexed { delete notify_token_index shared_tid. }
+            new_shared = mint_notify_token recipient.
+            notify_registrations recipient -> (
+                $version       -> (existing? $version),
+                $recipient_cid -> (existing? $recipient_cid),
+                $token         -> new_shared,
+                $bindings      -> (existing? $bindings),
+                $created_at    -> (existing? $created_at)
+            ).
+            // Re-index ONLY when the old shared token was indexed — if retire_shared
+            // removed the entry, rotating does not resurrect it (V5).
+            if shared_was_indexed { notify_token_index (new_shared $c $token_id) -> recipient. }
+
+            // Scoped tokens: collect all sender keys first (two-pass — avoid
+            // mutation-while-iterating the map), then rotate each slot atomically.
+            if (notify_sender_tokens recipient) != NIL
+            {
+                existing_map is (global_id ->> notify_token_t) = (,).
+                existing_map -> (notify_sender_tokens recipient)?.
+                sender_keys is global_id[] = [].
+                sc existing_map -- (s -> _) { sender_keys (_count sender_keys|) -> s. }
+                sc sender_keys -- ( -> s)
+                {
+                    old_tok = existing_map s.
+                    if old_tok != NIL
+                    {
+                        delete notify_token_index (old_tok? $c $token_id).
+                        new_tok = mint_notify_token_scoped recipient (_str s).
+                        existing_map s -> new_tok.
+                        notify_token_index (new_tok $c $token_id) -> recipient.
+                    }
+                }
+                notify_sender_tokens recipient -> existing_map.
+            }
+        }
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    // SERVICE inbound: toggle the receive-mute flag for a named sender (§5.2 / §7):
+    // $muted TRUE → write notify_sender_muted[recipient][sender] -> FALSE (the map
+    //   stores FALSE when receive-disabled — present entry = muted, per §4.1).
+    // $muted FALSE → DELETE the entry — absent = enabled, keeps state minimal (§7).
+    // Runtime-only: no token change, no re-index. Replies confirm so the client
+    // mirror stays coherent. Gate: registered-recipient only (shared gate pattern).
+    fn handle_set_sender_muted (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        abort "No notification registration for this sender." when (notify_registrations recipient) == NIL.
+
+        sender = (args $sender) safe global_id.
+        muted  = (args $muted)  safe bool.
+
+        inner is (global_id ->> bool) = (,).
+        if (notify_sender_muted recipient) != NIL { inner -> (notify_sender_muted recipient)?. }
+
+        if muted == TRUE
+        {
+            // Mute: store FALSE (= receive-disabled per §7 map semantics;
+            // present entry = muted, absent = enabled — keeps state minimal).
+            inner sender -> FALSE.
+        }
+        else
+        {
+            // Unmute: delete entry — absent = enabled (§7 minimal-state rule).
+            if (inner sender) != NIL { delete inner sender. }
+        }
+        notify_sender_muted recipient -> inner.
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    // SERVICE inbound: revoke the scoped tokens for each listed sender — no
+    // re-mint (revoke-without-replace, §5.4 / DoD 3). For each sender in $senders:
+    // delete its token_id from notify_token_index (posts against those token_ids
+    // abort at step 3 — E4) and remove its slot from notify_sender_tokens.
+    // Re-confirms once after all senders processed. Idempotent: unknown senders
+    // and absent slots are tolerated — delete of absent = no-op (E4/E8).
+    fn handle_revoke_sender_tokens (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        abort "No notification registration for this sender." when (notify_registrations recipient) == NIL.
+
+        senders is global_id[] = (args $senders) safe (global_id[]).
+
+        existing_map is (global_id ->> notify_token_t) = (,).
+        if (notify_sender_tokens recipient) != NIL { existing_map -> (notify_sender_tokens recipient)?. }
+
+        sc senders -- ( -> sender)
+        {
+            old_tok = existing_map sender.
+            if old_tok != NIL
+            {
+                // Revoke: drop index entry (posts using this token_id abort at step
+                // 3 — E4) and remove the sender slot (no re-mint — DoD 3).
+                delete notify_token_index (old_tok? $c $token_id).
+                delete existing_map sender.
+            }
+            // Unknown sender: no-op (delete of absent slot tolerated — E4/E8).
+        }
+        notify_sender_tokens recipient -> existing_map.
 
         actions is transaction::action::type[] = confirm_actions recipient.
         actions (_count actions|) -> _save_state NIL.
@@ -858,6 +1055,8 @@ library a2a_notifications loads libraries
     trn post_notification args: any { return handle_post_notification args. }
     trn issue_tokens args: any { return handle_issue_tokens args. }
     trn retire_shared args: any { return handle_retire_shared args. }
+    trn set_sender_muted args: any { return handle_set_sender_muted args. }
+    trn revoke_sender_tokens args: any { return handle_revoke_sender_tokens args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state composes these with

@@ -494,6 +494,33 @@ application actor loads libraries
         return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
     }
 
+    // Return the token_id of this actor's client-side shared-token registration
+    // mirror (my_notify_registrations[$service].$token.$c.$token_id). Used in N24
+    // to assert that rotate-all after retire does NOT re-index the new shared token.
+    trn readonly qa_client_reg_token_id _:($service -> svc: global_id)
+    {
+        reg = a2a_notifications::my_notify_registrations svc.
+        abort "No registration for this service." when reg == NIL.
+        return ($token_id -> (reg? $token $c $token_id)).
+    }
+
+    // Send set_sender_muted directly to the service without going through the
+    // client-side wrapper (bypasses the client's registration check). Used in N26
+    // to probe the service-side registered-recipient gate.
+    trn qa_set_sender_muted_direct _:($service -> svc: global_id, $sender -> s: global_id, $muted -> m: bool)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction svc (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx svc (
+                    $name -> "::a2a_notifications::set_sender_muted",
+                    $targ -> ($sender -> s, $muted -> m)
+                ),
+                _return_data ($sent_to -> svc)
+            ].
+        }).
+    }
+
     // E9: a well-formed confirm_registration over a REAL channel, from a contact
     // that is neither a pending nor a registered service of the target.
     trn qa_send_fake_confirm _:($target -> target: global_id)
