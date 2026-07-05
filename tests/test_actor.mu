@@ -240,6 +240,56 @@ application actor loads libraries
         ).
     }
 
+    // v2: per-sender token maps + contact-token mirror (N9-series probes).
+    trn readonly qa_notify_state_v2 _
+    {
+        return (
+            $sender_tokens  -> a2a_notifications::notify_sender_tokens,
+            $sender_muted   -> a2a_notifications::notify_sender_muted,
+            $contact_tokens -> a2a_notifications::my_notify_contact_tokens
+        ).
+    }
+
+    // Send a raw issue_tokens directly to a service (bypasses client-side paging —
+    // used to probe the batch-cap gate and the registered-recipient gate).
+    trn qa_issue_tokens_direct _:($service -> svc: global_id, $senders -> senders: any)
+    {
+        return encrypted_channel::execute_transaction svc (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx svc (
+                    $name -> "::a2a_notifications::issue_tokens",
+                    $targ -> ($senders -> senders)
+                ),
+                _return_data ($sent_to -> svc)
+            ].
+        }).
+    }
+
+    // Import a v1-era notify record (fields $notify_sender_tokens/$notify_sender_muted/
+    // $my_notify_contact_tokens absent) and return the post-import map state.
+    // Used for DoD 6 fixture: verifies import_notify_state handles missing v2 fields
+    // by leaving the defaults (empty maps) in place.
+    trn qa_import_v1_notify_state _:($vapid -> vapid: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_notifications::import_notify_state (
+            $my_notify_registrations -> (,),
+            $notify_registrations    -> (,),
+            $notify_token_index      -> (,),
+            $vapid_public_key        -> vapid
+            // $notify_sender_tokens, $notify_sender_muted, $my_notify_contact_tokens
+            // intentionally absent — simulates a v1-era export record shape.
+        ).
+        return transaction::success [
+            _return_data (
+                $sender_tokens  -> a2a_notifications::notify_sender_tokens,
+                $sender_muted   -> a2a_notifications::notify_sender_muted,
+                $contact_tokens -> a2a_notifications::my_notify_contact_tokens
+            ),
+            _save_state NIL
+        ].
+    }
+
     // ---- adversarial leg-1 senders (bare-send a crafted submit_invite_response) ----
     trn qa_leg1_badbox _:($invite -> blob: bin)
     {

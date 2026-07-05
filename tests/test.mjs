@@ -635,6 +635,162 @@ async function main() {
   const n7a = nst(alice2);
   ok(/VAPID_PUB_TEST/.test(n7a) && new RegExp(nsvc.cid).test(n7a), `client my_regs restored (vapid pub + service cid intact)`);
 
+  // ====== v2 N9-series: per-sender scoped tokens, issue_tokens, confirm extension ======
+  const nst2 = (id) => ro(id, '::actor::qa_notify_state_v2', undefined).Visualize();
+
+  // ---------- N9 DoD 6: v1-era export — absent new fields import as empty maps ----------
+  // Written FIRST per the brief: verifies that import_notify_state handles missing
+  // v2 fields (keeps default empty maps) before the round-trip tests run.
+  CUR = 'N9-v1era-import';
+  console.log('\n=== N9 v1-era import (DoD 6) ===');
+  const v1Fresh = mk('v1fresh'); await mkPacket(v1Fresh, 'seed-v1fresh'); await sleep(1000);
+  const v1Res = await mutate(v1Fresh, '::actor::qa_import_v1_notify_state',
+    { vapid: 'V1_TEST_VAPID' });
+  // new maps absent in the input record → kept as empty defaults (DoD 6).
+  ok(v1Res.Reduce('sender_tokens').Visualize().replace(/[(),\s]/g, '') === '',
+    `v1-era import: notify_sender_tokens stays empty (DoD 6 — absent field keeps default)`);
+  ok(v1Res.Reduce('contact_tokens').Visualize().replace(/[(),\s]/g, '') === '',
+    `v1-era import: my_notify_contact_tokens stays empty (DoD 6 — absent field keeps default)`);
+
+  // ---------- N10 issue_tokens happy path — scoped tokens; confirm carries them ----------
+  CUR = 'N10-issue-tokens';
+  console.log('\n=== N10 issue_tokens happy path ===');
+  // alice is registered with nsvc (re-registered in N6, state carried through N7).
+  // nbob and neve are never contacts of nsvc.
+  await mutate(alice, '::a2a_notifications::notify_issue_tokens',
+    { service: 'svc', contacts: [nbob.cid, neve.cid] });
+  await sleep(3000);
+  const n10Svc = nst2(nsvc);
+  const n10Alice = nst2(alice);
+  // Service side: notify_sender_tokens[alice][nbob] and [neve] set.
+  ok(new RegExp(nbob.cid).test(n10Svc), `service stores scoped token keyed to nbob's cid`);
+  ok(new RegExp(neve.cid).test(n10Svc), `service stores scoped token keyed to neve's cid`);
+  // Each token's $scope == _str(sender) (the sender's cid as a string).
+  // In the visualization, the scope field's value should contain the sender cid.
+  const n10NbobIdx = n10Svc.indexOf(nbob.cid);
+  const n10NbobSection = n10NbobIdx >= 0 ? n10Svc.slice(n10NbobIdx, n10NbobIdx + 800) : '';
+  ok(/scope/.test(n10NbobSection) && n10NbobSection.split('scope').length > 1 &&
+     new RegExp(nbob.cid).test(n10NbobSection.split('scope')[1].slice(0, nbob.cid.length + 20)),
+    `nbob's scoped token has $scope == _str(nbob) — i.e. scope value is nbob's cid`);
+  // Token IDs appear in notify_token_index (service indexes them).
+  ok(/token_id/.test(nst(nsvc)), `scoped token_ids indexed in notify_token_index`);
+  // Client side: my_notify_contact_tokens[nsvc][nbob] and [neve] set on alice.
+  ok(new RegExp(nbob.cid).test(n10Alice), `alice contact_tokens includes nbob's cid`);
+  ok(new RegExp(neve.cid).test(n10Alice), `alice contact_tokens includes neve's cid`);
+  // DoD 5: confirm still carries $token/$vapid_pub/$bindings (v1-shaped-consumer compat).
+  ok(/VAPID_PUB_TEST/.test(nst(alice)),
+    `v2 confirm still carries $vapid_pub after issue_tokens (DoD 5 compat)`);
+  ok(/token_id/.test(ro(alice, '::actor::qa_notify_state', undefined)
+    .Reduce('my_regs').Visualize()),
+    `alice my_regs.$token still present — v1-shaped consumer still reads correctly (DoD 5)`);
+
+  // ---------- N11 idempotence: repeat issue_tokens for bob → token bytes unchanged ----------
+  CUR = 'N11-idempotence';
+  console.log('\n=== N11 idempotence (DoD 1) ===');
+  const n11Before = nst2(nsvc);
+  await mutate(alice, '::a2a_notifications::notify_issue_tokens',
+    { service: 'svc', contacts: [nbob.cid] });
+  await sleep(3000);
+  const n11After = nst2(nsvc);
+  // Extract bob's token_id from before and after: they must be identical (E8, DoD 1).
+  const extractTokenLine = (vis, anchorCid) => {
+    const idx = vis.indexOf(anchorCid);
+    if (idx < 0) return '';
+    return (vis.slice(idx, idx + 600).match(/token_id[^\n)]*\)?/) || [''])[0];
+  };
+  const tid11Before = extractTokenLine(n11Before, nbob.cid);
+  const tid11After  = extractTokenLine(n11After,  nbob.cid);
+  ok(tid11Before !== '' && tid11Before === tid11After,
+    `nbob's scoped token_id unchanged after repeat issue_tokens (byte-stable E8 — DoD 1)`);
+
+  // ---------- N12 batch cap: 257 senders aborts; client wrapper pages ----------
+  CUR = 'N12-batch-cap';
+  console.log('\n=== N12 batch cap (V12) ===');
+  // Direct raw call with 257 senders — should abort at the service.
+  const n12SvcBefore = nst2(nsvc);
+  const nsvcRejectsBefore12 = nsvc.rejects.length;
+  await mutate(alice, '::actor::qa_issue_tokens_direct',
+    { service: nsvc.cid, senders: Array(257).fill(nbob.cid) });
+  await sleep(2500);
+  ok(nsvc.rejects.slice(nsvcRejectsBefore12).some((m) => /cap|exceed|256/i.test(m)),
+    `direct issue_tokens with 257 senders aborts at service (V12 cap error in rejects)`);
+  ok(nst2(nsvc) === n12SvcBefore,
+    `no state change on service after 257-sender abort (V12 zero-mutation)`);
+  // Client wrapper pages 257 into batches of 256 + 1; both confirms land.
+  const confirmsBefore12 = ro(alice, '::actor::qa_notify_state', undefined)
+    .Reduce('regconfirm_log').Visualize();
+  await mutate(alice, '::a2a_notifications::notify_issue_tokens',
+    { service: 'svc', contacts: Array(257).fill(nbob.cid) });
+  await sleep(6000); // two service round-trips: 256 + 1
+  const confirmsAfter12 = ro(alice, '::actor::qa_notify_state', undefined)
+    .Reduce('regconfirm_log').Visualize();
+  ok(confirmsAfter12 !== confirmsBefore12,
+    `notify_issue_tokens pages 257 contacts into batches — at least one confirm lands`);
+  ok(/token_id/.test(nst2(alice)),
+    `alice contact_tokens set after paged issue_tokens`);
+
+  // ---------- N13 non-contact cid mints anyway (V1) ----------
+  CUR = 'N13-noncontact-mint';
+  console.log('\n=== N13 non-contact cid mints (V1) ===');
+  // alice2.cid: a legitimate packet cid that is NOT a contact of either alice or nsvc.
+  // The service mints regardless (can't know R's contact set — V1).
+  await mutate(alice, '::a2a_notifications::notify_issue_tokens',
+    { service: 'svc', contacts: [alice2.cid] });
+  await sleep(3000);
+  ok(new RegExp(alice2.cid).test(nst2(nsvc)),
+    `service mints scoped token for alice2.cid (never met by nsvc — V1 non-contact mint)`);
+
+  // ---------- N14 zero-contact issue → abort (V11) ----------
+  CUR = 'N14-zero-senders';
+  console.log('\n=== N14 zero senders (V11) ===');
+  const nsvcRejectsBefore14 = nsvc.rejects.length;
+  await mutate(alice, '::actor::qa_issue_tokens_direct',
+    { service: nsvc.cid, senders: [] });
+  await sleep(2500);
+  ok(nsvc.rejects.slice(nsvcRejectsBefore14).some((m) => /non-empty|at least one|V11/i.test(m)),
+    `empty $senders aborts at service (V11 — non-empty required)`);
+
+  // ---------- N15 registered-recipient gate ----------
+  CUR = 'N15-gate';
+  console.log('\n=== N15 registered-recipient gate ===');
+  // Temporarily unregister alice from nsvc to create the unregistered-caller scenario.
+  await mutate(alice, '::a2a_notifications::notify_unregister', { service: 'svc' });
+  await sleep(2500);
+  const n15Before = nst2(nsvc);
+  const nsvcRejectsBefore15 = nsvc.rejects.length;
+  await mutate(alice, '::actor::qa_issue_tokens_direct',
+    { service: nsvc.cid, senders: [nbob.cid] });
+  await sleep(2500);
+  ok(nst2(nsvc) === n15Before,
+    `issue_tokens from unregistered caller: zero state change`);
+  ok(nsvc.rejects.slice(nsvcRejectsBefore15).some((m) => /No notification registration/i.test(m)),
+    `issue_tokens from unregistered caller aborts with registration gate error`);
+  // Re-register alice (so export/import tests can still use her state).
+  await mutate(alice, '::a2a_notifications::notify_register', { service: 'svc', bindings: null });
+  await sleep(2500);
+
+  // ---------- N16 export/import round-trip includes the three new maps ----------
+  CUR = 'N16-export-import-v2';
+  console.log('\n=== N16 export/import round-trip (DoD 6 round-trip) ===');
+  const n16SvcExp = ro(nsvc, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n16-svc.bin'), Buffer.from(n16SvcExp.Serialize()));
+  const n16AliceExp = ro(alice, '::actor::export_state', undefined);
+  fs.writeFileSync(resolve(UNIT_DIR, 'n16-alice.bin'), Buffer.from(n16AliceExp.Serialize()));
+  const nsvc3 = mk('nsvc3'); await mkPacket(nsvc3, 'seed-nsvc3'); await sleep(1000);
+  await mutate(nsvc3, '::actor::import_state',
+    nsvc3.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n16-svc.bin')))));
+  const n16Svc3 = nst2(nsvc3);
+  ok(new RegExp(nbob.cid).test(n16Svc3),
+    `sender_tokens round-trips: nbob's entry restored on the replacement service packet`);
+  ok(new RegExp(neve.cid).test(n16Svc3),
+    `sender_tokens round-trips: neve's entry restored`);
+  const alice3 = mk('alice3'); await mkPacket(alice3, 'seed-alice3'); await sleep(1000);
+  await mutate(alice3, '::actor::import_state',
+    alice3.pw.packet.ParseValue(new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, 'n16-alice.bin')))));
+  const n16Alice3 = nst2(alice3);
+  ok(/token_id/.test(n16Alice3),
+    `my_notify_contact_tokens round-trips: contact tokens restored on alice3`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

@@ -42,6 +42,10 @@ library a2a_notifications loads libraries
     unregister_tx           = "::a2a_notifications::unregister".
     post_notification_tx    = "::a2a_notifications::post_notification".
     mark_read_tx            = "::a2a_notifications::mark_read".
+    issue_tokens_tx         = "::a2a_notifications::issue_tokens".
+    // Maximum senders per issue_tokens call (V12 batch cap — the client wrapper
+    // pages >256 into multiple calls automatically).
+    issue_max_senders       = 256.
 
     // WebPush payload ceiling is ~4KB; oversize posts abort on BOTH sides
     // (sender-side in send_notification, service-side in post_notification).
@@ -133,6 +137,20 @@ library a2a_notifications loads libraries
     // only — the VAPID PRIVATE key never enters packet state.
     vapid_public_key is str = "".
 
+    // ---- service half v2: per-sender scoped token maps (DoD 1/5/6) -----------
+    // notify_sender_tokens[recipient][sender]: scoped token minted by issue_tokens
+    // (E8 idempotent — re-issue keeps existing token; scope == _str sender).
+    notify_sender_tokens is (global_id ->> (global_id ->> notify_token_t)) = (,).
+    // notify_sender_muted[recipient][sender]: mute flag set by future mute_sender
+    // inbound (a later task). Declared here so confirm_actions can mirror it.
+    notify_sender_muted  is (global_id ->> (global_id ->> bool)) = (,).
+
+    // ---- client half v2: mirror of the per-sender tokens from the last confirm
+    // my_notify_contact_tokens[service][sender]: the scoped token the service
+    // returned for that sender in the confirm_registration; populated wholesale
+    // from $sender_tokens in each confirm (mute-flag consumption is a later task).
+    my_notify_contact_tokens is (global_id ->> (global_id ->> notify_token_t)) = (,).
+
     hidden
     {
         _read_or_abort is (bin->any) = fn (_: bin) { abort "_read_or_abort is unset in a2a_notifications (call a2a_notifications::init)." when TRUE. }
@@ -179,20 +197,28 @@ library a2a_notifications loads libraries
 
     // ---- service-side helpers ----------------------------------------------
 
-    // Mint the shared token for one recipient: versioned core + detached
-    // signature over its _value_id (the delegation_cert_t signing idiom). The
-    // CALLER stores the registration + index entry.
-    fn mint_notify_token (recipient: global_id) -> notify_token_t
+    // Mint a token for one recipient with an explicit scope. Scope "" is the
+    // v1/shared-token path; scope == _str sender is the v2 per-sender path.
+    // Detached signature over _value_id (the delegation_cert_t signing idiom).
+    // The CALLER stores the registration + index entry.
+    fn mint_notify_token_scoped (recipient: global_id, scope: str) -> notify_token_t
     {
         core is notify_token_core_t = (
             $version       -> 1,
             $service_cid   -> _get_container_id(),
             $recipient_cid -> recipient,
             $token_id      -> _new_id "ours notify token",
-            $scope         -> "",
+            $scope         -> scope,
             $iat           -> (current_transaction_info::get_transaction_time())?
         ).
         return ($c -> core, $s -> key_storage::default_sign (_value_id core)).
+    }
+
+    // Backward-compat shim: callers that don't need a scope (register /
+    // rotate_token) keep minting with scope "" so nothing changes for v1 consumers.
+    fn mint_notify_token (recipient: global_id) -> notify_token_t
+    {
+        return mint_notify_token_scoped recipient "".
     }
 
     // The confirm leg every service-side mutator replies with (register /
@@ -203,13 +229,22 @@ library a2a_notifications loads libraries
     {
         reg = notify_registrations recipient.
         abort "No registration to confirm." when reg == NIL.
+        // v2 DoD 5: carry the per-sender token and mute maps so the client can
+        // mirror them. Additive-only — a v1-shaped consumer reading only
+        // $token/$vapid_pub/$bindings still parses correctly.
+        sender_tokens_map is (global_id ->> notify_token_t) = (,).
+        if (notify_sender_tokens recipient) != NIL { sender_tokens_map -> (notify_sender_tokens recipient)?. }
+        sender_muted_map is (global_id ->> bool) = (,).
+        if (notify_sender_muted recipient) != NIL { sender_muted_map -> (notify_sender_muted recipient)?. }
         return [
             encrypted_channel::send_encrypted_tx recipient (
                 $name -> confirm_registration_tx,
                 $targ -> (
-                    $token     -> (reg? $token),
-                    $vapid_pub -> vapid_public_key,
-                    $bindings  -> (reg? $bindings)
+                    $token         -> (reg? $token),
+                    $vapid_pub     -> vapid_public_key,
+                    $bindings      -> (reg? $bindings),
+                    $sender_tokens -> sender_tokens_map,
+                    $sender_muted  -> sender_muted_map
                 )
             )
         ].
@@ -324,6 +359,47 @@ library a2a_notifications loads libraries
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
             ].
+        }).
+    }
+
+    // Ask the service to mint scoped tokens for each contact in $contacts. The
+    // service cap is issue_max_senders (256) per call; this wrapper pages the
+    // list into batches automatically so callers never need to handle paging.
+    // Re-issuing a contact the service already has a token for is idempotent (E8).
+    // Requires an existing registration with the service.
+    trn notify_issue_tokens _:($service -> service_ref: str, $contacts -> contacts: global_id[])
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            // Page the contact list into batches of issue_max_senders.
+            batch is global_id[] = [].
+            actions is transaction::action::type[] = [].
+            sc contacts -- ( -> sender)
+            {
+                batch (_count batch|) -> sender.
+                if (_count batch) == issue_max_senders
+                {
+                    actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
+                        $name -> issue_tokens_tx,
+                        $targ -> ($senders -> batch)
+                    ).
+                    batch -> [].
+                }
+            }
+            if (_count batch) > 0
+            {
+                actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
+                    $name -> issue_tokens_tx,
+                    $targ -> ($senders -> batch)
+                ).
+            }
+            actions (_count actions|) -> _return_data ($sent_to -> target_id).
+            actions (_count actions|) -> _save_state NIL.
+            return transaction::success actions.
         }).
     }
 
@@ -459,6 +535,53 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: mint (or re-use) a scoped token for each requested sender
+    // cid and return the current per-sender map in the confirm (DoD 1/5 V12).
+    //
+    //   $senders: global_id[]+  — non-empty, max issue_max_senders (V12 batch cap).
+    //
+    // Edge cases:
+    //   E8: re-issue for an already-known sender keeps the existing token bytes
+    //       unchanged (idempotent — test proves byte-stability across repeat calls).
+    //   V11: empty $senders → abort (the type is non-empty; no partial mints).
+    //   V12: >issue_max_senders entries → abort; client wrapper pages for you.
+    // The handler does NOT check whether each sender is a contact of either side —
+    // that is intentional (V1: service cannot know R's contact set; any cid R
+    // names is eligible for a scoped token).
+    fn handle_issue_tokens (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        abort "No notification registration for this sender." when (notify_registrations recipient) == NIL.
+
+        senders is global_id[] = (args $senders) safe (global_id[]).
+        abort "issue_tokens requires at least one sender ($senders must be non-empty — V11)." when (_count senders) == 0.
+        abort "issue_tokens batch exceeds the " + (_str issue_max_senders) + "-sender cap — V12." when (_count senders) > issue_max_senders.
+
+        // E8: load existing per-sender map for this recipient (may be empty on
+        // the first call).
+        existing_map is (global_id ->> notify_token_t) = (,).
+        if (notify_sender_tokens recipient) != NIL { existing_map -> (notify_sender_tokens recipient)?. }
+
+        sc senders -- ( -> sender)
+        {
+            // Only mint when there is no existing token for this sender.
+            if (existing_map sender) == NIL
+            {
+                token = mint_notify_token_scoped recipient (_str sender).
+                existing_map sender -> token.
+                notify_token_index (token $c $token_id) -> recipient.
+            }
+        }
+        notify_sender_tokens recipient -> existing_map.
+
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
     // SERVICE inbound: atomically replace a registered sender's token — delete
     // the old index entry (posts against the old handout die on the lookup from
     // this transaction on — E4), mint + store + index a fresh token, re-confirm.
@@ -565,6 +688,13 @@ library a2a_notifications loads libraries
         my_notify_registrations sender_id -> myreg.
         if (pending_notify_registers sender_id) != NIL { delete pending_notify_registers sender_id. }
 
+        // v2 DoD 5/6: replace the contact-token mirror from the confirm wholesale.
+        // Absent on v1-era confirms → guard keeps existing (empty-default) map.
+        if (args $sender_tokens) != NIL
+        {
+            my_notify_contact_tokens sender_id -> (args $sender_tokens) safe (global_id ->> notify_token_t).
+        }
+
         actions is transaction::action::type[] = [].
         sc on_notify_registration ($service_cid -> sender_id, $registration -> myreg) -- ( -> a)
         {
@@ -632,6 +762,7 @@ library a2a_notifications loads libraries
     trn mark_read args: any { return handle_mark_read args. }
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
+    trn issue_tokens args: any { return handle_issue_tokens args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state composes these with
@@ -645,7 +776,10 @@ library a2a_notifications loads libraries
             $my_notify_registrations  -> my_notify_registrations,
             $notify_registrations     -> notify_registrations,
             $notify_token_index       -> notify_token_index,
-            $vapid_public_key         -> vapid_public_key
+            $vapid_public_key         -> vapid_public_key,
+            $notify_sender_tokens     -> notify_sender_tokens,
+            $notify_sender_muted      -> notify_sender_muted,
+            $my_notify_contact_tokens -> my_notify_contact_tokens
         ).
     }
 
@@ -670,6 +804,20 @@ library a2a_notifications loads libraries
         if (data $vapid_public_key) != NIL
         {
             vapid_public_key -> (data $vapid_public_key) safe str.
+        }
+        // v2 fields: individually guarded so a v1-era export imports cleanly
+        // with the defaults (empty maps) in place — DoD 6 fixture test relies on this.
+        if (data $notify_sender_tokens) != NIL
+        {
+            notify_sender_tokens -> (data $notify_sender_tokens) safe (global_id ->> (global_id ->> notify_token_t)).
+        }
+        if (data $notify_sender_muted) != NIL
+        {
+            notify_sender_muted -> (data $notify_sender_muted) safe (global_id ->> (global_id ->> bool)).
+        }
+        if (data $my_notify_contact_tokens) != NIL
+        {
+            my_notify_contact_tokens -> (data $my_notify_contact_tokens) safe (global_id ->> (global_id ->> notify_token_t)).
         }
         pending_notify_registers -> (,).
     }
