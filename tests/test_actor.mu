@@ -250,6 +250,22 @@ application actor loads libraries
         ).
     }
 
+    // Extract the scoped token_id for a specific (recipient, sender) pair from
+    // notify_sender_tokens. Used in N10 to prove handle_issue_tokens indexes scoped
+    // tokens into notify_token_index (revocation mechanism): the returned token_id
+    // must appear as a key in notify_token_index; if the indexing line were removed
+    // from handle_issue_tokens the token would exist in sender_tokens but be absent
+    // from the index and the N10 assertion would fail.
+    trn readonly qa_scoped_token_id _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        outer = a2a_notifications::notify_sender_tokens r.
+        abort "No sender tokens for recipient." when outer == NIL.
+        inner_map = outer?.
+        tok = inner_map s.
+        abort "No token for this sender." when tok == NIL.
+        return ($token_id -> (tok? $c $token_id)).
+    }
+
     // Send a raw issue_tokens directly to a service (bypasses client-side paging —
     // used to probe the batch-cap gate and the registered-recipient gate).
     trn qa_issue_tokens_direct _:($service -> svc: global_id, $senders -> senders: any)

@@ -672,8 +672,17 @@ async function main() {
   ok(/scope/.test(n10NbobSection) && n10NbobSection.split('scope').length > 1 &&
      new RegExp(nbob.cid).test(n10NbobSection.split('scope')[1].slice(0, nbob.cid.length + 20)),
     `nbob's scoped token has $scope == _str(nbob) — i.e. scope value is nbob's cid`);
-  // Token IDs appear in notify_token_index (service indexes them).
-  ok(/token_id/.test(nst(nsvc)), `scoped token_ids indexed in notify_token_index`);
+  // Token IDs appear in notify_token_index (service indexes them for revocation).
+  // Stronger check: extract nbob's concrete scoped token_id from sender_tokens via
+  // the probe and assert that exact id string is present in notify_token_index.
+  // This FAILS if the 'notify_token_index (...) -> recipient' line in
+  // handle_issue_tokens were removed — the token exists in sender_tokens but its
+  // id would be absent from the index, breaking the revocation mechanism.
+  const scopedTid = ro(nsvc, '::actor::qa_scoped_token_id',
+      { recipient: alice.cid, sender: nbob.cid }).Reduce('token_id').Visualize();
+  const tokenIndexVis = ro(nsvc, '::actor::qa_notify_state', undefined).Reduce('token_index').Visualize();
+  ok(scopedTid !== '' && tokenIndexVis.includes(scopedTid),
+      `scoped token_id for nbob is indexed in notify_token_index (revocation mechanism)`);
   // Client side: my_notify_contact_tokens[nsvc][nbob] and [neve] set on alice.
   ok(new RegExp(nbob.cid).test(n10Alice), `alice contact_tokens includes nbob's cid`);
   ok(new RegExp(neve.cid).test(n10Alice), `alice contact_tokens includes neve's cid`);
@@ -724,8 +733,13 @@ async function main() {
   await sleep(6000); // two service round-trips: 256 + 1
   const confirmsAfter12 = ro(alice, '::actor::qa_notify_state', undefined)
     .Reduce('regconfirm_log').Visualize();
-  ok(confirmsAfter12 !== confirmsBefore12,
-    `notify_issue_tokens pages 257 contacts into batches — at least one confirm lands`);
+  // Stronger: count VAPID_PUB_TEST occurrences (appears exactly once per confirm in
+  // regconfirm_log via my_registration_t.$vapid_pub). 257 contacts → 256+1 = 2 pages
+  // → 2 service round-trips → 2 confirms, so the delta must be >= 2.
+  const countVapid = (s) => (s.match(/VAPID_PUB_TEST/g) || []).length;
+  const confirmDelta = countVapid(confirmsAfter12) - countVapid(confirmsBefore12);
+  ok(confirmDelta >= 2,
+    `paged issue_tokens with 257 contacts yields >=2 confirms (256-batch + 1-batch, delta=${confirmDelta})`);
   ok(/token_id/.test(nst2(alice)),
     `alice contact_tokens set after paged issue_tokens`);
 
