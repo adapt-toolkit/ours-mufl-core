@@ -43,6 +43,7 @@ library a2a_notifications loads libraries
     post_notification_tx    = "::a2a_notifications::post_notification".
     mark_read_tx            = "::a2a_notifications::mark_read".
     issue_tokens_tx         = "::a2a_notifications::issue_tokens".
+    retire_shared_tx        = "::a2a_notifications::retire_shared".
     // Maximum senders per issue_tokens call (V12 batch cap — the client wrapper
     // pages >256 into multiple calls automatically).
     issue_max_senders       = 256.
@@ -403,6 +404,32 @@ library a2a_notifications loads libraries
         }).
     }
 
+    // Retire the shared (legacy scope-"") token for my registration with a
+    // service: tells the service to delete the shared token's index entry
+    // (revocation by index removal — E4; registration record stays inert so
+    // the service still knows me). Idempotent: second call is a no-op (the
+    // service-side delete silently skips an already-gone entry — E4 discipline).
+    // After retirement the shared handout is permanently dead; scoped tokens
+    // for the same registration keep working normally.
+    trn notify_retire_shared _:($service -> service_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = a2a_messaging::resolve_contact service_ref.
+        abort "No notification registration with that service." when (my_notify_registrations target_id) == NIL.
+
+        return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> retire_shared_tx,
+                    $targ -> (,)
+                ),
+                _return_data ($sent_to -> target_id),
+                _save_state NIL
+            ].
+        }).
+    }
+
     // Export the handout blob for my registration with a service ("to notify
     // me: this service, this token"). Distribution is out of protocol — it
     // rides ordinary send_message/send_file.
@@ -582,6 +609,38 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
+    // SERVICE inbound: retire the shared (scope-"") token for a registered
+    // sender — delete its notify_token_index entry so future posts using the
+    // old shared handout abort at step 3 (index lookup, "Unknown or revoked").
+    // The registration_t.$token field stays inert; the registration record
+    // itself is NOT removed (scoped tokens and re-confirm keep working).
+    // Idempotent (E4 discipline): if the index entry is already gone (second
+    // call, or after a rotation that replaced the shared token), the delete is
+    // a no-op — no abort is raised (§12.4 "tolerate/no-op" framing).
+    fn handle_retire_shared (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+
+        recipient = current_transaction_info::get_external_envelope_or_abort() $from.
+        existing = notify_registrations recipient.
+        abort "No notification registration for this sender." when existing == NIL.
+
+        // One index delete — revocation by index removal (E4).
+        // delete on an absent key is a no-op, so this is naturally idempotent.
+        shared_tid = (existing? $token $c $token_id).
+        if (notify_token_index shared_tid) != NIL
+        {
+            delete notify_token_index shared_tid.
+        }
+
+        // Re-confirm so the client mirror stays coherent with the service state
+        // (consistent with all other service-side mutators).
+        actions is transaction::action::type[] = confirm_actions recipient.
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
     // SERVICE inbound: atomically replace a registered sender's token — delete
     // the old index entry (posts against the old handout die on the lookup from
     // this transaction on — E4), mint + store + index a fresh token, re-confirm.
@@ -731,7 +790,42 @@ library a2a_notifications loads libraries
         abort "Token recipient does not match its index entry." when indexed? != (token $c $recipient_cid).
         reg = notify_registrations (token $c $recipient_cid).
         abort "No registration for the token's recipient." when reg == NIL.
-        abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id (reg? $token)).
+
+        // Step 4 — dispatch on $scope: "" = v1/legacy path (shared token);
+        // non-empty = v2/scoped path (per-sender token, steps 4-6 extended).
+        token_scope = (token $c $scope).
+        if token_scope == ""
+        {
+            // V1/legacy path: byte-equality vs the stored shared token in
+            // registration_t.$token. Shared token validates exactly as v1
+            // while its index entry is live (step 3 above kills it after retire).
+            abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id (reg? $token)).
+        }
+        else
+        {
+            // V2/scoped path —
+            // Step 5 (evaluated first in code — no reverse _str() to recover a
+            // global_id from scope; Q1 strict binding per §16): envelope $from
+            // must equal the token's $scope string. This also means a v1 sender
+            // posting a scoped token (it treats the blob as opaque) passes as long
+            // as it posts from the cid the token was issued to — happy path intact.
+            abort "Token is not bound to this sender." when token_scope != _str sender_id.
+            // Step 4 (scoped): byte-equality vs notify_sender_tokens[recipient][sender].
+            // Absent outer map or absent sender slot both abort (never-issued or revoked).
+            scoped_outer = notify_sender_tokens (token $c $recipient_cid).
+            abort "Token is not bound to this sender." when scoped_outer == NIL.
+            scoped_tok_entry = (scoped_outer?) sender_id.
+            abort "Token is not bound to this sender." when scoped_tok_entry == NIL.
+            abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id scoped_tok_entry?).
+            // Step 6 — mute check (scoped only): FALSE stored = muted per §4.1;
+            // absent = enabled. All checks precede hook/store writes — NFR-6.
+            muted_outer = notify_sender_muted (token $c $recipient_cid).
+            if muted_outer != NIL
+            {
+                muted_entry = muted_outer? sender_id.
+                abort "Notifications from this sender are disabled." when muted_entry != NIL.
+            }
+        }
 
         payload = (args $payload) safe str.
         abort "Notification payload exceeds " + (_str payload_max_bytes) + " bytes." when (_strlen payload) > payload_max_bytes.
@@ -763,6 +857,7 @@ library a2a_notifications loads libraries
     trn confirm_registration args: any { return handle_confirm_registration args. }
     trn post_notification args: any { return handle_post_notification args. }
     trn issue_tokens args: any { return handle_issue_tokens args. }
+    trn retire_shared args: any { return handle_retire_shared args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state composes these with

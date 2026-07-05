@@ -436,6 +436,64 @@ application actor loads libraries
         ].
     }
 
+    // ---- N17-N22 probes (v2 validation + retire_shared) ----
+
+    // Export a notify_address_t blob using a scoped (per-sender) token from
+    // my_notify_contact_tokens[service][sender]. Lets a sender post via the
+    // UNCHANGED send_notification trn using a scoped-token handout (N17).
+    trn readonly qa_export_contact_notify_address _:($service -> svc: global_id, $sender -> s: global_id)
+    {
+        outer = a2a_notifications::my_notify_contact_tokens svc.
+        abort "No contact tokens for this service." when outer == NIL.
+        inner_map = outer?.
+        tok = inner_map s.
+        abort "No token for this sender." when tok == NIL.
+        addr is a2a_notifications::notify_address_t = (
+            $version      -> 1,
+            $service_cid  -> svc,
+            $service_name -> "",
+            $token        -> tok?
+        ).
+        return ($blob -> (_write addr)).
+    }
+
+    // Set mute: write FALSE (= muted per §4.1) into notify_sender_muted[recipient][sender].
+    // Stand-in for set_sender_muted until that service inbound lands (a later task).
+    trn qa_notify_set_muted _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        inner is (global_id ->> bool) = (,).
+        if (a2a_notifications::notify_sender_muted r) != NIL { inner -> (a2a_notifications::notify_sender_muted r)?. }
+        inner s -> FALSE.
+        a2a_notifications::notify_sender_muted r -> inner.
+        return transaction::success [ _return_data ($muted -> TRUE), _save_state NIL ].
+    }
+
+    // Clear mute: delete the entry — absent = enabled per §7.
+    trn qa_notify_clear_muted _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if (a2a_notifications::notify_sender_muted r) != NIL
+        {
+            inner is (global_id ->> bool) = (a2a_notifications::notify_sender_muted r)?.
+            if (inner s) != NIL { delete inner s. a2a_notifications::notify_sender_muted r -> inner. }
+        }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
+    // Clear sender slot: delete notify_sender_tokens[recipient][sender].
+    // Used in N21 to create the absent-slot abort condition.
+    trn qa_notify_clear_sender_slot _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if (a2a_notifications::notify_sender_tokens r) != NIL
+        {
+            inner is (global_id ->> a2a_notifications::notify_token_t) = (a2a_notifications::notify_sender_tokens r)?.
+            if (inner s) != NIL { delete inner s. a2a_notifications::notify_sender_tokens r -> inner. }
+        }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
     // E9: a well-formed confirm_registration over a REAL channel, from a contact
     // that is neither a pending nor a registered service of the target.
     trn qa_send_fake_confirm _:($target -> target: global_id)

@@ -805,6 +805,115 @@ async function main() {
   ok(/token_id/.test(n16Alice3),
     `my_notify_contact_tokens round-trips: contact tokens restored on alice3`);
 
+  // ====== v2 N17-N22: post_notification v2 validation + notify_retire_shared ======
+
+  // ---------- N17 scoped happy path ----------
+  CUR = 'N17-scoped-post';
+  console.log('\n=== N17 scoped post happy path ===');
+  // alice has scoped tokens for nbob/neve from N10 state (preserved through N15 re-register + N16 export).
+  // Export a notify_address_t blob wrapping nbob's scoped token from alice's my_notify_contact_tokens.
+  const n17ScopedAddrBlob = Buffer.from(
+    ro(alice, '::actor::qa_export_contact_notify_address',
+       { service: nsvc.cid, sender: nbob.cid }).Reduce('blob').GetBinary()
+  );
+  const n17Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n17ScopedAddrBlob), payload: 'scoped-hello' });
+  await sleep(2500);
+  const n17After = nst(nsvc);
+  ok(/scoped-hello/.test(n17After), `scoped token: nbob posts via scoped handout, hook fired`);
+  // sender_cid comes before payload in notification_t; extract window around payload to verify.
+  { const idx = n17After.indexOf('scoped-hello');
+    ok(new RegExp(nbob.cid).test(n17After.slice(Math.max(0, idx - 500), idx + 50)),
+       `scoped post: sender_cid recorded as nbob`); }
+
+  // ---------- N18 $from != $scope ----------
+  CUR = 'N18-from-ne-scope';
+  console.log('\n=== N18 sender binding mismatch ($from != $scope) ===');
+  const n18Before = nst(nsvc);
+  // neve tries to post with nbob's scoped token — envelope $from == neve.cid, token.$scope == _str(nbob.cid).
+  await mutate(neve, '::a2a_notifications::send_notification',
+               { address: binv(neve, n17ScopedAddrBlob), payload: 'evil-neve' });
+  await sleep(2500);
+  ok(nst(nsvc) === n18Before, `$from≠$scope: service rejects (step 5 binding check), zero state change`);
+  ok(!/evil-neve/.test(nst(nsvc)), `$from≠$scope: payload does not appear in log`);
+
+  // ---------- N19 muted sender ----------
+  CUR = 'N19-muted';
+  console.log('\n=== N19 muted sender ===');
+  // Set mute: write FALSE into notify_sender_muted[alice][nbob] via qa probe.
+  await mutate(nsvc, '::actor::qa_notify_set_muted', { recipient: alice.cid, sender: nbob.cid });
+  const n19Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n17ScopedAddrBlob), payload: 'muted-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n19Before, `muted: post from muted sender aborts (step 6), no hook fired, zero state change`);
+  ok(!/muted-ping/.test(nst(nsvc)), `muted: payload does not appear in log`);
+  // Unmute: delete the entry (absent = enabled per §7). Same token delivers without re-issue.
+  await mutate(nsvc, '::actor::qa_notify_clear_muted', { recipient: alice.cid, sender: nbob.cid });
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n17ScopedAddrBlob), payload: 'unmuted-ping' });
+  await sleep(2500);
+  ok(/unmuted-ping/.test(nst(nsvc)), `unmuted: same token delivers after mute cleared (no re-issue needed)`);
+
+  // ---------- N20 legacy token + notify_retire_shared ----------
+  CUR = 'N20-retire-shared';
+  console.log('\n=== N20 retire_shared ===');
+  // Confirm shared token (scope="") still validates while indexed — existing v1 tests prove this;
+  // this post is the last affirmative confirmation before retirement.
+  const n20SharedBlob = Buffer.from(ro(alice, '::a2a_notifications::export_notify_address',
+    { service: 'svc' }).Reduce('blob').GetBinary());
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n20SharedBlob), payload: 'shared-before-retire' });
+  await sleep(2500);
+  ok(/shared-before-retire/.test(nst(nsvc)), `shared token delivers before retire`);
+  // Retire the shared token (removes its notify_token_index entry; registration_t stays inert).
+  await mutate(alice, '::a2a_notifications::notify_retire_shared', { service: 'svc' });
+  await sleep(2500);
+  // After retire: shared token fails at step 3 — "Unknown or revoked notification token."
+  const n20AfterRetire = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n20SharedBlob), payload: 'shared-after-retire' });
+  await sleep(2500);
+  ok(nst(nsvc) === n20AfterRetire, `shared token aborts after retire (index gone, zero state change)`);
+  ok(!/shared-after-retire/.test(nst(nsvc)), `shared token payload does not appear after retire`);
+  // Scoped tokens for the same recipient are unaffected.
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n17ScopedAddrBlob), payload: 'scoped-after-retire' });
+  await sleep(2500);
+  ok(/scoped-after-retire/.test(nst(nsvc)), `scoped token still validates after shared retire`);
+
+  // ---------- N21 scoped token for absent slot ----------
+  CUR = 'N21-absent-slot';
+  console.log('\n=== N21 scoped token for absent slot ===');
+  // Clear nbob's slot from notify_sender_tokens[alice] via qa probe.
+  // The token is now a "zombie" — valid artifact, but no matching slot → step 4 aborts.
+  await mutate(nsvc, '::actor::qa_notify_clear_sender_slot', { recipient: alice.cid, sender: nbob.cid });
+  const n21Before = nst(nsvc);
+  await mutate(nbob, '::a2a_notifications::send_notification',
+               { address: binv(nbob, n17ScopedAddrBlob), payload: 'absent-slot-ping' });
+  await sleep(2500);
+  ok(nst(nsvc) === n21Before, `absent slot: scoped post aborts at step 4, zero state change`);
+  ok(!/absent-slot-ping/.test(nst(nsvc)), `absent slot: payload does not appear in log`);
+
+  // ---------- N22 retire gate + idempotence ----------
+  CUR = 'N22-retire-gate';
+  console.log('\n=== N22 retire gate + idempotence ===');
+  // Idempotence: alice already retired the shared token in N20; retiring again is a no-op
+  // (E4 discipline: if index entry is already gone, the conditional delete is skipped silently;
+  // confirm still fires so alice's state stays consistent).
+  const n22IdempBefore = nst(nsvc);
+  await mutate(alice, '::a2a_notifications::notify_retire_shared', { service: 'svc' });
+  await sleep(2500);
+  ok(nst(nsvc) === n22IdempBefore, `retire idempotent: second retire is no-op, zero state change`);
+  // Gate: unregister alice, then try retire → client aborts locally (no registration in my_notify_registrations).
+  await mutate(alice, '::a2a_notifications::notify_unregister', { service: 'svc' });
+  await sleep(2500);
+  const n22Err = await mutate(alice, '::a2a_notifications::notify_retire_shared', { service: 'svc' })
+    .then(() => null, (e) => e.message || String(e));
+  ok(n22Err !== null, `retire gate: unregistered caller aborts (client-side gate)`);
+  ok(/No notification registration/.test(n22Err || ''), `retire gate: abort is "No notification registration with that service."`);
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
