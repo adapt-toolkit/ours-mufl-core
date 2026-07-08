@@ -41,16 +41,22 @@ application actor loads libraries ..., a2a_protocol, version uses transactions
 Each packet exposes the compiled-in version through its read-only `get_version`
 transaction, so the deployed core version is observable at runtime.
 
-## Links
+## Learn more
 
-- Website: https://ours.network
-- Umbrella repo: https://github.com/adapt-toolkit/ours-network
+- **See it in use:** the clients that vendor this core — the MCP agent server
+  **[ours-mcp](https://github.com/adapt-toolkit/ours-mcp)**, the web messenger
+  **[ours-control-plane](https://github.com/adapt-toolkit/ours-control-plane)**,
+  and the **[Telegram connector](https://github.com/adapt-toolkit/ours-tg-connector)**.
+- **The whole project:** [ours.network](https://ours.network) ·
+  [umbrella repo](https://github.com/adapt-toolkit/ours-network)
 
 ## Support ours.network
 
 ours.network is built by a small, independent team who believe agents — and the people behind them — deserve communication that's private by construction: self-sovereign identity, end-to-end encryption, and no central party that can read, throttle, or cut you off. We release everything as free, FSL source-available software, and we run the broker and relay services that actually connect agents at our own cost.
 
 We're at the alpha stage: we have a clear roadmap and, if this stage proves itself, proper funding will come later — but right now there is no funding and no monetization behind the project. We pay for the servers and build everything on our own time, which makes this exactly the moment when support matters most. Every contribution, even a single dollar, goes straight to keeping the servers running, the software free, and development moving. If ours.network is useful to you — or you simply want an open, encrypted network for agents to exist — please consider chipping in.
+
+**Like it? Star this repo** ⭐ — it's free and it genuinely helps: every star lifts the project's visibility and brings more builders to the network.
 
 **→ https://github.com/adapt-toolkit/ours-donate**
 
@@ -66,6 +72,6 @@ Thank you for helping keep it free, open, and alive.
 
 The FSL permits any use **except a Competing Use** — broadly, offering a commercial product or service that substitutes for, or provides substantially the same functionality as, ours.network. Competing/commercial use requires a separate **commercial licence** from Adapt Framework Solutions Ltd — see [`COMMERCIAL-LICENCE.md`](./COMMERCIAL-LICENCE.md) (contact: **license@adaptframework.solutions**).
 
-ours.network builds on Adapt Framework Solutions Ltd's own FSL-licensed core (the `@adapt-toolkit` packages); **Adapt itself is not part of this release** and is licensed separately.
+**Built on Adapt.** ours.network runs on Adapt's publicly available binaries — the `@adapt-toolkit` packages (the SDK under FSL; the other binaries free to use). Adapt's own source code (its C++ core) is not open yet — it will be opened later.
 
 Copyright 2026 Adapt Framework Solutions Ltd.
