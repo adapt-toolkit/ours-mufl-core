@@ -91,6 +91,13 @@ application actor loads libraries
         unregs_log is any[] = [].
         regconfirm_log is any[] = [].
 
+        // Deployed-messenger emulation (LEGACY receive_notify_address): stores
+        // the blob, counts receipts, sends NO ack — exactly the pre-engine peer
+        // shape. Feeds the control-plane engine rig's byte-compat + retry-cap
+        // tests.
+        notify_addr_store is (global_id ->> bin) = (,).
+        notify_addr_recv_count is int = 0.
+
         a2a_notifications::init (
             $_read_or_abort -> _read_or_abort,
             $on_notification_posted -> fn (arg: any) -> transaction::action::type[]
@@ -122,6 +129,42 @@ application actor loads libraries
     trn receive_message args: any { return a2a_messaging::handle_receive_message args. }
     trn readonly list_incoming_messages _ { return ($inbox -> inbox). }
     trn readonly list_incoming_files _ { return ($files -> files). }
+
+    // LEGACY notify-address receiver — byte-for-byte the DEPLOYED messenger
+    // targ shape ($address only, required bin). Stores + counts, never acks.
+    // An engine sender's additive $gen field must route here unchanged
+    // (byte-compat obligation).
+    trn receive_notify_address _:($address -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort ().
+
+        from = current_transaction_info::get_external_envelope_or_abort() $from.
+        notify_addr_store from -> blob.
+        notify_addr_recv_count -> notify_addr_recv_count + 1.
+        return transaction::success [ _save_state NIL ].
+    }
+    trn readonly qa_notify_addr_store _
+    {
+        return ($store -> notify_addr_store, $count -> notify_addr_recv_count).
+    }
+    // LEGACY notify-address SENDER — byte-for-byte the deployed fan-out targ
+    // shape ($address only, no $gen). Lets the engine rig prove a pre-engine
+    // peer's handout still lands at a v2 messenger (which must store it and
+    // send no ack).
+    trn qa_send_legacy_notify_address _:($target -> tgt: global_id, $address -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::actor::receive_notify_address",
+                    $targ -> ($address -> blob)
+                ),
+                _return_data ($sent_to -> tgt)
+            ].
+        }).
+    }
     // Exercises the metadata-only file monitoring summary directly (the loopback has
     // no bound control plane, so the format + byte-secrecy are asserted on the helper).
     trn qa_file_summary _:($filename -> f: str, $mime -> m: str, $data -> d: bin)
@@ -238,6 +281,72 @@ application actor loads libraries
             $unregs_log    -> unregs_log,
             $regconfirm_log -> regconfirm_log
         ).
+    }
+
+    // v2: per-sender token maps + contact-token mirror (N9-series probes).
+    trn readonly qa_notify_state_v2 _
+    {
+        return (
+            $sender_tokens  -> a2a_notifications::notify_sender_tokens,
+            $sender_muted   -> a2a_notifications::notify_sender_muted,
+            $contact_tokens -> a2a_notifications::my_notify_contact_tokens
+        ).
+    }
+
+    // Extract the scoped token_id for a specific (recipient, sender) pair from
+    // notify_sender_tokens. Used in N10 to prove handle_issue_tokens indexes scoped
+    // tokens into notify_token_index (revocation mechanism): the returned token_id
+    // must appear as a key in notify_token_index; if the indexing line were removed
+    // from handle_issue_tokens the token would exist in sender_tokens but be absent
+    // from the index and the N10 assertion would fail.
+    trn readonly qa_scoped_token_id _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        outer = a2a_notifications::notify_sender_tokens r.
+        abort "No sender tokens for recipient." when outer == NIL.
+        inner_map = outer?.
+        tok = inner_map s.
+        abort "No token for this sender." when tok == NIL.
+        return ($token_id -> (tok? $c $token_id)).
+    }
+
+    // Send a raw issue_tokens directly to a service (bypasses client-side paging —
+    // used to probe the batch-cap gate and the registered-recipient gate).
+    trn qa_issue_tokens_direct _:($service -> svc: global_id, $senders -> senders: any)
+    {
+        return encrypted_channel::execute_transaction svc (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx svc (
+                    $name -> "::a2a_notifications::issue_tokens",
+                    $targ -> ($senders -> senders)
+                ),
+                _return_data ($sent_to -> svc)
+            ].
+        }).
+    }
+
+    // Import a v1-era notify record (fields $notify_sender_tokens/$notify_sender_muted/
+    // $my_notify_contact_tokens absent) and return the post-import map state.
+    // Used for the v1-era import fixture: verifies import_notify_state handles missing v2 fields
+    // by leaving the defaults (empty maps) in place.
+    trn qa_import_v1_notify_state _:($vapid -> vapid: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_notifications::import_notify_state (
+            $my_notify_registrations -> (,),
+            $notify_registrations    -> (,),
+            $notify_token_index      -> (,),
+            $vapid_public_key        -> vapid
+            // $notify_sender_tokens, $notify_sender_muted, $my_notify_contact_tokens
+            // intentionally absent — simulates a v1-era export record shape.
+        ).
+        return transaction::success [
+            _return_data (
+                $sender_tokens  -> a2a_notifications::notify_sender_tokens,
+                $sender_muted   -> a2a_notifications::notify_sender_muted,
+                $contact_tokens -> a2a_notifications::my_notify_contact_tokens
+            ),
+            _save_state NIL
+        ].
     }
 
     // ---- adversarial leg-1 senders (bare-send a crafted submit_invite_response) ----
@@ -370,21 +479,101 @@ application actor loads libraries
         ].
     }
 
+    // ---- N17+ probes (per-contact validation) ----
+
+    // Export a notify_address_t blob using a scoped (per-sender) token from
+    // my_notify_contact_tokens[service][sender]. Lets a sender post via the
+    // UNCHANGED send_notification trn using a scoped-token handout (N17).
+    trn readonly qa_export_contact_notify_address _:($service -> svc: global_id, $sender -> s: global_id)
+    {
+        outer = a2a_notifications::my_notify_contact_tokens svc.
+        abort "No contact tokens for this service." when outer == NIL.
+        inner_map = outer?.
+        tok = inner_map s.
+        abort "No token for this sender." when tok == NIL.
+        addr is a2a_notifications::notify_address_t = (
+            $version      -> 1,
+            $service_cid  -> svc,
+            $service_name -> "",
+            $token        -> tok?
+        ).
+        return ($blob -> (_write addr)).
+    }
+
+    // Set mute: write FALSE (= muted per §4.1) into notify_sender_muted[recipient][sender].
+    // Stand-in for set_sender_muted until that service inbound lands (a later task).
+    trn qa_notify_set_muted _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        inner is (global_id ->> bool) = (,).
+        if (a2a_notifications::notify_sender_muted r) != NIL { inner -> (a2a_notifications::notify_sender_muted r)?. }
+        inner s -> FALSE.
+        a2a_notifications::notify_sender_muted r -> inner.
+        return transaction::success [ _return_data ($muted -> TRUE), _save_state NIL ].
+    }
+
+    // Clear mute: delete the entry — absent = enabled per §7.
+    trn qa_notify_clear_muted _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if (a2a_notifications::notify_sender_muted r) != NIL
+        {
+            inner is (global_id ->> bool) = (a2a_notifications::notify_sender_muted r)?.
+            if (inner s) != NIL { delete inner s. a2a_notifications::notify_sender_muted r -> inner. }
+        }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
+    // Clear sender slot: delete notify_sender_tokens[recipient][sender].
+    // Used in N21 to create the absent-slot abort condition.
+    trn qa_notify_clear_sender_slot _:($recipient -> r: global_id, $sender -> s: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if (a2a_notifications::notify_sender_tokens r) != NIL
+        {
+            inner is (global_id ->> a2a_notifications::notify_token_t) = (a2a_notifications::notify_sender_tokens r)?.
+            if (inner s) != NIL { delete inner s. a2a_notifications::notify_sender_tokens r -> inner. }
+        }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
+    // Return exactly the $sender_muted map the LAST on_notify_registration hook
+    // call carried (the engine-mirror feed). Precise probe — avoids grepping
+    // the whole regconfirm_log dump.
+    trn readonly qa_last_confirm_muted _
+    {
+        found is any = NIL.
+        sc regconfirm_log -- ( -> entry) { found -> entry. }
+        abort "No confirms logged." when found == NIL.
+        return ($sender_muted -> (found $sender_muted)).
+    }
+
+    // Send set_sender_muted directly to the service without going through the
+    // client-side wrapper (bypasses the client's registration check). Used in N26
+    // to probe the service-side registered-recipient gate.
+    trn qa_set_sender_muted_direct _:($service -> svc: global_id, $sender -> s: global_id, $muted -> m: bool)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction svc (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx svc (
+                    $name -> "::a2a_notifications::set_sender_muted",
+                    $targ -> ($sender -> s, $muted -> m)
+                ),
+                _return_data ($sent_to -> svc)
+            ].
+        }).
+    }
+
     // E9: a well-formed confirm_registration over a REAL channel, from a contact
     // that is neither a pending nor a registered service of the target.
     trn qa_send_fake_confirm _:($target -> target: global_id)
     {
-        core is a2a_notifications::notify_token_core_t = (
-            $version -> 1, $service_cid -> _get_container_id(), $recipient_cid -> target,
-            $token_id -> _new_id "qa fake confirm token", $scope -> "",
-            $iat -> (current_transaction_info::get_transaction_time())?
-        ).
-        token is a2a_notifications::notify_token_t = ($c -> core, $s -> key_storage::default_sign (_value_id core)).
         return encrypted_channel::execute_transaction target (fn (_) -> transaction::results::type {
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target (
                     $name -> "::a2a_notifications::confirm_registration",
-                    $targ -> ($token -> token, $vapid_pub -> "EVIL_VAPID", $bindings -> NIL)
+                    $targ -> ($vapid_pub -> "EVIL_VAPID", $bindings -> NIL, $sender_tokens -> (,), $sender_muted -> (,))
                 ),
                 _return_data ($sent -> TRUE)
             ].
