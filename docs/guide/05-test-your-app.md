@@ -41,15 +41,14 @@ revision you pinned behaves as released.
 
 1. From your app repo **root** (`my-app`, not `mufl_code/`), run the suite inside the
    submodule, pointing it at your
-   environment and at the `protocol_container.mm` stub you created in page 02
-   (`tests/run.sh` honors all four as env overrides):
+   environment (`tests/run.sh` honors these as env overrides; it bundles the
+   `protocol_container.mm` stub itself, so you no longer pass one in):
 
    ```sh
    cd mufl_code/core
    ADAPT_TOOLKIT="$ADAPT_TOOLKIT" \
    OURS_SDK_NODE_MODULES="$OURS_SDK_NODE_MODULES" \
    DEV_BROKER="$DEV_BROKER" \
-   PROTOCOL_CONTAINER_MM="$PWD/../protocol_container.mm" \
    PORT=9791 ./tests/run.sh
    ```
 

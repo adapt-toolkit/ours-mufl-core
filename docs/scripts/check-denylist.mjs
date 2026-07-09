@@ -14,8 +14,6 @@ const DENY = [
   new RegExp('TEAM-' + 'PROTOCOL'),
   new RegExp('Coordinator-' + 'frozen'),
   new RegExp('/home/' + 'fleet'),
-  new RegExp('a2a_' + 'notifications'),
-  new RegExp('feat/' + 'a2a-' + 'notifications'),
 ]
 const docsRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const errors = []

@@ -20,6 +20,7 @@ The repo is a set of pure MUFL libraries with no standalone build. The modules:
 | `a2a_cluster.mm` | The `core.cluster` capability: child/subagent lifecycle, per-child monitoring authorization, the host-local contact book, and introductions. |
 | `a2a_monitoring.mm` | The receiver side of monitoring copies. |
 | `a2a_control.mm` | Control-plane transport: an opaque payload sent to a contact over the encrypted channel. |
+| `a2a_notifications.mm` | Notification service protocol: per-contact scoped tokens, WebPush bindings, issuance/rotation/revocation, receive-mute, and the bare signed-send notification ingest. |
 | `version.mm` | The core version, exposed via `get_core_version`. |
 | `config.mufl` | Exports the libraries above for `config_load #"core"`. |
 
