@@ -17,7 +17,7 @@ library version
 
     // This MUST be updated every time we update ANY code in the shared core.
     hidden {
-        core_version = create_version 0 2 0.
+        core_version = create_version 0 3 0.
     }
 
     fn get_core_version(_) = core_version.
