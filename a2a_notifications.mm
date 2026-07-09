@@ -11,7 +11,7 @@
 //     for storage + WebPush egress. A packet "is" a notification service by
 //     USING this half and advertising cap_notifications — no node-type enum.
 //
-// Trust model (v1, owner-locked): the payload is NOT end-to-end private — the
+// Trust model (v1): the payload is NOT end-to-end private — the
 // service reads every payload and delivers plaintext to the device (transport
 // legs are encrypted by the wire and by WebPush itself). Sender authorization
 // is possession of the service-minted shared token alone: post_notification
