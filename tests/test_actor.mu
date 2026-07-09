@@ -94,7 +94,7 @@ application actor loads libraries
         // Deployed-messenger emulation (LEGACY receive_notify_address): stores
         // the blob, counts receipts, sends NO ack — exactly the pre-engine peer
         // shape. Feeds the control-plane engine rig's byte-compat + retry-cap
-        // tests (notif-v2 DoD 9/10).
+        // tests.
         notify_addr_store is (global_id ->> bin) = (,).
         notify_addr_recv_count is int = 0.
 
@@ -133,7 +133,7 @@ application actor loads libraries
     // LEGACY notify-address receiver — byte-for-byte the DEPLOYED messenger
     // targ shape ($address only, required bin). Stores + counts, never acks.
     // An engine sender's additive $gen field must route here unchanged
-    // (notif-v2 DoD 10 byte-compat obligation).
+    // (byte-compat obligation).
     trn receive_notify_address _:($address -> blob: bin)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -326,7 +326,7 @@ application actor loads libraries
 
     // Import a v1-era notify record (fields $notify_sender_tokens/$notify_sender_muted/
     // $my_notify_contact_tokens absent) and return the post-import map state.
-    // Used for DoD 6 fixture: verifies import_notify_state handles missing v2 fields
+    // Used for the v1-era import fixture: verifies import_notify_state handles missing v2 fields
     // by leaving the defaults (empty maps) in place.
     trn qa_import_v1_notify_state _:($vapid -> vapid: str)
     {

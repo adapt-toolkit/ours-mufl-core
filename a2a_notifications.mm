@@ -12,7 +12,7 @@
 //     for storage + WebPush egress. A packet "is" a notification service by
 //     USING this half and advertising cap_notifications — no node-type enum.
 //
-// Trust model (owner-locked): the payload is NOT end-to-end private — the
+// Trust model: the payload is NOT end-to-end private — the
 // service reads every payload and delivers plaintext to the device (transport
 // legs are encrypted by the wire and by WebPush itself). Tokens are PER-CONTACT
 // scoped: every token names the one sender ($scope == _str sender_cid) it was
@@ -150,7 +150,7 @@ library a2a_notifications loads libraries
     // The ONLY token store — registration carries no token.
     notify_sender_tokens is (global_id ->> (global_id ->> notify_token_t)) = (,).
     // notify_sender_muted[recipient][sender]: receive-mute flag set by
-    // set_sender_muted. Stores FALSE when muted; ABSENT = enabled (§7).
+    // set_sender_muted. Stores FALSE when muted; ABSENT = enabled.
     notify_sender_muted  is (global_id ->> (global_id ->> bool)) = (,).
 
     // ---- client half: mirror of the per-sender tokens from the last confirm
@@ -298,8 +298,8 @@ library a2a_notifications loads libraries
         }).
     }
 
-    // Replace a single sender's scoped token OR all scoped tokens (§5.4 / §8 /
-    // Q9). $contact present → rotate ONLY that sender's slot; $contact NIL →
+    // Replace a single sender's scoped token OR all scoped tokens.
+    // $contact present → rotate ONLY that sender's slot; $contact NIL →
     // rotate ALL scoped slots (panic button). Recovery path for a leaked token
     // or wholesale reset.
     trn notify_rotate_token _:($service -> service_ref: str, $contact -> contact_ref: str+)
@@ -332,8 +332,8 @@ library a2a_notifications loads libraries
         }).
     }
 
-    // Tell the service to mute or unmute notifications from a given sender (§5.2 / §7).
-    // $muted TRUE → block; FALSE → unblock (delete entry — absent = enabled, §7).
+    // Tell the service to mute or unmute notifications from a given sender.
+    // $muted TRUE → block; FALSE → unblock (delete entry — absent = enabled).
     // Runtime-only: no token change, no re-index. Service re-confirms so alice's state
     // mirror stays coherent. $contact is the sender's global_id (cid string accepted by SDK).
     trn notify_set_sender_muted _:($service -> service_ref: str, $contact -> contact_id: global_id, $muted -> muted: bool)
@@ -356,7 +356,7 @@ library a2a_notifications loads libraries
     }
 
     // Tell the service to revoke the scoped tokens for each listed contact — no
-    // re-mint (revoke-without-replace, §5.4 / DoD 3). Service deletes each sender's
+    // re-mint (revoke-without-replace). Service deletes each sender's
     // index entry and notify_sender_tokens slot; posts against those token_ids abort at
     // step 3 (index lookup). Empty list / unknown-sender slots: tolerated (E4/E8).
     trn notify_revoke_contact_tokens _:($service -> service_ref: str, $contacts -> contacts: global_id[])
@@ -605,9 +605,9 @@ library a2a_notifications loads libraries
     }
 
     // SERVICE inbound: mint (or re-use) a scoped token for each requested sender
-    // cid and return the current per-sender map in the confirm (DoD 1/5 V12).
+    // cid and return the current per-sender map in the confirm.
     //
-    //   $senders: global_id[]+  — non-empty, max issue_max_senders (V12 batch cap).
+    //   $senders: global_id[]+  — non-empty, max issue_max_senders (batch cap).
     //
     // Edge cases:
     //   E8: re-issue for an already-known sender keeps the existing token bytes
@@ -651,11 +651,11 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
-    // SERVICE inbound: atomically replace tokens — two paths (§5.4):
-    // · $sender present → per-sender path (DoD 3): rotate ONLY that sender's scoped
+    // SERVICE inbound: atomically replace tokens — two paths:
+    // · $sender present → per-sender path: rotate ONLY that sender's scoped
     //   token; old token_id dies on index delete; fresh scoped token minted / stored /
     //   indexed in the same transaction. Other senders untouched.
-    // · $sender absent/NIL → rotate-all (Q9 panic button): every scoped slot in
+    // · $sender absent/NIL → rotate-all (panic button): every scoped slot in
     //   notify_sender_tokens. Keys collected first to avoid mutation-while-iterating;
     //   each old index entry deleted and new token minted / stored / indexed.
     fn handle_rotate_token (args: any) -> transaction::results::type
@@ -672,7 +672,7 @@ library a2a_notifications loads libraries
 
         if sender != NIL
         {
-            // Per-sender path: rotate exactly one scoped token atomically (§5.4).
+            // Per-sender path: rotate exactly one scoped token atomically.
             sender_cid = sender?.
             existing_map is (global_id ->> notify_token_t) = (,).
             if (notify_sender_tokens recipient) != NIL { existing_map -> (notify_sender_tokens recipient)?. }
@@ -716,10 +716,10 @@ library a2a_notifications loads libraries
         return transaction::success actions.
     }
 
-    // SERVICE inbound: toggle the receive-mute flag for a named sender (§5.2 / §7):
+    // SERVICE inbound: toggle the receive-mute flag for a named sender:
     // $muted TRUE → write notify_sender_muted[recipient][sender] -> FALSE (the map
-    //   stores FALSE when receive-disabled — present entry = muted, per §4.1).
-    // $muted FALSE → DELETE the entry — absent = enabled, keeps state minimal (§7).
+    //   stores FALSE when receive-disabled — present entry = muted).
+    // $muted FALSE → DELETE the entry — absent = enabled, keeps state minimal.
     // Runtime-only: no token change, no re-index. Replies confirm so the client
     // mirror stays coherent. Gate: registered-recipient only (shared gate pattern).
     fn handle_set_sender_muted (args: any) -> transaction::results::type
@@ -738,13 +738,13 @@ library a2a_notifications loads libraries
 
         if muted == TRUE
         {
-            // Mute: store FALSE (= receive-disabled per §7 map semantics;
+            // Mute: store FALSE (= receive-disabled map semantics;
             // present entry = muted, absent = enabled — keeps state minimal).
             inner sender -> FALSE.
         }
         else
         {
-            // Unmute: delete entry — absent = enabled (§7 minimal-state rule).
+            // Unmute: delete entry — absent = enabled (minimal-state rule).
             if (inner sender) != NIL { delete inner sender. }
         }
         notify_sender_muted recipient -> inner.
@@ -755,9 +755,9 @@ library a2a_notifications loads libraries
     }
 
     // SERVICE inbound: revoke the scoped tokens for each listed sender — no
-    // re-mint (revoke-without-replace, §5.4 / DoD 3). For each sender in $senders:
+    // re-mint (revoke-without-replace). For each sender in $senders:
     // delete its token_id from notify_token_index (posts against those token_ids
-    // abort at step 3 — E4) and remove its slot from notify_sender_tokens.
+    // abort at step 3) and remove its slot from notify_sender_tokens.
     // Re-confirms once after all senders processed. Idempotent: unknown senders
     // and absent slots are tolerated — delete of absent = no-op (E4/E8).
     fn handle_revoke_sender_tokens (args: any) -> transaction::results::type
@@ -779,7 +779,7 @@ library a2a_notifications loads libraries
             if old_tok != NIL
             {
                 // Revoke: drop index entry (posts using this token_id abort at step
-                // 3 — E4) and remove the sender slot (no re-mint — DoD 3).
+                // 3) and remove the sender slot (no re-mint).
                 delete notify_token_index (old_tok? $c $token_id).
                 delete existing_map sender.
             }
@@ -910,8 +910,8 @@ library a2a_notifications loads libraries
     }
 
     // SERVICE inbound: the notification ingest. The ONE inbound that accepts a
-    // BARE signed send (origin external, NO check_encrypted_or_abort — locked
-    // §0.2): the sender is typically a packet this service never met, and the
+    // BARE signed send (origin external, NO check_encrypted_or_abort by
+    // design): the sender is typically a packet this service never met, and the
     // token is the sole authorization. Validation order matters (abort on first
     // failure, mutate nothing):
     //   1. parse-safe + version   2. minted by THIS service   3. live index
@@ -919,14 +919,14 @@ library a2a_notifications loads libraries
     //   entries, so revocation is a state lookup)   4. sender binding — the
     //   signature-verified envelope $from must equal the token's $scope
     //   (evaluated before byte-equality: mufl has no reverse _str() to recover
-    //   a global_id from the scope string; observably equivalent to the SPEC
+    //   a global_id from the scope string; observably equivalent to the intended
     //   order)   5. byte-equality vs the STORED token in
     //   notify_sender_tokens[recipient][sender] (_value_id) — forging any
     //   field, $scope included, requires possessing the exact minted artifact;
     //   no signature re-verification is needed because we compare against what
     //   we ourselves stored   6. mute check (FALSE stored = muted, absent =
     //   enabled)   7. payload cap.
-    // All checks precede hook/store writes (NFR-6). Fire-and-forget: no reply
+    // All checks precede hook/store writes. Fire-and-forget: no reply
     // leg — an aborted post is invisible to the sender (mute is unprobeable).
     fn handle_post_notification (args: any) -> transaction::results::type
     {
@@ -954,7 +954,7 @@ library a2a_notifications loads libraries
         scoped_tok_entry = (scoped_outer?) sender_id.
         abort "Token is not bound to this sender." when scoped_tok_entry == NIL.
         abort "Presented token does not match the stored registration." when (_value_id token) != (_value_id scoped_tok_entry?).
-        // Mute check: FALSE stored = muted per §4.1; absent = enabled.
+        // Mute check: FALSE stored = muted; absent = enabled.
         muted_outer = notify_sender_muted (token $c $recipient_cid).
         if muted_outer != NIL
         {
@@ -1040,7 +1040,7 @@ library a2a_notifications loads libraries
             vapid_public_key -> (data $vapid_public_key) safe str.
         }
         // v2 fields: individually guarded so a v1-era export imports cleanly
-        // with the defaults (empty maps) in place — DoD 6 fixture test relies on this.
+        // with the defaults (empty maps) in place — fixture test relies on this.
         if (data $notify_sender_tokens) != NIL
         {
             notify_sender_tokens -> (data $notify_sender_tokens) safe (global_id ->> (global_id ->> notify_token_t)).
