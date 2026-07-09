@@ -1,6 +1,6 @@
 # Modules
 
-The core is seven `.mm` libraries and one config export loaded by `config_load #"core"` from a consumer's
+The core is eight `.mm` libraries and one config export loaded by `config_load #"core"` from a consumer's
 `config.mufl`. The source is the authoritative reference; the
 [how-it-works](../how-it-works/overview.md) pages explain the protocol design behind each module.
 
@@ -12,6 +12,7 @@ The core is seven `.mm` libraries and one config export loaded by `config_load #
 | [`a2a_cluster.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_cluster.mm) | The `core.cluster` capability handler: child/subagent lifecycle, per-child monitoring authorization, host-local contact book, and introductions between children and contacts. |
 | [`a2a_monitoring.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_monitoring.mm) | Control-plane receiver side of monitoring copies: validates sender and hands the copy to the app's storage hook. |
 | [`a2a_control.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_control.mm) | Control-plane transport: an opaque payload delivered to a contact over the `encrypted_channel`, validated on receipt. |
+| [`a2a_notifications.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_notifications.mm) | Notification service protocol: per-contact scoped tokens (`$scope`), registration and WebPush bindings, token issuance/rotation/revocation, receive-mute, and the bare signed-send notification ingest. |
 | [`version.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/version.mm) | Core version record, readable at runtime via `get_core_version`. |
 | [`config.mufl`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/config.mufl) | Compile configuration: exports the libraries above for `config_load #"core"`. |
 

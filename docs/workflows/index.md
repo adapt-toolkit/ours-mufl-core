@@ -46,10 +46,12 @@ mid-handshake, so a crash restores to the last stable point).
 | [Control-plane verb calls](./control-verbs.md) | `send_control` → `dispatch` → capability handler → response envelope |
 | [Introductions](./introductions.md) | `core.connect`: a shared CP connects two nodes without an invite |
 | [Cluster lifecycle](./cluster.md) | async child create via host primitives, cluster enrollment, roster push |
+| [Notifications](./notifications.md) | `notify_register` → `notify_issue_tokens` → `send_notification` / `post_notification`, mute/rotate/revoke |
 
 All flows were traced from
 [`a2a_messaging.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_messaging.mm),
 [`a2a_control.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_control.mm),
 [`a2a_capabilities.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_capabilities.mm),
 [`a2a_cluster.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_cluster.mm) and
-[`a2a_monitoring.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_monitoring.mm).
+[`a2a_monitoring.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_monitoring.mm) and
+[`a2a_notifications.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_notifications.mm).
