@@ -1,204 +1,688 @@
 {
   "how-it-works/overview.md": [
-    { "file": "README.md", "symbol": "config_load #\"core\"" },
-    { "file": "README.md", "symbol": "identical wire" },
-    { "file": "README.md", "symbol": "git submodule add" },
-    { "file": "README.md", "symbol": "a2a_capabilities.mm" }
+    {
+      "file": "README.md",
+      "symbol": "config_load #\"core\""
+    },
+    {
+      "file": "README.md",
+      "symbol": "identical wire"
+    },
+    {
+      "file": "README.md",
+      "symbol": "git submodule add"
+    },
+    {
+      "file": "README.md",
+      "symbol": "a2a_capabilities.mm"
+    }
   ],
   "how-it-works/identity.md": [
-    { "file": "a2a_protocol.mm", "symbol": "verify_peer_delegation" },
-    { "file": "a2a_protocol.mm", "symbol": "verify_cp_attestation" },
-    { "file": "a2a_protocol.mm", "symbol": "verify_root_cp_binding" },
-    { "file": "a2a_protocol.mm", "symbol": "delegation_cert_t" }
+    {
+      "file": "a2a_protocol.mm",
+      "symbol": "verify_peer_delegation"
+    },
+    {
+      "file": "a2a_protocol.mm",
+      "symbol": "verify_cp_attestation"
+    },
+    {
+      "file": "a2a_protocol.mm",
+      "symbol": "verify_root_cp_binding"
+    },
+    {
+      "file": "a2a_protocol.mm",
+      "symbol": "delegation_cert_t"
+    }
   ],
   "how-it-works/invites-and-contacts.md": [
-    { "file": "a2a_messaging.mm", "symbol": "generate_invite" },
-    { "file": "a2a_messaging.mm", "symbol": "add_contact" },
-    { "file": "a2a_messaging.mm", "symbol": "already-redeemed" },
-    { "file": "a2a_messaging.mm", "symbol": "pending_redemptions" },
-    { "file": "a2a_messaging.mm", "symbol": "ingest_connect_descriptor" },
-    { "file": "tests/README.md", "symbol": "T1 | happy-flat" },
-    { "file": "tests/README.md", "symbol": "T3 | single-use" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "generate_invite"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "add_contact"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "already-redeemed"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "pending_redemptions"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "ingest_connect_descriptor"
+    },
+    {
+      "file": "tests/README.md",
+      "symbol": "T1 | happy-flat"
+    },
+    {
+      "file": "tests/README.md",
+      "symbol": "T3 | single-use"
+    }
   ],
   "how-it-works/messaging.md": [
-    { "file": "a2a_messaging.mm", "symbol": "send_message" },
-    { "file": "a2a_messaging.mm", "symbol": "send_file" },
-    { "file": "a2a_messaging.mm", "symbol": "receive_message_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "receive_file_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "DEGRADED contact" },
-    { "file": "README.md", "symbol": "Contact and messaging transactions" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "send_message"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "send_file"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "receive_message_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "receive_file_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "DEGRADED contact"
+    },
+    {
+      "file": "README.md",
+      "symbol": "Contact and messaging transactions"
+    }
   ],
   "how-it-works/capabilities-and-control.md": [
-    { "file": "a2a_capabilities.mm", "symbol": "control_envelope_t" },
-    { "file": "a2a_capabilities.mm", "symbol": "cap_configuration" },
-    { "file": "a2a_capabilities.mm", "symbol": "cap_monitoring" },
-    { "file": "a2a_capabilities.mm", "symbol": "cap_connect" },
-    { "file": "a2a_capabilities.mm", "symbol": "cap_cluster" },
-    { "file": "a2a_capabilities.mm", "symbol": "dispatch" },
-    { "file": "a2a_control.mm", "symbol": "send_control" },
-    { "file": "a2a_control.mm", "symbol": "control_message" },
-    { "file": "a2a_control.mm", "symbol": "on_control_received" }
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "control_envelope_t"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "cap_configuration"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "cap_monitoring"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "cap_connect"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "cap_cluster"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "dispatch"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "send_control"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "control_message"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "on_control_received"
+    }
   ],
   "how-it-works/cluster.md": [
-    { "file": "a2a_cluster.mm", "symbol": "cluster_members" },
-    { "file": "a2a_cluster.mm", "symbol": "member_t" },
-    { "file": "a2a_cluster.mm", "symbol": "cluster_handler" },
-    { "file": "a2a_cluster.mm", "symbol": "register_provisioned_child" },
-    { "file": "a2a_cluster.mm", "symbol": "confirm_child_destroyed" },
-    { "file": "a2a_cluster.mm", "symbol": "register_child_invite" },
-    { "file": "a2a_cluster.mm", "symbol": "confirm_child_monitoring" },
-    { "file": "a2a_cluster.mm", "symbol": "reconcile" },
-    { "file": "a2a_capabilities.mm", "symbol": "cap_cluster" }
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "cluster_members"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "member_t"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "cluster_handler"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "register_provisioned_child"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "confirm_child_destroyed"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "register_child_invite"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "confirm_child_monitoring"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "reconcile"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "cap_cluster"
+    }
   ],
   "how-it-works/monitoring-and-config.md": [
-    { "file": "a2a_messaging.mm", "symbol": "monitoring_proxy" },
-    { "file": "a2a_messaging.mm", "symbol": "monitor_copy_actions" },
-    { "file": "a2a_messaging.mm", "symbol": "set_proxy_pending" },
-    { "file": "a2a_messaging.mm", "symbol": "verify_proxy_code" },
-    { "file": "a2a_messaging.mm", "symbol": "authorize_control" },
-    { "file": "a2a_messaging.mm", "symbol": "set_app_config" },
-    { "file": "a2a_monitoring.mm", "symbol": "receive_monitoring_copy" },
-    { "file": "a2a_monitoring.mm", "symbol": "on_monitoring_copy_received" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "monitoring_proxy"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "monitor_copy_actions"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "set_proxy_pending"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "verify_proxy_code"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "authorize_control"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "set_app_config"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "receive_monitoring_copy"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "on_monitoring_copy_received"
+    }
   ],
   "workflows/index.md": [
-    { "file": "a2a_messaging.mm", "symbol": "validate_origin_or_abort" },
-    { "file": "a2a_messaging.mm", "symbol": "ADAPT broker" },
-    { "file": "a2a_messaging.mm", "symbol": "transaction::action::send" },
-    { "file": "a2a_messaging.mm", "symbol": "send_encrypted_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "_notify_agent" },
-    { "file": "a2a_messaging.mm", "symbol": "_save_state" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "validate_origin_or_abort"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "ADAPT broker"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "transaction::action::send"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "send_encrypted_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "_notify_agent"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "_save_state"
+    }
   ],
   "workflows/contact-exchange.md": [
-    { "file": "a2a_messaging.mm", "symbol": "mint_eph_invite" },
-    { "file": "a2a_messaging.mm", "symbol": "submit_invite_response_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_submit_invite_response" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_complete_invite" },
-    { "file": "a2a_messaging.mm", "symbol": "pending_redemption_keys" },
-    { "file": "a2a_messaging.mm", "symbol": "already-redeemed" },
-    { "file": "a2a_messaging.mm", "symbol": "verify_identity_bundle" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "mint_eph_invite"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "submit_invite_response_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_submit_invite_response"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_complete_invite"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "pending_redemption_keys"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "already-redeemed"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "verify_identity_bundle"
+    }
   ],
   "workflows/messaging.md": [
-    { "file": "a2a_messaging.mm", "symbol": "send_message" },
-    { "file": "a2a_messaging.mm", "symbol": "receive_message_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_receive_message" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_receive_file" },
-    { "file": "a2a_messaging.mm", "symbol": "monitor_copy_actions" },
-    { "file": "a2a_messaging.mm", "symbol": "file_monitor_summary" },
-    { "file": "a2a_messaging.mm", "symbol": "deferred_msgs_cap" },
-    { "file": "a2a_messaging.mm", "symbol": "on_message_received" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "send_message"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "receive_message_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_receive_message"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_receive_file"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "monitor_copy_actions"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "file_monitor_summary"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "deferred_msgs_cap"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "on_message_received"
+    }
   ],
   "workflows/contact-restore.md": [
-    { "file": "a2a_messaging.mm", "symbol": "begin_contact_restore" },
-    { "file": "a2a_messaging.mm", "symbol": "request_contact_restore_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_request_contact_restore" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_submit_restore_response" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_complete_restore" },
-    { "file": "a2a_messaging.mm", "symbol": "flush_deferred" },
-    { "file": "a2a_messaging.mm", "symbol": "restore_degraded_contacts" },
-    { "file": "a2a_messaging.mm", "symbol": "restore_max_attempts" },
-    { "file": "a2a_messaging.mm", "symbol": "list_degraded_contacts" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "begin_contact_restore"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "request_contact_restore_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_request_contact_restore"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_submit_restore_response"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_complete_restore"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "flush_deferred"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "restore_degraded_contacts"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "restore_max_attempts"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "list_degraded_contacts"
+    }
   ],
   "workflows/monitoring.md": [
-    { "file": "a2a_messaging.mm", "symbol": "set_proxy_pending" },
-    { "file": "a2a_messaging.mm", "symbol": "do_verify_proxy_code" },
-    { "file": "a2a_messaging.mm", "symbol": "proxy_code_max_age_seconds" },
-    { "file": "a2a_messaging.mm", "symbol": "disable_monitoring" },
-    { "file": "a2a_messaging.mm", "symbol": "receive_monitoring_copy_tx" },
-    { "file": "a2a_messaging.mm", "symbol": "host_clear_child_monitoring" },
-    { "file": "a2a_cluster.mm", "symbol": "monitoring_handler" },
-    { "file": "a2a_monitoring.mm", "symbol": "handle_receive_monitoring_copy" },
-    { "file": "a2a_monitoring.mm", "symbol": "on_monitoring_copy_received" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "set_proxy_pending"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "do_verify_proxy_code"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "proxy_code_max_age_seconds"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "disable_monitoring"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "receive_monitoring_copy_tx"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "host_clear_child_monitoring"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "monitoring_handler"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "handle_receive_monitoring_copy"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "on_monitoring_copy_received"
+    }
   ],
   "workflows/control-verbs.md": [
-    { "file": "a2a_control.mm", "symbol": "send_control" },
-    { "file": "a2a_control.mm", "symbol": "control_message_tx" },
-    { "file": "a2a_control.mm", "symbol": "on_control_received" },
-    { "file": "a2a_capabilities.mm", "symbol": "dispatch" },
-    { "file": "a2a_capabilities.mm", "symbol": "control_auth_class" },
-    { "file": "a2a_capabilities.mm", "symbol": "response_envelope_t" },
-    { "file": "a2a_capabilities.mm", "symbol": "deny_action" },
-    { "file": "a2a_messaging.mm", "symbol": "authorize_control" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_set_app_config" },
-    { "file": "a2a_messaging.mm", "symbol": "require_bound_cp_or_abort" }
+    {
+      "file": "a2a_control.mm",
+      "symbol": "send_control"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "control_message_tx"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "on_control_received"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "dispatch"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "control_auth_class"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "response_envelope_t"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "deny_action"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "authorize_control"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_set_app_config"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "require_bound_cp_or_abort"
+    }
   ],
   "workflows/introductions.md": [
-    { "file": "a2a_messaging.mm", "symbol": "introduce_to_group" },
-    { "file": "a2a_messaging.mm", "symbol": "emit_pair" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_ingest_connect_descriptor" },
-    { "file": "a2a_messaging.mm", "symbol": "require_cluster_cp_or_abort" },
-    { "file": "a2a_messaging.mm", "symbol": "introduce_name" },
-    { "file": "a2a_capabilities.mm", "symbol": "self_supports" }
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "introduce_to_group"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "emit_pair"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_ingest_connect_descriptor"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "require_cluster_cp_or_abort"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "introduce_name"
+    },
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "self_supports"
+    }
   ],
   "workflows/cluster.md": [
-    { "file": "a2a_cluster.mm", "symbol": "cluster_handler" },
-    { "file": "a2a_cluster.mm", "symbol": "pending_create_names" },
-    { "file": "a2a_cluster.mm", "symbol": "register_provisioned_child" },
-    { "file": "a2a_cluster.mm", "symbol": "sweep_and_settle" },
-    { "file": "a2a_cluster.mm", "symbol": "reconcile" },
-    { "file": "a2a_cluster.mm", "symbol": "confirm_child_monitoring" },
-    { "file": "a2a_cluster.mm", "symbol": "_push_roster_actions" },
-    { "file": "a2a_cluster.mm", "symbol": "ev_mint_invite" },
-    { "file": "a2a_messaging.mm", "symbol": "relay_enroll_delegated_node" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_enroll_delegated_node" },
-    { "file": "a2a_messaging.mm", "symbol": "host_register_monitoring_cp" },
-    { "file": "a2a_messaging.mm", "symbol": "bound_cp_cid" },
-    { "file": "a2a_monitoring.mm", "symbol": "on_roster_update" }
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "cluster_handler"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "pending_create_names"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "register_provisioned_child"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "sweep_and_settle"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "reconcile"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "confirm_child_monitoring"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "_push_roster_actions"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "ev_mint_invite"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "relay_enroll_delegated_node"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_enroll_delegated_node"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "host_register_monitoring_cp"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "bound_cp_cid"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "on_roster_update"
+    }
   ],
   "guide/index.md": [
-    { "file": "README.md", "symbol": "compiles it into its own packet" },
-    { "file": "README.md", "symbol": "config_load #\"core\"" }
+    {
+      "file": "README.md",
+      "symbol": "compiles it into its own packet"
+    },
+    {
+      "file": "README.md",
+      "symbol": "config_load #\"core\""
+    }
   ],
   "guide/01-vendor-the-core.md": [
-    { "file": "README.md", "symbol": "git submodule add" }
+    {
+      "file": "README.md",
+      "symbol": "git submodule add"
+    }
   ],
   "guide/02-configure-and-compile.md": [
-    { "file": "config.mufl", "symbol": "$exports" },
-    { "file": "README.md", "symbol": "config_load #\"core\"" }
+    {
+      "file": "config.mufl",
+      "symbol": "$exports"
+    },
+    {
+      "file": "README.md",
+      "symbol": "config_load #\"core\""
+    }
   ],
   "guide/03-wire-the-host.md": [
-    { "file": "tests/test_actor.mu", "symbol": "a2a_messaging::init" },
-    { "file": "tests/test_actor.mu", "symbol": "protocol_container" },
-    { "file": "tests/test_actor.mu", "symbol": "export_core_state" },
-    { "file": "a2a_messaging.mm", "symbol": "::actor::receive_message" },
-    { "file": "a2a_messaging.mm", "symbol": "handle_receive_message" }
+    {
+      "file": "tests/test_actor.mu",
+      "symbol": "a2a_messaging::init"
+    },
+    {
+      "file": "tests/test_actor.mu",
+      "symbol": "protocol_container"
+    },
+    {
+      "file": "tests/test_actor.mu",
+      "symbol": "export_core_state"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "::actor::receive_message"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "handle_receive_message"
+    }
   ],
   "guide/04-connect-and-message.md": [
-    { "file": "tests/test.mjs", "symbol": "generate_invite" },
-    { "file": "tests/test.mjs", "symbol": "add_contact" },
-    { "file": "tests/test.mjs", "symbol": "send_message" },
-    { "file": "tests/test_actor.mu", "symbol": "receive_message" }
+    {
+      "file": "tests/test.mjs",
+      "symbol": "generate_invite"
+    },
+    {
+      "file": "tests/test.mjs",
+      "symbol": "add_contact"
+    },
+    {
+      "file": "tests/test.mjs",
+      "symbol": "send_message"
+    },
+    {
+      "file": "tests/test_actor.mu",
+      "symbol": "receive_message"
+    }
   ],
   "guide/05-test-your-app.md": [
-    { "file": "tests/run.sh", "symbol": "OURS_SDK_NODE_MODULES" },
-    { "file": "tests/run.sh", "symbol": "PROTOCOL_CONTAINER_MM" },
-    { "file": "tests/README.md", "symbol": "SCORECARD" },
-    { "file": "tests/README.md", "symbol": "qa_*" }
+    {
+      "file": "tests/run.sh",
+      "symbol": "OURS_SDK_NODE_MODULES"
+    },
+    {
+      "file": "tests/README.md",
+      "symbol": "SCORECARD"
+    },
+    {
+      "file": "tests/README.md",
+      "symbol": "qa_*"
+    }
   ],
   "how-it-works/versioning.md": [
-    { "file": "version.mm", "symbol": "version_t" },
-    { "file": "version.mm", "symbol": "get_core_version" },
-    { "file": "version.mm", "symbol": "core_version" },
-    { "file": "version.mm", "symbol": "MUST be updated every time we update ANY code" },
-    { "file": "README.md", "symbol": "get_version" }
+    {
+      "file": "version.mm",
+      "symbol": "version_t"
+    },
+    {
+      "file": "version.mm",
+      "symbol": "get_core_version"
+    },
+    {
+      "file": "version.mm",
+      "symbol": "core_version"
+    },
+    {
+      "file": "version.mm",
+      "symbol": "MUST be updated every time we update ANY code"
+    },
+    {
+      "file": "README.md",
+      "symbol": "get_version"
+    }
   ],
   "reference/modules.md": [
-    { "file": "a2a_capabilities.mm", "symbol": "Shared ours capabilities library" },
-    { "file": "a2a_protocol.mm", "symbol": "Shared ours protocol library" },
-    { "file": "a2a_messaging.mm", "symbol": "Shared ours messaging library" },
-    { "file": "a2a_cluster.mm", "symbol": "Shared ours cluster library" },
-    { "file": "a2a_monitoring.mm", "symbol": "Shared ours monitoring library" },
-    { "file": "a2a_control.mm", "symbol": "Shared ours control-plane library" },
-    { "file": "version.mm", "symbol": "get_core_version" },
-    { "file": "config.mufl", "symbol": "$exports" }
+    {
+      "file": "a2a_capabilities.mm",
+      "symbol": "Shared ours capabilities library"
+    },
+    {
+      "file": "a2a_protocol.mm",
+      "symbol": "Shared ours protocol library"
+    },
+    {
+      "file": "a2a_messaging.mm",
+      "symbol": "Shared ours messaging library"
+    },
+    {
+      "file": "a2a_cluster.mm",
+      "symbol": "Shared ours cluster library"
+    },
+    {
+      "file": "a2a_monitoring.mm",
+      "symbol": "Shared ours monitoring library"
+    },
+    {
+      "file": "a2a_control.mm",
+      "symbol": "Shared ours control-plane library"
+    },
+    {
+      "file": "version.mm",
+      "symbol": "get_core_version"
+    },
+    {
+      "file": "config.mufl",
+      "symbol": "$exports"
+    }
   ],
   "reference/implementations.md": [
-    { "file": "README.md", "symbol": "MCP agent server" },
-    { "file": "README.md", "symbol": "Telegram connector" }
+    {
+      "file": "README.md",
+      "symbol": "MCP agent server"
+    },
+    {
+      "file": "README.md",
+      "symbol": "Telegram connector"
+    }
   ],
   "reference/glossary.md": [
-    { "file": "README.md", "symbol": "identical wire" }
+    {
+      "file": "README.md",
+      "symbol": "identical wire"
+    }
   ],
   "reference/contributing.md": [
-    { "file": "CONTRIBUTING.md", "symbol": "CLA" }
+    {
+      "file": "CONTRIBUTING.md",
+      "symbol": "CLA"
+    }
+  ],
+  "workflows/notifications.md": [
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_register"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_issue_tokens"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "export_notify_address"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "send_notification"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "post_notification"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_set_sender_muted"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_rotate_token"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_revoke_contact_tokens"
+    },
+    {
+      "file": "a2a_notifications.mm",
+      "symbol": "notify_mark_read"
+    }
   ]
 }
