@@ -658,6 +658,34 @@ application actor loads libraries
         return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
     }
 
+    // Inject a learned dialect for a contact — arranges the "peer was v2 at
+    // invite time" precondition of the upgrade scenario (V7) on a pair that
+    // has a live encrypted channel (V1 proves the real v2 leg-1 learns 2).
+    trn qa_set_contact_pv _:($cid -> cid: global_id, $pv -> pv: int)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::contact_pv cid -> pv.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    // Emit the EXACT pre-0.5 legacy receive_message $targ — only $text, no
+    // $wire_id / $reply_to / $pv — over the established encrypted channel
+    // (byte-shape of the deployed 0.2-line sender). Drives the V7 monotonicity
+    // assertion: unstamped legacy traffic must never downgrade learned state.
+    trn qa_send_legacy_message _:($target -> tgt: global_id, $text -> text: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::actor::receive_message",
+                    $targ -> ($text -> text)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
     // ---- golden-wire corpus probes (COMPATIBILITY.md release gate) ----
     // One fixture per REGISTERED version per registry, built as the EXACT wire
     // shape that version's sender emits (fixtures-as-code: the payloads carry

@@ -37,6 +37,16 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
   stamped `$pv` on message/file traffic (an *unstamped* message never overwrites the more
   precise invite-time inference). Both maps are additive in the export blob, guarded on
   import.
+- **Refresh scope (by design):** ordinary message/file traffic refreshes **`$pv` only** —
+  `$caps` refreshes solely via the bundle legs (invite redeem / contact restore) or a future
+  daemon-driven `get_manifest` pull (backlog); it is deliberately NOT piggybacked on every
+  message (wire cost). Consequence: a peer that upgrades and then only sends ordinary
+  messages is re-learned as `contact_pv = 5` with stale/absent caps — **benign** under the
+  fail-open CAP-1 gate (absent/empty caps pass). Learning is per-contact lazy; there is no
+  bulk re-sync. Monotonicity: unstamped traffic writes nothing, and a caps entry is never
+  downgraded to empty — only replaced by a newer non-empty advertisement; `contact_pv`
+  itself is last-*stamped*-wins so an honest software downgrade is re-learned (a forged
+  lower `$pv` only degrades the forger's own UX — REG-6).
 
 ## Registry rules (REG-1…6)
 

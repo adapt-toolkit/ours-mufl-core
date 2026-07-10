@@ -1229,6 +1229,37 @@ async function main() {
     ok(pvOf(I, R.cid) === '5', `inviter learned contact_pv=5 (real 0.5.0 v5 leg-1)`);
   }
 
+  // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
+  // A contact was v2 at invite time (V1 proves a real v2 leg-1 learns
+  // contact_pv=2; the emulated legacy responder has no reverse channel, so that
+  // v2-era state is ARRANGED here on the channel-connected T1 pair). Then the
+  // peer "upgrades": its first v5-STAMPED ordinary message must re-learn
+  // contact_pv 2→5 through handle_receive_message (ongoing learning, not
+  // invite-time-only). Finally a stale/replayed v2-SHAPE (unstamped) legacy
+  // message must NOT downgrade the learned pv nor clobber learned v5 caps.
+  CUR = 'V7 upgrade+monotonic';
+  console.log('\n=== V7 upgrade-later re-learn + monotonic (no downgrade by legacy traffic) ===');
+  {
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 2 });
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });  // v2-era: nothing advertised
+    ok(pvOf(I, R.cid) === '2', `arranged: contact recorded as v2-era (the state a real v2 leg-1 yields, per V1)`);
+    // The upgrade: the peer's next ORDINARY message is v5-stamped.
+    await mutate(R, '::a2a_messaging::send_message', { contact: I.cid, text: 'post-upgrade-hello' });
+    await sleep(2500);
+    ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
+      `post-upgrade stamped message delivered`);
+    ok(pvOf(I, R.cid) === '5', `UPGRADE: first v5-stamped ordinary message re-learned contact_pv 2→5 (ongoing learning)`);
+    // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
+    await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
+    await sleep(2500);
+    ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
+      `legacy (pre-wire_id, unstamped) message still delivers`);
+    ok(pvOf(I, R.cid) === '5', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
+      `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
+  }
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
