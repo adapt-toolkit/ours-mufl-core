@@ -18,8 +18,14 @@ PORT=9811 tests/run.sh
 ```
 (toolkit dir = symlinks into /home/fleet/.ours-fleet/tmp/Developer-1/adapt-shim)
 
-**Status:** Steps done: 0 (review, baseline green), A/B design settled + reported.
-Next: Step 1 — a2a_versions.mm (registry module) with semantics pins first (TDD).
+**Status:** Steps 0-5 ALL LANDED (commits 8cfc12e..bd63333): a2a_versions.mm registries
+(sir/cin/rst/acc + rmsg/rfil), all 5 handler gates with Additions A/B error-as-data,
+Critic round-1 fixes (M1 _typeof guards, M2 use-site re-cast, R1 gate-before-verify,
+R2/R3 test+doc obligations), send-side $pv/$caps stamping, contact_pv/contact_caps,
+CAP-1 gate, COMPATIBILITY.md + versioning.md, version.mm→0.5.0. First green: full suite
+208 asserts (V1-V4 incl. A/B end-to-end) + corpus 23 + semantics pins.
+Remaining: final full-suite green on HEAD (V5 CAP-1 + V6 pv-learning added), remove this
+file, open PR (do NOT merge — owner gate), checkpoint-3 message to FleetCoordinator.
 
 **Plan of record (condensed):**
 1. `a2a_versions.mm`: wire_version=5, min_wire_version=2, opt_* helpers, version_error_t,
