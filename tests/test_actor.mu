@@ -25,6 +25,7 @@ application actor loads libraries
     key_storage,
     continuation,
     encrypted_channel,
+    a2a_versions,
     a2a_protocol,
     a2a_messaging,
     a2a_notifications,
@@ -579,6 +580,89 @@ application actor loads libraries
             ].
         }).
     }
+    // ---- golden-wire corpus probes (COMPATIBILITY.md release gate) ----
+    // One fixture per REGISTERED version per registry, built as the EXACT wire
+    // shape that version's sender emits (fixtures-as-code: the payloads carry
+    // real global_ids + a real AD, which JSON fixtures cannot encode), replayed
+    // through the registry try_narrow_* dispatch. The driver asserts the branch
+    // taken for every registered version — a release is green only if all pass.
+    trn qa_corpus_narrow _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        my_ad = address_document::get_my_address_document().
+        iid = _new_id "qa corpus invite".
+        rid = _new_id "qa corpus rid".
+
+        // registry "sir" — leg-1 boxed bundle: v2 (no $name), v3 (+$name),
+        // v5 (+$pv/$caps), a below-floor dialect ($pv -> 1), an unrecognized
+        // shape, and a FUTURE dialect ($pv -> 7, v5 shape + unknown field).
+        sir_v2  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid).
+        sir_v3  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Bob").
+        sir_v5  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Carol", $pv -> 5, $caps -> ["core.notifications"]).
+        sir_old = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 1).
+        sir_bad = ($nope -> 1).
+        sir_fut = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Dee", $pv -> 7, $caps -> ["core.notifications"], $future_field -> "F").
+
+        r2 = a2a_versions::try_narrow_sir (sir_v2 as any).
+        r3 = a2a_versions::try_narrow_sir (sir_v3 as any).
+        r5 = a2a_versions::try_narrow_sir (sir_v5 as any).
+        ro = a2a_versions::try_narrow_sir (sir_old as any).
+        rb = a2a_versions::try_narrow_sir (sir_bad as any).
+        rf = a2a_versions::try_narrow_sir (sir_fut as any).
+
+        // registry "cin" — leg-3 boxed bundle: v2 / v5.
+        c2 = a2a_versions::try_narrow_cin ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid).
+        c5 = a2a_versions::try_narrow_cin ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 5, $caps -> []).
+        co = a2a_versions::try_narrow_cin ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 1).
+
+        // registry "rst" — restore boxed bundle: v2 / v5.
+        s2 = a2a_versions::try_narrow_rst ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $rid -> rid).
+        s5 = a2a_versions::try_narrow_rst ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $rid -> rid, $pv -> 5, $caps -> []).
+        so = a2a_versions::try_narrow_rst ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $rid -> rid, $pv -> 1).
+
+        // registry "acc" — legacy accept_contact args: v2 (no $joiner_name) / v3.
+        a2 = a2a_versions::try_narrow_acc ($invite_id -> iid, $joiner_ad -> my_ad).
+        a3 = a2a_versions::try_narrow_acc ($invite_id -> iid, $joiner_ad -> my_ad, $joiner_name -> "Joi").
+        ao = a2a_versions::try_narrow_acc ($invite_id -> iid, $joiner_ad -> my_ad, $pv -> 1).
+
+        return transaction::success [ _return_data (
+            $sir -> (
+                $v2  -> ($ok -> (r2 $ok), $v -> (a2a_versions::sir_version_of (sir_v2 as any)), $name -> (a2a_versions::sir_joiner_name ((r2 $payload)?))),
+                $v3  -> ($ok -> (r3 $ok), $v -> (a2a_versions::sir_version_of (sir_v3 as any)), $name -> (a2a_versions::sir_joiner_name ((r3 $payload)?))),
+                $v5  -> ($ok -> (r5 $ok), $v -> (a2a_versions::sir_version_of (sir_v5 as any)), $name -> (a2a_versions::sir_joiner_name ((r5 $payload)?))),
+                $old -> ($ok -> (ro $ok), $code -> (((ro $err)?) $code), $msg -> (((ro $err)?) $message), $peer_v -> (((ro $err)?) $peer_version), $min -> (((ro $err)?) $min_supported)),
+                $bad -> ($ok -> (rb $ok), $code -> (((rb $err)?) $code)),
+                $fut -> ($ok -> (rf $ok), $name -> (a2a_versions::sir_joiner_name ((rf $payload)?)), $stripped_future -> ((((rf $payload)?) as any) $future_field == NIL))
+            ),
+            $cin -> (
+                $v2  -> ($ok -> (c2 $ok)),
+                $v5  -> ($ok -> (c5 $ok)),
+                $old -> ($ok -> (co $ok), $code -> (((co $err)?) $code))
+            ),
+            $rst -> (
+                $v2  -> ($ok -> (s2 $ok)),
+                $v5  -> ($ok -> (s5 $ok)),
+                $old -> ($ok -> (so $ok), $code -> (((so $err)?) $code))
+            ),
+            $acc -> (
+                $v2  -> ($ok -> (a2 $ok), $name -> (a2a_versions::acc_joiner_name ((a2 $payload)?))),
+                $v3  -> ($ok -> (a3 $ok), $name -> (a2a_versions::acc_joiner_name ((a3 $payload)?))),
+                $old -> ($ok -> (ao $ok), $code -> (((ao $err)?) $code))
+            )
+        ) ].
+    }
+
+    // The STRICT narrow on a below-floor payload must abort with the stable
+    // error message (never a raw NIL-cast EVAL_ERROR) — driver asserts the text.
+    trn qa_corpus_narrow_strict_old _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        my_ad = address_document::get_my_address_document().
+        iid = _new_id "qa strict".
+        p = a2a_versions::narrow_sir ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 1).
+        return transaction::success [ _return_data ($unreachable -> ((p as any) $invite_id)) ].
+    }
+
     // ---- leg-3 isolation helpers ----
     // A fake invite carrying a chosen inviter cid; the named cid never minted it, so
     // its leg-2 aborts (unknown invite) and sends no real leg-3 — leaving the
