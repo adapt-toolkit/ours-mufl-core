@@ -32,6 +32,7 @@ library a2a_messaging loads libraries
     key_storage,
     current_transaction_info,
     encrypted_channel,
+    a2a_versions,
     a2a_protocol,
     a2a_capabilities,
     version
@@ -97,6 +98,14 @@ library a2a_messaging loads libraries
     my_persona is str = "".
     // Known contacts, keyed by their container id.
     contacts is (global_id ->> a2a_protocol::contact_t) = (,).
+    // core 0.5.0: passively learned peer wire dialects + capability ids
+    // (SPEC §3/§4). Written on every inbound that carries version evidence
+    // (last-seen wins); absent = nothing learned, 0 = pre-0.5 peer. $pv is
+    // peer-asserted — these gate send-side feature selection and diagnostics,
+    // NEVER authz (REG-6). Both maps are additive in the export blob and
+    // guarded on import (pre-0.5 exports import unchanged).
+    contact_pv is (global_id ->> int) = (,).
+    contact_caps is (global_id ->> str[]) = (,).
     // core 3.0: invites I generated, keyed by invite id. Holds the NON-secret
     // per-invite material — the assigned contact name ("" = none), the ephemeral
     // encryption PUBLIC key shipped in the slim invite, and the crypto scheme id.
@@ -588,6 +597,31 @@ library a2a_messaging loads libraries
             if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
         }
         return ($ad -> address_document::get_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
+    }
+
+    // ---- core 0.5.0 versioning helpers ---------------------------------------
+    // Passive version learning (SPEC §3): record the peer's wire dialect (and
+    // its advertised capability ids, when it piggybacked any) off an inbound
+    // that carried version evidence. Guarded writes — state only mutates when
+    // the learned value actually changes, so handlers that do not _save_state
+    // are not left with silently divergent persistence.
+    fn learn_contact_version (cid: global_id, pv: int, caps: str[]) -> nil
+    {
+        prev = contact_pv cid.
+        if prev == NIL || prev? != pv { contact_pv cid -> pv. }
+        if (_count caps|) != 0 { contact_caps cid -> caps. }
+    }
+
+    // Owner Addition B: the inviter-facing, render-ready message for a version-
+    // incompatible invite second phase. Context-specific wording layered over
+    // the registry's generic version_error_t (which rides beside it verbatim).
+    fn invite_version_error_message (err: a2a_versions::version_error_t) -> str
+    {
+        if (err $code) == "peer_version_unsupported"
+        {
+            return "An invite you created was accepted by a peer running an unsupported (too old) protocol version (v" + (_str (err $peer_version)) + "; minimum supported is v" + (_str (err $min_supported)) + "). The contact was not added — ask them to update their client, then they can redeem the same invite again.".
+        }
+        return "An invite you created was accepted by a peer whose payload matches no supported protocol shape. The contact was not added — ask them to update their client, then they can redeem the same invite again.".
     }
 
     // Verify a received identity bundle against the authenticated sender: D8
@@ -1391,6 +1425,28 @@ library a2a_messaging loads libraries
         encrypted_channel::check_encrypted_or_abort().
 
         sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+
+        // --- 0.5.0 registry gate (acc) — BEFORE any strict read of the args.
+        // The legacy redeem sibling of the sir gate: a version-incompatible
+        // payload surfaces to the inviter as error-as-data (Addition A/B),
+        // never an abort; the invite is NOT consumed.
+        nr = a2a_versions::try_narrow_acc args.
+        if (nr $ok) != TRUE
+        {
+            err = (nr $err)?.
+            return transaction::success [
+                _notify_agent (
+                    $event     -> $protocol_error,
+                    $context   -> $invite_redeem,
+                    $message   -> invite_version_error_message err,
+                    $error     -> err,
+                    $invite_id -> (args $invite_id),
+                    $peer_cid  -> sender_id
+                )
+            ].
+        }
+        narrowed is a2a_versions::acc_args_t = (nr $payload)?.
+
         invite_id = (args $invite_id) safe global_id.
         joiner_ad = (args $joiner_ad) safe address_document_types::t_address_document.
 
@@ -1417,7 +1473,10 @@ library a2a_messaging loads libraries
         contact_name is str = (invite_rec?) $assigned.
         if contact_name == ""
         {
-            joiner_self = (args $joiner_name) safe str.
+            // REGISTRY DISPATCH replaces the strict $joiner_name read (the
+            // sir incident's hygiene sibling): v3 returns the sent name; v2
+            // has no such field and falls back to the sender cid.
+            joiner_self = a2a_versions::acc_joiner_name narrowed.
             contact_name -> (joiner_self == "" ?? (_str sender_id) ; joiner_self).
         }
 
@@ -1443,6 +1502,9 @@ library a2a_messaging loads libraries
         }
 
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        // Passive version learning: this legacy surface never carries $pv or
+        // $caps — record the shape-inferred dialect (2 or 3).
+        learn_contact_version sender_id (a2a_versions::acc_version_of args) [].
         // Remember the joiner's address document for upgrade-time re-registration.
         peer_ads sender_id -> joiner_ad.
         if joiner_root != NIL
@@ -1487,6 +1549,36 @@ library a2a_messaging loads libraries
         // box-open: aborts on tamper / wrong key BEFORE anything is consumed.
         payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_r ct).
 
+        // --- 0.5.0 registry gate (BEFORE any strict read of the payload) ---
+        // Dispatch on the peer's wire version and exact-cast to the registered
+        // type (REG-4). A below-floor or unrecognized payload is the owner's
+        // Addition A/B case: return the ERROR AS DATA to the INVITER via a
+        // $protocol_error notify — transaction::success, NO abort, NO state
+        // consumed (the invite stays redeemable: the peer can update and
+        // redeem this same invite again). Crypto/tamper failures above and
+        // identity-verification failures below remain HARD aborts by design.
+        nr = a2a_versions::try_narrow_sir payload.
+        if (nr $ok) != TRUE
+        {
+            err = (nr $err)?.
+            return transaction::success [
+                _notify_agent (
+                    $event     -> $protocol_error,
+                    $context   -> $invite_redeem,
+                    $message   -> invite_version_error_message err,
+                    $error     -> err,
+                    $invite_id -> invite_id,
+                    $peer_cid  -> sender_id
+                )
+            ].
+        }
+        // `narrowed` is union-typed: backward compat is visible in this
+        // binding's type; per-version reads go through the registry accessors.
+        narrowed is a2a_versions::sir_payload_t = (nr $payload)?.
+
+        // Identity verification takes the RAW payload: narrow() rebuilds the
+        // record to the registered fields, and verify must keep seeing exactly
+        // what was sent (also future-proof for fields newer than we know).
         // D8 cid-bind + PoP self-sig, then the optional delegation chain — an
         // invalid chain or forged/inconsistent AD aborts before any write.
         vb = verify_identity_bundle payload sender_id.
@@ -1495,10 +1587,16 @@ library a2a_messaging loads libraries
         contact_name is str = (rec?) $assigned.
         if contact_name == ""
         {
-            joiner_name is str = (payload $name) safe str.
+            // REGISTRY DISPATCH replaces the 0.3.0 strict read that caused the
+            // incident ((payload $name) safe str on a NIL): the v3/v5 branches
+            // return the sent $name; the v2 branch returns "" (no such field
+            // in sir_payload_v2_t) and we fall back to the sender cid.
+            joiner_name is str = a2a_versions::sir_joiner_name narrowed.
             contact_name -> (joiner_name == "" ?? (_str sender_id) ; joiner_name).
         }
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        // Passive version learning (SPEC §3): dialect + piggybacked caps.
+        learn_contact_version sender_id (a2a_versions::sir_version_of payload) (a2a_versions::sir_caps narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -1563,6 +1661,27 @@ library a2a_messaging loads libraries
         // box-open with the kept responder ephemeral private key (aborts on tamper).
         payload = _read_or_abort (_crypto_decrypt_message eph_priv_r? epk_i ct).
 
+        // --- 0.5.0 registry gate (cin) — error-as-data, never an abort ------
+        // A version-incompatible completion surfaces to MY client as a
+        // $protocol_error notify; the pending redemption stays (transient,
+        // GC'd with the stores) so a corrected completion can still land.
+        nr = a2a_versions::try_narrow_cin payload.
+        if (nr $ok) != TRUE
+        {
+            err = (nr $err)?.
+            return transaction::success [
+                _notify_agent (
+                    $event     -> $protocol_error,
+                    $context   -> $invite_complete,
+                    $message   -> ("An invite you redeemed was completed by an inviter running an unsupported protocol version. The contact was not added — ask them to update their client. (" + (err $message) + ")"),
+                    $error     -> err,
+                    $invite_id -> invite_id,
+                    $peer_cid  -> sender_id
+                )
+            ].
+        }
+        narrowed is a2a_versions::cin_payload_t = (nr $payload)?.
+
         // D8 cid-bind + PoP self-sig, then the optional delegation chain — an
         // invalid chain or forged/inconsistent AD aborts before any write.
         vb = verify_identity_bundle payload sender_id.
@@ -1573,6 +1692,7 @@ library a2a_messaging loads libraries
         if contact_name == "" { contact_name -> (pend?) $inviter_name. }
         if contact_name == "" { contact_name -> (_str sender_id). }
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        learn_contact_version sender_id (a2a_versions::cin_version_of payload) (a2a_versions::cin_caps narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -1676,10 +1796,32 @@ library a2a_messaging loads libraries
         scheme = (args $v) safe int.
         ct = (args $data) safe crypto_message.
         payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_r ct).
+
+        // --- 0.5.0 registry gate (rst) — error-as-data, never an abort ------
+        // The degraded contact stays degraded (request not consumed: the boot
+        // sweep re-attempts, and a corrected reply can still land).
+        nr = a2a_versions::try_narrow_rst payload.
+        if (nr $ok) != TRUE
+        {
+            err = (nr $err)?.
+            return transaction::success [
+                _notify_agent (
+                    $event    -> $protocol_error,
+                    $context  -> $contact_restore,
+                    $message  -> ("A contact could not be restored: the peer runs an unsupported protocol version. Ask them to update their client. (" + (err $message) + ")"),
+                    $error    -> err,
+                    $peer_cid -> sender_id
+                )
+            ].
+        }
+        narrowed is a2a_versions::rst_payload_t = (nr $payload)?.
+
+        // Post-gate the $rid domain is checked, so this strict read cannot abort.
         abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
         vb = verify_identity_bundle payload sender_id.
 
         // --- all gates passed: (re)install the peer's keys + single-use consume ---
+        learn_contact_version sender_id (a2a_versions::rst_version_of payload) (a2a_versions::rst_caps narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -1731,10 +1873,30 @@ library a2a_messaging loads libraries
         epk_i = (args $epk) safe publickey_encrypt.
         ct = (args $data) safe crypto_message.
         payload = _read_or_abort (_crypto_decrypt_message eph_priv? epk_i ct).
+
+        // --- 0.5.0 registry gate (rst) — error-as-data, never an abort ------
+        nr = a2a_versions::try_narrow_rst payload.
+        if (nr $ok) != TRUE
+        {
+            err = (nr $err)?.
+            return transaction::success [
+                _notify_agent (
+                    $event    -> $protocol_error,
+                    $context  -> $contact_restore,
+                    $message  -> ("A contact could not complete a key restore: the peer runs an unsupported protocol version. Ask them to update their client. (" + (err $message) + ")"),
+                    $error    -> err,
+                    $peer_cid -> sender_id
+                )
+            ].
+        }
+        narrowed is a2a_versions::rst_payload_t = (nr $payload)?.
+
+        // Post-gate the $rid domain is checked, so this strict read cannot abort.
         abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
         vb = verify_identity_bundle payload sender_id.
 
         // --- all gates passed: replace + single-use consume ---
+        learn_contact_version sender_id (a2a_versions::rst_version_of payload) (a2a_versions::rst_caps narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -1886,6 +2048,12 @@ library a2a_messaging loads libraries
             sender_name -> sender? $name.
         }
 
+        // Passive version learning: only a STAMPED $pv is evidence (an
+        // unstamped message says just "pre-0.5", which must not overwrite the
+        // more precise dialect the invite/restore legs shape-inferred).
+        pv_seen = a2a_versions::peer_pv args.
+        if pv_seen != 0 { learn_contact_version sender_id pv_seen []. }
+
         // The app hook owns storage; it may abort (unknown sender rejected) — in
         // which case nothing is delivered and no copy is emitted. When it accepts,
         // we append the FORCED inbound monitoring copy as core code (after the hook,
@@ -1941,6 +2109,10 @@ library a2a_messaging loads libraries
             sender_name -> sender? $name.
         }
 
+        // Passive version learning (see handle_receive_message).
+        pv_seen = a2a_versions::peer_pv args.
+        if pv_seen != 0 { learn_contact_version sender_id pv_seen []. }
+
         actions is transaction::action::type[] = [].
         sc on_file_received (
             $sender_id   -> sender_id,
@@ -1993,7 +2165,9 @@ library a2a_messaging loads libraries
             $monitoring_proxy -> monitoring_proxy,
             $app_config       -> app_config,
             $format_version  -> core_format_version,
-            $deferred_msgs   -> deferred_msgs
+            $deferred_msgs   -> deferred_msgs,
+            $contact_pv      -> contact_pv,
+            $contact_caps    -> contact_caps
         ).
     }
 
@@ -2095,6 +2269,16 @@ library a2a_messaging loads libraries
         if (data $deferred_msgs) != NIL
         {
             deferred_msgs -> (data $deferred_msgs) safe (global_id ->> deferred_msg_t[]).
+        }
+        // core 0.5.0: learned peer dialects/caps (absent from pre-0.5 exports
+        // → defaults stay empty; re-learned passively from inbound traffic).
+        if (data $contact_pv) != NIL
+        {
+            contact_pv -> (data $contact_pv) safe (global_id ->> int).
+        }
+        if (data $contact_caps) != NIL
+        {
+            contact_caps -> (data $contact_caps) safe (global_id ->> str[]).
         }
 
         // Re-register every peer's keys so encrypted channels keep working after

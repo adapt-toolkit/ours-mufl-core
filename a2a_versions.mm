@@ -48,8 +48,33 @@ library a2a_versions
     fn opt_int  (v: any, dflt: int)  -> int  { return (v == NIL ?? dflt ; v safe int). }
     fn opt_bool (v: any, dflt: bool) -> bool { return (v == NIL ?? dflt ; v safe bool). }
 
-    // $pv as sent by the peer; 0 = pre-0.5 peer (never stamped it).
-    fn peer_pv (raw: any) -> int { return opt_int (raw $pv) 0. }
+    // ---- runtime type-domain guards (M1) -----------------------------------
+    // `x safe T` ABORTS on a present-but-wrong-DOMAIN field (mufl has no
+    // try/catch), so presence checks alone cannot make try_narrow abort-free.
+    // Every NON-nullable field a registry cast reads is pre-checked against its
+    // _typeof runtime domain (probed on the vendored toolchain, mufl 0.8.0):
+    //   str -> "STRING", int -> "INTEGER", bin -> "BINARY",
+    //   global_id -> "STRING" (ids are hex strings at runtime).
+    // Residual (documented, accepted): `safe global_id` additionally
+    // hex-validates, so a STRING that is not valid hex still aborts inside the
+    // exact cast. No shipped version's sender can produce that (senders stamp
+    // real ids); reaching it requires a hostile hand-crafted box, which is the
+    // malformed/tamper class where a hard abort is the correct outcome.
+    td_str = "STRING".
+    td_int = "INTEGER".
+
+    fn is_str (v: any) -> bool { return v != NIL && (_typeof v) == td_str. }
+    fn is_int (v: any) -> bool { return v != NIL && (_typeof v) == td_int. }
+
+    // $pv as sent by the peer; 0 = pre-0.5 peer (never stamped it). Tolerant
+    // of a mistyped $pv (non-int => treated as unstamped, shape inference
+    // applies) so reading the discriminator itself can never abort (M1).
+    fn peer_pv (raw: any) -> int
+    {
+        p = raw $pv.
+        if is_int p != TRUE { return 0. }
+        return p safe int.
+    }
 
     // ---- error-as-data (owner Addition A) ----------------------------------
     // The first-class protocol return type for a version-incompatible input:
@@ -161,16 +186,18 @@ library a2a_versions
         return ((raw $name) != NIL ?? 3 ; 2).
     }
 
-    // Field-presence check for the REGISTERED version `reg` (2|3|5): the
-    // non-aborting "does this payload actually carry its version's required
-    // fields" probe try_narrow uses to make no-match an ERROR VALUE instead of
-    // a cast abort. (A present-but-mistyped field still aborts in the exact
-    // cast — that is malformed input, not a version gap; crypto/tamper stays
-    // an abort by design.)
+    // Field presence + runtime-domain check for the REGISTERED version `reg`
+    // (2|3|5): the abort-free "does this payload actually carry its version's
+    // required fields, with the right domains" probe (M1) try_narrow uses to
+    // make no-match an ERROR VALUE instead of a cast abort. Nullable fields
+    // ($cert/$root_profile/$cp_binding bin+, $caps str[]+) are excluded: absent
+    // reads NIL and passes; present-but-mistyped is the malformed/hostile class
+    // (aborts in the cast, correctly). $ad is `any` — verified downstream.
     fn sir_shape_ok (raw: any, reg: int) -> bool
     {
-        if (raw $ad) == NIL || (raw $invite_id) == NIL { return FALSE. }
-        if reg >= 3 && (raw $name) == NIL { return FALSE. }
+        if (raw $ad) == NIL || is_str (raw $invite_id) != TRUE { return FALSE. }
+        if reg >= 3 && is_str (raw $name) != TRUE { return FALSE. }
+        if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
         return TRUE.
     }
 
@@ -186,6 +213,10 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "sir" v sir_max_version).
         }
+        // Registered-version mapping: 5+ -> v5, 3..4 -> v3 (0.4.x never shipped
+        // and its wire on this surface is byte-identical to 0.3's; a synthetic
+        // $pv=4 therefore narrows as v3 — requires $name, else shape error),
+        // else v2.
         reg = (v >= 5 ?? 5 ; (v >= 3 ?? 3 ; 2)).
         if sir_shape_ok raw reg != TRUE
         {
@@ -215,6 +246,20 @@ library a2a_versions
         v = sir_version_of raw.
         if v >= 3 { return ((raw safe sir_payload_v3_t) $name). }
         return "".
+    }
+
+    // Versioned $caps accessor (M2 pattern: re-cast from raw per version —
+    // never read version fields off the union binding): v5 carries $caps
+    // (nullable); every earlier version has no such field — empty list.
+    fn sir_caps (input: sir_payload_t) -> str[]
+    {
+        raw = input as any.
+        if (sir_version_of raw) >= 5
+        {
+            c = (raw safe sir_payload_v5_t) $caps.
+            if c != NIL { return c?. }
+        }
+        return [].
     }
 
     // ========================================================================
@@ -248,9 +293,11 @@ library a2a_versions
         return (pv != 0 ?? pv ; 2).
     }
 
-    fn cin_shape_ok (raw: any) -> bool
+    fn cin_shape_ok (raw: any, reg: int) -> bool
     {
-        return (raw $ad) != NIL && (raw $invite_id) != NIL.
+        if (raw $ad) == NIL || is_str (raw $invite_id) != TRUE { return FALSE. }
+        if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
+        return TRUE.
     }
 
     metadef cin_narrowed_t: ($ok -> bool, $payload -> cin_payload_t+, $err -> version_error_t+).
@@ -262,11 +309,12 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "cin" v cin_max_version).
         }
-        if cin_shape_ok raw != TRUE
+        reg = (v >= 5 ?? 5 ; 2).
+        if cin_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "cin" v cin_max_version).
         }
-        if v >= 5 { return ($ok -> TRUE, $payload -> raw safe cin_payload_v5_t, $err -> NIL). }
+        if reg >= 5 { return ($ok -> TRUE, $payload -> raw safe cin_payload_v5_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe cin_payload_v2_t, $err -> NIL).
     }
 
@@ -275,6 +323,17 @@ library a2a_versions
         r = try_narrow_cin raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
         return (r $payload)?.
+    }
+
+    fn cin_caps (input: cin_payload_t) -> str[]
+    {
+        raw = input as any.
+        if (cin_version_of raw) >= 5
+        {
+            c = (raw safe cin_payload_v5_t) $caps.
+            if c != NIL { return c?. }
+        }
+        return [].
     }
 
     // ========================================================================
@@ -308,9 +367,11 @@ library a2a_versions
         return (pv != 0 ?? pv ; 2).
     }
 
-    fn rst_shape_ok (raw: any) -> bool
+    fn rst_shape_ok (raw: any, reg: int) -> bool
     {
-        return (raw $ad) != NIL && (raw $rid) != NIL.
+        if (raw $ad) == NIL || is_str (raw $rid) != TRUE { return FALSE. }
+        if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
+        return TRUE.
     }
 
     metadef rst_narrowed_t: ($ok -> bool, $payload -> rst_payload_t+, $err -> version_error_t+).
@@ -322,11 +383,12 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "rst" v rst_max_version).
         }
-        if rst_shape_ok raw != TRUE
+        reg = (v >= 5 ?? 5 ; 2).
+        if rst_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "rst" v rst_max_version).
         }
-        if v >= 5 { return ($ok -> TRUE, $payload -> raw safe rst_payload_v5_t, $err -> NIL). }
+        if reg >= 5 { return ($ok -> TRUE, $payload -> raw safe rst_payload_v5_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe rst_payload_v2_t, $err -> NIL).
     }
 
@@ -335,6 +397,17 @@ library a2a_versions
         r = try_narrow_rst raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
         return (r $payload)?.
+    }
+
+    fn rst_caps (input: rst_payload_t) -> str[]
+    {
+        raw = input as any.
+        if (rst_version_of raw) >= 5
+        {
+            c = (raw safe rst_payload_v5_t) $caps.
+            if c != NIL { return c?. }
+        }
+        return [].
     }
 
     // ========================================================================
@@ -371,8 +444,8 @@ library a2a_versions
 
     fn acc_shape_ok (raw: any, reg: int) -> bool
     {
-        if (raw $invite_id) == NIL || (raw $joiner_ad) == NIL { return FALSE. }
-        if reg >= 3 && (raw $joiner_name) == NIL { return FALSE. }
+        if is_str (raw $invite_id) != TRUE || (raw $joiner_ad) == NIL { return FALSE. }
+        if reg >= 3 && is_str (raw $joiner_name) != TRUE { return FALSE. }
         return TRUE.
     }
 

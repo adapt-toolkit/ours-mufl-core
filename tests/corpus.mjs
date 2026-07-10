@@ -63,7 +63,12 @@ async function main() {
   ok(g('sir.old.peer_v') === '1' && g('sir.old.min') === '2', `sir too-old error carries peer_version=1 min_supported=2`);
   ok(/too old/.test(g('sir.old.msg')) && /update/.test(g('sir.old.msg')), 'sir too-old error message is human-readable ("too old", "update")');
   ok(!T(g('sir.bad.ok')) && g('sir.bad.code') === 'payload_shape_unrecognized', 'sir unrecognized shape: error-as-data payload_shape_unrecognized');
+  ok(!/too old/.test(g('sir.bad.msg')) && /no supported wire shape/.test(g('sir.bad.msg')), 'sir shape error message is DISTINCT from the too-old message (R2)');
   ok(T(g('sir.fut.ok')) && g('sir.fut.name') === 'Dee' && T(g('sir.fut.stripped_future')), 'sir $pv=7 (future): narrows as newest registered (v5), unknown field stripped');
+  ok(!T(g('sir.wid.ok')) && g('sir.wid.code') === 'payload_shape_unrecognized', 'sir mistyped $invite_id (int): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('sir.wnm.ok')) && g('sir.wnm.code') === 'payload_shape_unrecognized', 'sir mistyped $name (int): shape error-as-data, no cast abort (M1)');
+  ok(T(g('sir.wpv.ok')) && g('sir.wpv.v') === '3' && g('sir.wpv.name') === 'Eve', 'sir mistyped $pv (str): tolerated as unstamped, shape-inferred v3 (M1)');
+  ok(T(g('sir.pv4.ok')) && g('sir.pv4.name') === 'Fay', 'sir synthetic $pv=4 (dead 0.4 line): narrows as v3, $name honored (R3)');
 
   console.log('=== corpus: registry cin (v2/v5 + floor) ===');
   ok(T(g('cin.v2.ok')), 'cin v2: ok');

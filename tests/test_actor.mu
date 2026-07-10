@@ -580,6 +580,57 @@ application actor loads libraries
             ].
         }).
     }
+    // ---- cross-version leg-1 senders (PLAN Step 4.1) ----
+    // Emit a submit_invite_response whose BOXED payload is the EXACT wire shape
+    // of a given core version's sender — the 0.2.0 ($shape "v2": no $name, no
+    // $pv), 0.3.0 ("v3": +$name), 0.5.0 ("v5": +$pv/$caps), or a BELOW-FLOOR
+    // dialect ("too_old": v2 fields + $pv -> 1, the Addition A/B injection).
+    // Sender-side emulation only: the responder-side completion stores are
+    // hidden (INV-4), so the inviter-side outcome + the leg-3 ARRIVAL at this
+    // packet (visible as its gate abort) are what the driver asserts.
+    trn qa_send_versioned_leg1 _:($invite -> blob: bin, $shape -> shape: str, $name -> name: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        inv = (_read_or_abort blob) safe a2a_protocol::invite_eph_t.
+        kpr = _crypto_construct_encryption_keypair (inv $v).
+        my_ad = address_document::get_my_address_document().
+
+        payload is bin+ = NIL.
+        if shape == "v2"
+        {
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d))).
+        }
+        if shape == "v3"
+        {
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name)).
+        }
+        if shape == "v5"
+        {
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name, $pv -> a2a_versions::wire_version, $caps -> ["core.notifications"])).
+        }
+        if shape == "too_old"
+        {
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $pv -> 1)).
+        }
+        abort "qa_send_versioned_leg1: unknown shape " + shape when payload == NIL.
+
+        data = _crypto_encrypt_message (kpr $secret_key) (inv $k) payload?.
+        return transaction::success [
+            transaction::action::send (inv $c) (
+                $name -> "::a2a_messaging::submit_invite_response",
+                $targ -> ($invite_id -> (inv $d), $epk -> (kpr $public_key), $v -> (inv $v), $data -> data)
+            ),
+            _return_data ($sent -> TRUE, $shape -> shape)
+        ].
+    }
+
+    // Passive version learning probe: the contact_pv map (cid -> learned wire
+    // dialect; absent = nothing learned yet, 0 = pre-0.5 peer).
+    trn readonly qa_contact_pv _
+    {
+        return ($contact_pv -> a2a_messaging::contact_pv, $contact_caps -> a2a_messaging::contact_caps).
+    }
+
     // ---- golden-wire corpus probes (COMPATIBILITY.md release gate) ----
     // One fixture per REGISTERED version per registry, built as the EXACT wire
     // shape that version's sender emits (fixtures-as-code: the payloads carry
@@ -602,6 +653,15 @@ application actor loads libraries
         sir_old = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 1).
         sir_bad = ($nope -> 1).
         sir_fut = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Dee", $pv -> 7, $caps -> ["core.notifications"], $future_field -> "F").
+        // M1 wrong-domain fixtures: present-but-mistyped NON-nullable fields
+        // must classify as shape errors (error-as-data), never abort the cast.
+        sir_wid = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> 42).
+        sir_wnm = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> 42).
+        // Mistyped $pv: tolerated as UNSTAMPED (shape inference applies) — this
+        // one carries $name so it dispatches v3.
+        sir_wpv = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Eve", $pv -> "five").
+        // Synthetic $pv=4 (dead 0.4 line, wire-identical to 0.3): narrows as v3.
+        sir_pv4 = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Fay", $pv -> 4).
 
         r2 = a2a_versions::try_narrow_sir (sir_v2 as any).
         r3 = a2a_versions::try_narrow_sir (sir_v3 as any).
@@ -609,6 +669,10 @@ application actor loads libraries
         ro = a2a_versions::try_narrow_sir (sir_old as any).
         rb = a2a_versions::try_narrow_sir (sir_bad as any).
         rf = a2a_versions::try_narrow_sir (sir_fut as any).
+        rwid = a2a_versions::try_narrow_sir (sir_wid as any).
+        rwnm = a2a_versions::try_narrow_sir (sir_wnm as any).
+        rwpv = a2a_versions::try_narrow_sir (sir_wpv as any).
+        rpv4 = a2a_versions::try_narrow_sir (sir_pv4 as any).
 
         // registry "cin" — leg-3 boxed bundle: v2 / v5.
         c2 = a2a_versions::try_narrow_cin ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid).
@@ -631,8 +695,12 @@ application actor loads libraries
                 $v3  -> ($ok -> (r3 $ok), $v -> (a2a_versions::sir_version_of (sir_v3 as any)), $name -> (a2a_versions::sir_joiner_name ((r3 $payload)?))),
                 $v5  -> ($ok -> (r5 $ok), $v -> (a2a_versions::sir_version_of (sir_v5 as any)), $name -> (a2a_versions::sir_joiner_name ((r5 $payload)?))),
                 $old -> ($ok -> (ro $ok), $code -> (((ro $err)?) $code), $msg -> (((ro $err)?) $message), $peer_v -> (((ro $err)?) $peer_version), $min -> (((ro $err)?) $min_supported)),
-                $bad -> ($ok -> (rb $ok), $code -> (((rb $err)?) $code)),
-                $fut -> ($ok -> (rf $ok), $name -> (a2a_versions::sir_joiner_name ((rf $payload)?)), $stripped_future -> ((((rf $payload)?) as any) $future_field == NIL))
+                $bad -> ($ok -> (rb $ok), $code -> (((rb $err)?) $code), $msg -> (((rb $err)?) $message)),
+                $fut -> ($ok -> (rf $ok), $name -> (a2a_versions::sir_joiner_name ((rf $payload)?)), $stripped_future -> ((((rf $payload)?) as any) $future_field == NIL)),
+                $wid -> ($ok -> (rwid $ok), $code -> (((rwid $err)?) $code)),
+                $wnm -> ($ok -> (rwnm $ok), $code -> (((rwnm $err)?) $code)),
+                $wpv -> ($ok -> (rwpv $ok), $name -> (a2a_versions::sir_joiner_name ((rwpv $payload)?)), $v -> (a2a_versions::sir_version_of (sir_wpv as any))),
+                $pv4 -> ($ok -> (rpv4 $ok), $name -> (a2a_versions::sir_joiner_name ((rpv4 $payload)?)))
             ),
             $cin -> (
                 $v2  -> ($ok -> (c2 $ok)),
