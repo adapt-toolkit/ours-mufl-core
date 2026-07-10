@@ -1214,14 +1214,19 @@ async function main() {
   }
 
   // ---------- V6 $pv stamping on message traffic + passive learning ----------
+  // Uses the T1 pair (I↔R, MUTUAL contacts from the real 0.5.0 redeem): both
+  // legs of that redeem were the stamped v5 shapes, and message $targs carry
+  // $pv — so both sides must have learned dialect 5, and a fresh stamped
+  // message must deliver normally.
   CUR = 'V6 pv-stamp';
   console.log('\n=== V6 $pv stamp on send_message + passive learning at the receiver ===');
   {
-    await mutate(VI, '::a2a_messaging::send_message', { contact: VL.cid, text: 'v5-stamped-msg' });
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'v5-stamped-msg' });
     await sleep(2500);
-    ok(/v5-stamped-msg/.test(ro(VL, '::actor::list_incoming_messages', undefined).Visualize()),
+    ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(VL, VI.cid) === '5', `receiver learned contact_pv=5 from the stamped receive_message $targ`);
+    ok(pvOf(R, I.cid) === '5', `responder learned contact_pv=5 (v5 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '5', `inviter learned contact_pv=5 (real 0.5.0 v5 leg-1)`);
   }
 
   console.log('\n================ SCORECARD ================');
