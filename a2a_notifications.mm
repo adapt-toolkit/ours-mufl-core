@@ -35,7 +35,9 @@ library a2a_notifications loads libraries
     key_storage,
     current_transaction_info,
     encrypted_channel,
+    a2a_versions,
     a2a_protocol,
+    a2a_capabilities,
     a2a_messaging
     uses transactions
 {
@@ -247,7 +249,45 @@ library a2a_notifications loads libraries
                     $vapid_pub     -> vapid_public_key,
                     $bindings      -> (reg? $bindings),
                     $sender_tokens -> sender_tokens_map,
-                    $sender_muted  -> sender_muted_map
+                    $sender_muted  -> sender_muted_map,
+                    $pv -> a2a_versions::wire_version
+                )
+            )
+        ].
+    }
+
+    // ---- CAP-1 gate (SPEC §4, core 0.5.0) -------------------------------------
+    // No capability-gated traffic to a contact that positively does NOT
+    // advertise the capability. Deny ONLY on positive evidence: the peer
+    // piggybacked a NON-EMPTY capability set (0.5.0 invite/restore legs) that
+    // lacks core.notifications. Unknown / absent / empty caps PASS — pre-0.5
+    // peers and pre-0.5-established contacts keep working (fail-open, aligned
+    // with "old peers never crash"; owner-approved interpretation).
+    fn peer_lacks_notifications (target: global_id) -> bool
+    {
+        caps = a2a_messaging::contact_caps target.
+        if caps == NIL { return FALSE. }
+        if (_count caps?|) == 0 { return FALSE. }
+        found is bool = FALSE.
+        sc caps? -- ( -> c)
+        {
+            if c == a2a_capabilities::cap_notifications { found -> TRUE. break. }
+        }
+        return found != TRUE.
+    }
+
+    // The CAP-1 denial, AS DATA (degrade, never abort user flows): the caller
+    // gets a structured $ok/$error result it can render; nothing is sent.
+    fn cap1_denial (target: global_id) -> transaction::results::type
+    {
+        return transaction::success [
+            _return_data (
+                $ok -> FALSE,
+                $error -> (
+                    $code     -> "capability_not_advertised",
+                    $cap      -> a2a_capabilities::cap_notifications,
+                    $message  -> "This contact's app does not advertise notification support (core.notifications), so notifications to it are disabled. Base messaging still works.",
+                    $peer_cid -> target
                 )
             )
         ].
@@ -264,13 +304,16 @@ library a2a_notifications loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
         target_id = a2a_messaging::resolve_contact service_ref.
+        // CAP-1: registering IS the start of capability-gated traffic — deny
+        // as data when the service positively lacks core.notifications.
+        if peer_lacks_notifications target_id { return cap1_denial target_id. }
         pending_notify_registers target_id -> TRUE.
 
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> register_tx,
-                    $targ -> ($bindings -> bindings)
+                    $targ -> ($bindings -> bindings, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
@@ -291,7 +334,7 @@ library a2a_notifications loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> update_bindings_tx,
-                    $targ -> ($bindings -> bindings)
+                    $targ -> ($bindings -> bindings, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent_to -> target_id)
             ].
@@ -319,8 +362,8 @@ library a2a_notifications loads libraries
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             // Build $targ: $sender present → service picks per-sender path;
             // absent (empty tuple) → service picks rotate-all path.
-            targ is any = (,).
-            if sender_id != NIL { targ -> ($sender -> sender_id?). }
+            targ is any = ($pv -> a2a_versions::wire_version).
+            if sender_id != NIL { targ -> ($sender -> sender_id?, $pv -> a2a_versions::wire_version). }
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> rotate_token_tx,
@@ -347,7 +390,7 @@ library a2a_notifications loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> set_sender_muted_tx,
-                    $targ -> ($sender -> contact_id, $muted -> muted)
+                    $targ -> ($sender -> contact_id, $muted -> muted, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
@@ -370,7 +413,7 @@ library a2a_notifications loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> revoke_sender_tokens_tx,
-                    $targ -> ($senders -> contacts)
+                    $targ -> ($senders -> contacts, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
@@ -392,7 +435,7 @@ library a2a_notifications loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> mark_read_tx,
-                    $targ -> ($notif_ids -> notif_ids)
+                    $targ -> ($notif_ids -> notif_ids, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent_to -> target_id)
             ].
@@ -419,7 +462,7 @@ library a2a_notifications loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> unregister_tx,
-                    $targ -> (,)
+                    $targ -> ($pv -> a2a_versions::wire_version,)
                 ),
                 _return_data ($sent_to -> target_id),
                 _save_state NIL
@@ -450,7 +493,7 @@ library a2a_notifications loads libraries
                 {
                     actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
                         $name -> issue_tokens_tx,
-                        $targ -> ($senders -> batch)
+                        $targ -> ($senders -> batch, $pv -> a2a_versions::wire_version)
                     ).
                     batch -> [].
                 }
@@ -459,7 +502,7 @@ library a2a_notifications loads libraries
             {
                 actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
                     $name -> issue_tokens_tx,
-                    $targ -> ($senders -> batch)
+                    $targ -> ($senders -> batch, $pv -> a2a_versions::wire_version)
                 ).
             }
             actions (_count actions|) -> _return_data ($sent_to -> target_id).
@@ -514,7 +557,8 @@ library a2a_notifications loads libraries
                 $targ -> (
                     $token   -> (addr $token),
                     $payload -> payload,
-                    $wire_id -> wire_id
+                    $wire_id -> wire_id,
+                    $pv -> a2a_versions::wire_version
                 )
             ),
             _return_data ($sent_to -> (addr $service_cid), $wire_id -> wire_id)

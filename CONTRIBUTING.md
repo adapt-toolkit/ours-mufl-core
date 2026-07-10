@@ -21,8 +21,12 @@ We know CLAs are sometimes criticised as one-sided ("you can relicense our work;
 1. Open or comment on an issue first for anything non-trivial, so we can agree the approach before you write code.
 2. Keep PRs focused — one change per PR.
 3. Include tests for behavioural changes and update documentation affected by your change.
-4. Sign the CLA when prompted by the CLA bot (first PR only).
-5. Use clear commit messages; reference the issue number.
+4. **Wire changes** (anything a peer sends or receives) must follow the versioned
+   type registry rules and PR checklist in [COMPATIBILITY.md](./COMPATIBILITY.md) —
+   register a new versioned type, add a corpus fixture, note the Wire delta, bump
+   `version.mm`.
+5. Sign the CLA when prompted by the CLA bot (first PR only).
+6. Use clear commit messages; reference the issue number.
 
 ## Code of conduct
 

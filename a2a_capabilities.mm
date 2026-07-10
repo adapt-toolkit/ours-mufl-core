@@ -163,6 +163,12 @@ library a2a_capabilities loads libraries
         // NIL until init wires it; dispatch FAIL-FASTS (abort) if a controller-class
         // verb is routed with this unset, so an app can never forget the gate.
         authorizer is (any -> bool)+ = NIL.
+        // The static capability-id list captured from init's $supported — the
+        // source for the 0.5.0 $caps wire piggyback (self_cap_ids below).
+        // DELIBERATELY not derived through describe(): that hook aborts when
+        // an app never wires capabilities, and the piggyback must degrade to
+        // "advertises nothing" there, never abort an invite/restore leg.
+        self_caps is str[] = [].
     }
 
     // FAIL-FAST: $supported is the static list of capability ids this app
@@ -185,10 +191,19 @@ library a2a_capabilities loads libraries
         handlers -> handler_map.
         on_unknown -> fallback.
         if authorizer_cb != NIL { authorizer -> authorizer_cb. }
+        self_caps -> supported_caps.
         sc supported_caps -- ( -> cap)
         {
             abort "Capability declared without a handler: " + cap when (handler_map cap) == NIL.
         }
+    }
+
+    // The capability ids THIS node advertises on the 0.5.0 wire piggyback
+    // ($caps in the invite/restore identity bundles, SPEC §4). Empty for an
+    // app that never ran init — degrade, never abort (CAP-1 spirit).
+    fn self_cap_ids (_) -> str[]
+    {
+        return self_caps.
     }
 
     // ---- manifest helpers -------------------------------------------------
