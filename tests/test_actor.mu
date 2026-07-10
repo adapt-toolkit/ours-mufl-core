@@ -631,6 +631,33 @@ application actor loads libraries
         return ($contact_pv -> a2a_messaging::contact_pv, $contact_caps -> a2a_messaging::contact_caps).
     }
 
+    // Per-cid probes (precise driver assertions, no map-dump parsing):
+    // learned dialect (-1 = nothing learned), advertised caps, contact name.
+    trn readonly qa_contact_pv_of _:($cid -> cid: global_id)
+    {
+        p = a2a_messaging::contact_pv cid.
+        caps = a2a_messaging::contact_caps cid.
+        empty is str[] = [].
+        return (
+            $pv   -> (p == NIL ?? 0 - 1 ; p?),
+            $caps -> (caps == NIL ?? empty ; caps?)
+        ).
+    }
+    trn readonly qa_contact_name _:($cid -> cid: global_id)
+    {
+        c = a2a_messaging::contacts cid.
+        return ($name -> (c == NIL ?? "" ; (c? $name))).
+    }
+
+    // Inject a learned capability set for a contact — drives the CAP-1 gate
+    // tests (positive-evidence denial vs unknown/empty pass-through).
+    trn qa_set_contact_caps _:($cid -> cid: global_id, $caps -> caps: str[])
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::contact_caps cid -> caps.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
     // ---- golden-wire corpus probes (COMPATIBILITY.md release gate) ----
     // One fixture per REGISTERED version per registry, built as the EXACT wire
     // shape that version's sender emits (fixtures-as-code: the payloads carry

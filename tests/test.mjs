@@ -19,11 +19,29 @@ const ok = (c, m) => { if (!c) { scorecard.push(`✗ [${CUR}] ${m}`); console.lo
 const isT = (s) => /true/i.test(String(s));
 
 let wrapper;
-function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [], events: [] }; }
+function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [], events: [], errEvents: [] }; }
 function wire(id) {
   id.pw.on_return_data = (d) => {
     const kind = d.Reduce('kind').Visualize();
-    if (kind === 'notify_agent') { id.events.push(d.Reduce('payload').Reduce('event').Visualize()); return; }
+    if (kind === 'notify_agent') {
+      const ev = d.Reduce('payload').Reduce('event').Visualize();
+      id.events.push(ev);
+      // Capture the full error-as-data payload for $protocol_error events
+      // (Additions A/B assertions read code/message/context off it).
+      if (ev === 'protocol_error') {
+        const p = d.Reduce('payload');
+        id.errEvents.push({
+          context: p.Reduce('context').Visualize(),
+          message: p.Reduce('message').Visualize(),
+          code: p.Reduce('error').Reduce('code').Visualize(),
+          errMessage: p.Reduce('error').Reduce('message').Visualize(),
+          peerVersion: p.Reduce('error').Reduce('peer_version').Visualize(),
+          minSupported: p.Reduce('error').Reduce('min_supported').Visualize(),
+          surface: p.Reduce('error').Reduce('surface').Visualize(),
+        });
+      }
+      return;
+    }
     if (kind === 'save_state') return;
     const p = id.pending.shift(); if (!p) return;
     clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
@@ -1086,6 +1104,125 @@ async function main() {
     `service gate: set_sender_muted from unregistered caller: zero service state change`);
   ok(nsvc.rejects.slice(n26RejBefore).some((m) => /No notification registration/i.test(m)),
     `service gate: set_sender_muted from unregistered caller aborts at registered-recipient gate`);
+
+  // ================= V-series: versioned type registry (core 0.5.0) =========
+  // Cross-version leg-1 shapes against a 0.5.0 inviter (fresh packet pair so
+  // earlier scenarios' contacts cannot mask the registration outcomes).
+  const VI = mk('VI'); const VL = mk('VL');
+  await mkPacket(VI, 'eph-t-VI-04'); await mkPacket(VL, 'eph-t-VL-05');
+  await sleep(1200);
+  await setName(VI, 'VerInviter'); await setName(VL, 'VerLegacy');
+  const pvOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('pv').Visualize();
+  const capsOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('caps').Visualize();
+  const nameOfContact = (id, cid) => ro(id, '::actor::qa_contact_name', { cid }).Reduce('name').Visualize();
+
+  // ---------- V1 legacy v2 leg-1 (the 0.2.0 incident shape: no $name) ----------
+  CUR = 'V1 legacy-v2-leg1';
+  console.log('\n=== V1 legacy v2 leg-1 (no $name — THE incident shape) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});   // NO assigned name — the incident precondition
+  const blobV1 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const before = st(VI); const rejB = VI.rejects.length; const legRejB = VL.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV1), shape: 'v2', name: '' });
+    await sleep(4000);
+    const after = st(VI);
+    ok(VI.rejects.length === rejB, `v2 leg-1: inviter did NOT abort (no EVAL_ERROR reject) — the incident is dead`);
+    ok(after.pi === before.pi - 1, `v2 leg-1: invite consumed (pi ${before.pi}→${after.pi})`);
+    ok(after.c === before.c + 1, `v2 leg-1: responder registered as contact (c ${before.c}→${after.c})`);
+    ok(nameOfContact(VI, VL.cid) === VL.cid, `v2 leg-1: no $name → contact named by sender cid (typed v2 branch)`);
+    ok(pvOf(VI, VL.cid) === '2', `v2 leg-1: contact_pv learned as 2 (shape-inferred)`);
+    ok(VL.rejects.slice(legRejB).some((x) => /Unsolicited completion|Redemption ephemeral key/.test(x)),
+      `v2 leg-1: inviter DID send leg-3 (arrived at the emulated legacy responder)`);
+  }
+
+  // ---------- V2 legacy v3 leg-1 ($name honored) ----------
+  CUR = 'V2 legacy-v3-leg1';
+  console.log('\n=== V2 legacy v3 leg-1 ($name, no $pv) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV2 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const rejB = VI.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV2), shape: 'v3', name: 'LegacyBob' });
+    await sleep(4000);
+    ok(VI.rejects.length === rejB, `v3 leg-1: no abort at inviter`);
+    ok(nameOfContact(VI, VL.cid) === 'LegacyBob', `v3 leg-1: $name honored (typed v3 branch)`);
+    ok(pvOf(VI, VL.cid) === '3', `v3 leg-1: contact_pv learned as 3 (shape-inferred)`);
+  }
+
+  // ---------- V3 v5 leg-1 ($pv stamped + $caps piggyback) ----------
+  CUR = 'V3 v5-leg1';
+  console.log('\n=== V3 v5 leg-1 ($pv + $caps) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV3 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const rejB = VI.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV3), shape: 'v5', name: 'NewCarol' });
+    await sleep(4000);
+    ok(VI.rejects.length === rejB, `v5 leg-1: no abort at inviter`);
+    ok(nameOfContact(VI, VL.cid) === 'NewCarol', `v5 leg-1: $name honored (typed v5 branch)`);
+    ok(pvOf(VI, VL.cid) === '5', `v5 leg-1: contact_pv learned as 5 ($pv stamped)`);
+    ok(/core\.notifications/.test(String(capsOf(VI, VL.cid))), `v5 leg-1: piggybacked $caps learned into contact_caps`);
+  }
+
+  // ---------- V4 Additions A+B: below-floor leg-1 → error-as-data to inviter ----------
+  CUR = 'V4 too-old-leg1 (Additions A/B)';
+  console.log('\n=== V4 below-floor leg-1 ($pv=1) → inviter error-as-data, invite NOT consumed ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV4 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const before = st(VI); const rejB = VI.rejects.length; const errB = VI.errEvents.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'too_old', name: '' });
+    await sleep(4000);
+    const after = st(VI);
+    ok(VI.rejects.length === rejB, `A: inviter did NOT abort/rollback on a below-floor peer (no reject)`);
+    const errs = VI.errEvents.slice(errB);
+    ok(errs.length === 1, `A: exactly one $protocol_error event surfaced to the inviter's client`);
+    const e = errs[0] ?? {};
+    ok(e.code === 'peer_version_unsupported', `A: error-as-data code is peer_version_unsupported (got ${e.code})`);
+    ok(e.surface === 'sir' && e.peerVersion === '1' && e.minSupported === '2',
+      `A: typed error carries surface=sir peer_version=1 min_supported=2`);
+    ok(e.context === 'invite_redeem', `B: context marks the invite second phase (invite_redeem)`);
+    ok(/An invite you created was accepted by a peer running an unsupported \(too old\) protocol version/.test(e.message)
+      && /update their client/.test(e.message),
+      `B: inviter-facing message is the clear human-readable wording`);
+    ok(after.pi === before.pi && after.c === before.c && after.p === before.p,
+      `B: NO state consumed (invite intact, no contact registered)`);
+    // The same invite redeems fine once the peer "updates" (proves not consumed).
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'v3', name: 'UpdatedPeer' });
+    await sleep(4000);
+    ok(st(VI).pi === before.pi - 1, `B: SAME invite redeems after the peer updates (invite was not consumed)`);
+    ok(nameOfContact(VI, VL.cid) === 'UpdatedPeer', `B: post-update redeem registered the contact normally`);
+  }
+
+  // ---------- V5 CAP-1 gate (deny only on positive evidence) ----------
+  CUR = 'V5 CAP-1';
+  console.log('\n=== V5 CAP-1 capability gate at the notify client send ===');
+  {
+    // Positive evidence: alice "learned" nsvc advertises caps WITHOUT
+    // core.notifications → register must be denied AS DATA (no send, no abort).
+    await mutate(alice, '::actor::qa_set_contact_caps', { cid: nsvc.cid, caps: ['core.cluster'] });
+    const den = await mutate(alice, '::a2a_notifications::notify_register', { service: nsvc.cid });
+    ok(!isT(den.Reduce('ok').Visualize()), `CAP-1: register toward a caps-lacking service denied AS DATA ($ok FALSE)`);
+    ok(den.Reduce('error').Reduce('code').Visualize() === 'capability_not_advertised',
+      `CAP-1: denial carries stable code capability_not_advertised`);
+    ok(/notification support/.test(den.Reduce('error').Reduce('message').Visualize()),
+      `CAP-1: denial message is render-ready`);
+    // Unknown/empty caps → pass-through (pre-0.5 contacts keep working).
+    await mutate(alice, '::actor::qa_set_contact_caps', { cid: nsvc.cid, caps: [] });
+    const allow = await mutate(alice, '::a2a_notifications::notify_register', { service: nsvc.cid });
+    ok(allow.Reduce('sent_to').Visualize() === nsvc.cid, `CAP-1: EMPTY/unknown caps pass through (fail-open) — register sent`);
+  }
+
+  // ---------- V6 $pv stamping on message traffic + passive learning ----------
+  CUR = 'V6 pv-stamp';
+  console.log('\n=== V6 $pv stamp on send_message + passive learning at the receiver ===');
+  {
+    await mutate(VI, '::a2a_messaging::send_message', { contact: VL.cid, text: 'v5-stamped-msg' });
+    await sleep(2500);
+    ok(/v5-stamped-msg/.test(ro(VL, '::actor::list_incoming_messages', undefined).Visualize()),
+      `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
+    ok(pvOf(VL, VI.cid) === '5', `receiver learned contact_pv=5 from the stamped receive_message $targ`);
+  }
 
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');

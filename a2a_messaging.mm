@@ -324,7 +324,7 @@ library a2a_messaging loads libraries
         return [
             encrypted_channel::send_encrypted_tx (monitoring_proxy? $proxy_cid) (
                 $name -> receive_monitoring_copy_tx,
-                $targ -> ($copy -> copy)
+                $targ -> ($copy -> copy, $pv -> a2a_versions::wire_version)
             )
         ].
     }
@@ -737,13 +737,18 @@ library a2a_messaging loads libraries
         // My identity bundle: my AD plus, if I am a delegated role, my chain so the
         // inviter learns my root linkage symmetrically. All inside the box.
         b = my_identity_bundle_fields NIL.
+        // The literal sir_payload_v5_t shape: 0.5.0 stamps its wire dialect +
+        // capability ids (SPEC §3/§4). Pre-0.5 inviters ignore both (unknown
+        // fields — shipped, proven behavior).
         payload = _write (
             $ad -> (b $ad),
             $cert -> (b $cert),
             $root_profile -> (b $root_profile),
             $cp_binding -> (b $cp_binding),
             $invite_id -> invite_id,
-            $name -> my_name
+            $name -> my_name,
+            $pv   -> a2a_versions::wire_version,
+            $caps -> (a2a_capabilities::self_cap_ids NIL)
         ).
         data = _crypto_encrypt_message (kpr $secret_key) eph_pub_inviter payload.
 
@@ -762,7 +767,8 @@ library a2a_messaging loads libraries
                     $invite_id -> invite_id,
                     $epk -> (kpr $public_key),
                     $v -> scheme,
-                    $data -> data
+                    $data -> data,
+                    $pv -> a2a_versions::wire_version
                 )
             ),
             _return_data (
@@ -798,7 +804,7 @@ library a2a_messaging loads libraries
         return [
             transaction::action::send target (
                 $name -> request_contact_restore_tx,
-                $targ -> ($rid -> rid, $epk -> (kp $public_key), $v -> scheme)
+                $targ -> ($rid -> rid, $epk -> (kp $public_key), $v -> scheme, $pv -> a2a_versions::wire_version)
             )
         ].
     }
@@ -838,7 +844,7 @@ library a2a_messaging loads libraries
             actions is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_message_tx,
-                    $targ -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to)
+                    $targ -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version)
                 )
             ].
             sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
@@ -888,7 +894,7 @@ library a2a_messaging loads libraries
             actions is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_file_tx,
-                    $targ -> ($filename -> filename, $mime -> mime_s, $data -> data, $wire_id -> wire_id, $reply_to -> reply_to)
+                    $targ -> ($filename -> filename, $mime -> mime_s, $data -> data, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version)
                 )
             ].
             sc on_file_sent ($target_id -> target_id, $filename -> filename, $mime -> mime_s, $data -> data, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
@@ -1238,7 +1244,7 @@ library a2a_messaging loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx cp_cid (
                     $name -> enroll_delegated_node_tx,
-                    $targ -> ($child_ad -> child_ad, $delegation_cert -> cert_blob, $root_profile -> rp_blob)
+                    $targ -> ($child_ad -> child_ad, $delegation_cert -> cert_blob, $root_profile -> rp_blob, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($enroll_relayed -> (_str cp_cid), $child -> (_str (child_ad $identity $container_id)))
             ].
@@ -1272,11 +1278,11 @@ library a2a_messaging loads libraries
         return [
             encrypted_channel::send_encrypted_tx a_id (
                 $name -> ingest_connect_descriptor_tx,
-                $targ -> ($peer_ad -> ad_b, $peer_name -> name_b)
+                $targ -> ($peer_ad -> ad_b, $peer_name -> name_b, $pv -> a2a_versions::wire_version)
             ),
             encrypted_channel::send_encrypted_tx b_id (
                 $name -> ingest_connect_descriptor_tx,
-                $targ -> ($peer_ad -> ad_a, $peer_name -> name_a)
+                $targ -> ($peer_ad -> ad_a, $peer_name -> name_a, $pv -> a2a_versions::wire_version)
             )
         ].
     }
@@ -1613,12 +1619,16 @@ library a2a_messaging loads libraries
         // being registered after leg 3.
         b = my_identity_bundle_fields NIL.
         kpi = _crypto_construct_encryption_keypair (rec? $scheme).
+        // The literal cin_payload_v5_t shape ($pv/$caps; this surface never
+        // carried $name). 0.2.0 responders ignore the additions.
         leg3_payload = _write (
             $ad -> (b $ad),
             $cert -> (b $cert),
             $root_profile -> (b $root_profile),
             $cp_binding -> (b $cp_binding),
-            $invite_id -> invite_id
+            $invite_id -> invite_id,
+            $pv   -> a2a_versions::wire_version,
+            $caps -> (a2a_capabilities::self_cap_ids NIL)
         ).
         leg3_data = _crypto_encrypt_message (kpi $secret_key) epk_r leg3_payload.
         return transaction::success [
@@ -1628,7 +1638,8 @@ library a2a_messaging loads libraries
                     $invite_id -> invite_id,
                     $epk -> (kpi $public_key),
                     $v -> (rec? $scheme),
-                    $data -> leg3_data
+                    $data -> leg3_data,
+                    $pv -> a2a_versions::wire_version
                 )
             ),
             _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id),
@@ -1752,15 +1763,17 @@ library a2a_messaging loads libraries
         pending_restore_reply_keys sender_id -> (kpr $secret_key).
 
         b = my_identity_bundle_fields NIL.
+        // rst_payload_v5_t shape ($pv/$caps piggyback, SPEC §3/§4).
         payload = _write (
             $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
-            $cp_binding -> (b $cp_binding), $rid -> rid
+            $cp_binding -> (b $cp_binding), $rid -> rid,
+            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL)
         ).
         data = _crypto_encrypt_message (kpr $secret_key) epk_requester payload.
         return transaction::success [
             transaction::action::send sender_id (
                 $name -> submit_restore_response_tx,
-                $targ -> ($rid -> rid, $epk -> (kpr $public_key), $v -> scheme, $data -> data)
+                $targ -> ($rid -> rid, $epk -> (kpr $public_key), $v -> scheme, $data -> data, $pv -> a2a_versions::wire_version)
             ),
             _save_state NIL
         ].
@@ -1830,16 +1843,18 @@ library a2a_messaging loads libraries
 
         b = my_identity_bundle_fields NIL.
         kp2 = _crypto_construct_encryption_keypair scheme.
+        // rst_payload_v5_t shape ($pv/$caps piggyback, SPEC §3/§4).
         leg2_payload = _write (
             $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
-            $cp_binding -> (b $cp_binding), $rid -> rid
+            $cp_binding -> (b $cp_binding), $rid -> rid,
+            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL)
         ).
         leg2_data = _crypto_encrypt_message (kp2 $secret_key) epk_r leg2_payload.
         contact_name = ((contacts sender_id)?) $name.
         return transaction::success [
             transaction::action::send sender_id (
                 $name -> complete_restore_tx,
-                $targ -> ($rid -> rid, $epk -> (kp2 $public_key), $v -> scheme, $data -> leg2_data)
+                $targ -> ($rid -> rid, $epk -> (kp2 $public_key), $v -> scheme, $data -> leg2_data, $pv -> a2a_versions::wire_version)
             ),
             _notify_agent ($event -> $contact_restored, $name -> contact_name, $container_id -> sender_id),
             _save_state NIL
@@ -1999,7 +2014,7 @@ library a2a_messaging loads libraries
             {
                 actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_message_tx,
-                    $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to))
+                    $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $pv -> a2a_versions::wire_version)
                 ).
                 sc on_message_sent ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
                 {

@@ -14,6 +14,7 @@
 library a2a_control loads libraries
     current_transaction_info,
     encrypted_channel,
+    a2a_versions,
     a2a_messaging
     uses transactions
 {
@@ -53,7 +54,7 @@ library a2a_control loads libraries
             return transaction::success [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> control_message_tx,
-                    $targ -> ($payload -> payload, $app_id -> app_id)
+                    $targ -> ($payload -> payload, $app_id -> app_id, $pv -> a2a_versions::wire_version)
                 ),
                 transaction::action::return_data ($kind -> $data, $payload -> ($sent_to -> target_id))
             ].
