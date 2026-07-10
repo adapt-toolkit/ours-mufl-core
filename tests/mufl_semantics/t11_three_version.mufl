@@ -1,0 +1,47 @@
+// The real worked example: submit_invite_response across 0.2 / 0.3 / 0.5
+script
+{
+    // ---- versioned input types (the registry entries) ----
+    metadef sir_input_v02_t: ($invite_id -> str, $data -> str).
+    metadef sir_input_v03_t: ($invite_id -> str, $data -> str, $name -> str).
+    metadef sir_input_v05_t: ($invite_id -> str, $data -> str, $name -> str, $pv -> int).
+    // union of supported versions (type-level registry face)
+    metadef sir_input_t: sir_input_v05_t || sir_input_v03_t || sir_input_v02_t.
+    // ordered version vector (type-level list of registered versions)
+    metadef sir_versions_t: [sir_input_v02_t, sir_input_v03_t, sir_input_v05_t].
+
+    fn version_of (raw: any) -> int {
+        pvv = raw $pv.
+        if pvv != NIL { return pvv SAFE(int). }
+        return ((raw $name) != NIL ?? 3 ; 2).   // pre-$pv versions: distinguish by shape
+    }
+
+    fn handle_sir (input: sir_input_t) -> str {
+        raw = input as any.
+        v = version_of raw.
+        if v >= 5 {
+            p = raw SAFE(sir_input_v05_t).
+            return "v0.5 way: name=" + (p $name) + " pv=" + (_str (p $pv)).
+        }
+        if v == 3 {
+            p = raw SAFE(sir_input_v03_t).
+            return "v0.3 way: name=" + (p $name).
+        }
+        p = raw SAFE(sir_input_v02_t).
+        return "v0.2 way: fallback name from sender cid".
+    }
+
+    fn narrow (raw: any) -> sir_input_t {
+        v = version_of raw.
+        if v >= 5 { return raw SAFE(sir_input_v05_t). }
+        if v == 3 { return raw SAFE(sir_input_v03_t). }
+        return raw SAFE(sir_input_v02_t).
+    }
+
+    p02 = ($invite_id -> "I", $data -> "D").
+    p03 = ($invite_id -> "I", $data -> "D", $name -> "Bob").
+    p05 = ($invite_id -> "I", $data -> "D", $name -> "Carol", $pv -> 5).
+    _print (handle_sir (narrow p02)) "\n".
+    _print (handle_sir (narrow p03)) "\n".
+    _print (handle_sir (narrow p05)) "\n".
+}

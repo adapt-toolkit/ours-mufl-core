@@ -1,0 +1,11 @@
+// T-B: safe cast of a record with EXTRA fields; is the extra field kept or stripped?
+script
+{
+    metadef small_t: ($a -> int, $b -> str).
+    v = ($a -> 1, $b -> "x", $c -> "EXTRA").
+    w = v SAFE(small_t).
+    _print "cast ok; w = " w "\n".
+    c = (w as any) $c.
+    _print "w $c = " c "\n".
+    _print "same value_id: " (_value_id v == _value_id w) "\n".
+}
