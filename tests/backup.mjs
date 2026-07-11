@@ -129,9 +129,16 @@ async function phase1() {
   ok(!xSealed.includes('seal-me-marker') && !xSealed.includes('BackupBob'),
     'SEALED state blob contains no plaintext state markers');
 
+  // service auth surface: stable id + identity-signed PUT request
+  const xBid = ro(X, '::actor::backup_id', undefined).Reduce('backup_id').Visualize();
+  ok(xBid.length > 10, `backup_id derived in-wasm (${xBid.slice(0, 14)}…)`);
+  const sig = ro(X, '::actor::sign_backup_request', { payload: { seq: 1, op: 'put' } });
+  ok(String(sig.Reduce('sig').Visualize()).length > 0, 'sign_backup_request: identity-key signature over the domain-separated digest');
+
   // persist ONLY the words + ciphertext artifacts — no plaintext secrets.
   fs.writeFileSync(BK_STATE, JSON.stringify({
-    xCid: X.cid, yCid: Y.cid, xWords, yWords,
+    xCid: X.cid, yCid: Y.cid, xWords, yWords, xBid,
+    xChallenge: pSealed.toString('base64'),   // the qa_seal_probe blob doubles as a service challenge sealed to B.pub
     xSealedKey: xSealedKey.toString('base64'), ySealedKey: ySealedKey.toString('base64'),
     xSealed: xSealed.toString('base64'), ySealed: ySealed.toString('base64'),
   }));
@@ -163,6 +170,12 @@ async function phase2() {
   try { await mutate(T, '::actor::unseal_signing_secret', { words: S.xWords, sealed_key: binv(T, fut) }); }
   catch (e) { futErr = String(e.message); }
   ok(/newer than this core supports/.test(futErr), `future sealed version fails CLOSED with the stable message`);
+
+  // recovery auth: a fresh device (words only) answers a challenge sealed to B.pub
+  const ans = await mutate(T, '::actor::unseal_recovery_challenge',
+    { words: S.xWords, challenge: binv(T, Buffer.from(S.xChallenge, 'base64')) });
+  ok(ans.Reduce('answer').Reduce('probe_marker').Visualize() === 'CONFIDENTIALITY-CANARY-0451',
+    'recovery auth: fresh device answers the B-sealed challenge with the WORDS alone (in-wasm)');
 
   // the real words-only unseal of both package keys
   const xHex = (await mutate(T, '::actor::unseal_signing_secret',
@@ -202,6 +215,11 @@ async function phase2() {
   const again = Buffer.from(ro(X2, '::actor::export_state_sealed', undefined).Reduce('sealed').GetBinary());
   ok(again.length > 0 && !again.includes('post-restore-roundtrip'),
     'post-restore: sealed export works without the words (backup_pub re-derived at import)');
+  // and the service identity survives the restore: SAME backup_id, PUT signing works
+  const bid2 = ro(X2, '::actor::backup_id', undefined).Reduce('backup_id').Visualize();
+  ok(bid2 === S.xBid, `post-restore: backup_id STABLE across restore (${bid2.slice(0, 14)}…)`);
+  ok(String(ro(X2, '::actor::sign_backup_request', { payload: { seq: 2, op: 'put' } }).Reduce('sig').Visualize()).length > 0,
+    'post-restore: PUT signing works without the words (identity key via key-through-init)');
 }
 
 async function main() {

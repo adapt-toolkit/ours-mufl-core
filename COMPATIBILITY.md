@@ -152,6 +152,34 @@ pre-0.5-established contacts keep working). Owner-approved fail-open interpretat
 | **C** | change/remove a field, change semantics | BREAKING: parallel transaction (class B) or new registered version with a dual-accept window; old version leaves the union only on an OSP raise. MAJOR |
 | **D** | evolve a signed artifact | mint `vN+1` core metadef beside `vN`; verifiers accept an explicit version set; unknown version **fail-closed** (authz). Never mutate a signed shape |
 
+## Sealed backup artifacts (host-facing versioned types, core 0.6.0)
+
+`a2a_backup.mm` produces two long-lived STORED artifacts (never on the peer wire, but
+persisted indefinitely by hosts/backup services — so they follow the same discipline):
+
+- **`sealed_state_v1_t`** `($v -> int, $epk -> publickey_encrypt, $ct -> crypto_message)` —
+  the sealed envelope for both the state blob and the package key. `$v` is the
+  discriminator (host-facing sibling of `$pv`); v1 construction = fresh ephemeral sender
+  keypair + box to the backup public key. A shape change registers `v2` beside it; an
+  UNKNOWN NEWER `$v` fails **closed** with a stable message ("newer than this core
+  supports") — a stored artifact must never be mis-parsed by old software.
+- **The sealed package key** (`seal_signing_secret`): a `($kind -> "ours-package-key-v1",
+  $hex -> str)` record inside a sealed envelope. `$kind` is frozen; `$hex` is the exact
+  encoding `__init` inverts (`hex(_write(secretkey_sign))`).
+- **The derivation chain** is itself versioned by purpose tags: backup keypair =
+  `derive_seed32(words, "ours-backup-seal-v1")` → `_crypto_construct_encryption_keypair_
+  from_seed`; consumer-level derivations (e.g. the recovery-request signing keypair,
+  `"ours-recover-sign-v1"`) reuse `derive_seed32` with their own frozen tag. A changed
+  chain gets a NEW tag beside the old one — never a mutation (old artifacts must stay
+  unsealable).
+- Restore preserves the container address via the **key-through-init** path (`__init` →
+  `key_storage::reseed_identity_from_secret`, the ours-mcp pattern). Reseeding ROLLS the
+  identity's encrypt keys, which is exactly why the seal targets the words-derived backup
+  keypair, never the identity encrypt key — and why peers' stored ADs for a restored node
+  go stale until the contact-restore legs re-exchange them (rst registry above).
+
+Gate: `tests/run_backup.sh` (two-phase: live → "restart" → words-only restore).
+
 ## Golden-wire corpus (release gate)
 
 One fixture per registered version per registry, built as the **exact wire shape** that

@@ -64,8 +64,12 @@ library a2a_backup
     // Sealed-envelope format version. Bump ONLY on an envelope shape change
     // (new field / new construction), registering a new branch below.
     sealed_v = 1.
-    // Derivation domain tag (versions the words->B chain itself).
+    // Derivation domain tags (each versions its words->key chain; a changed
+    // chain gets a NEW tag beside the old one, never a mutation).
     derive_purpose = "ours-backup-seal-v1".
+    recover_sign_purpose = "ours-recover-sign-v1".
+    // Domain tag mixed into every signed backup-service request.
+    request_domain = "ours-backup-request-v1".
     // Default phrase strength (BIP39 words). 24 per owner decision 2026-07-11.
     backup_word_count = 24.
 
@@ -104,6 +108,48 @@ library a2a_backup
     {
         kp = _crypto_construct_encryption_keypair_from_seed (_crypto_default_scheme_id()) (derive_seed32 words derive_purpose).
         return ($pub -> (kp $public_key), $sec -> (kp $secret_key)).
+    }
+
+    // ---- backup-service addressing + request auth (all in-wasm; replaces
+    //      the panel's JS backup_id / request-signing in crypto/backup.ts) ---
+    //
+    // TOOLCHAIN CONSTRAINT (probed, compile-level): a WORDS-DERIVED SIGNING
+    // keypair is not constructible today — _crypto_signing_keypair_from_secret
+    // requires an existing (crypto SECKEY_SIGN) element, never a raw seed
+    // bin, and _eth_sign signs Ethereum transaction structures only. A
+    // `_crypto_signing_keypair_from_seed` primitive (the exact mirror of the
+    // encryption one at domain_crypto.cpp:149) is the queued adapt request;
+    // when it ships, the recover-sign chain (derive_seed32 words
+    // recover_sign_purpose) plugs in here unchanged.
+    //
+    // WORKING surface until then (everything in-wasm, nothing new needed):
+    //   addressing — backup_id_of(B.pub): stable, words-derived, computable
+    //     at setup AND at recovery (derive_backup_keypair re-derives B.pub).
+    //   PUT auth (established device, no words in scope) — the packet's
+    //     IDENTITY signing key: consumers sign request_hash(payload) with
+    //     key_storage::default_sign (state-resident, survives the
+    //     key-through-init restore; the service pins the identity pub/cid at
+    //     setup).
+    //   RECOVERY auth (fresh device, words in scope) — proof-of-words by
+    //     UNSEAL: the service holds B.pub (pinned at setup) and issues a
+    //     challenge sealed to it (public-key op); the device answers via
+    //     unseal_state_with_words. Capability-equivalent to a words-derived
+    //     signature. The precise service contract is the impl-plan's layer.
+    //
+    // The stable backup-service addressing id: an in-wasm digest of the
+    // words-derived backup PUBLIC key (hex string; a NEW id namespace vs the
+    // old JS sha256(HKDF-pub) scheme — the migration plan covers the cutover).
+    fn backup_id_of (pub: publickey_encrypt) -> str
+    {
+        return _str (_value_id ($domain -> request_domain, $pub -> pub)).
+    }
+
+    // Domain-separated request digest for the PUT-auth signature: consumers
+    // sign it with the identity key (key_storage::default_sign) and the
+    // service verifies against the pinned identity pub.
+    fn request_hash (payload: any) -> hash_code
+    {
+        return _value_id ($domain -> request_domain, $payload -> payload).
     }
 
     // Generic mint (non-derived variant — kept for designs that prefer a

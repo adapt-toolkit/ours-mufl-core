@@ -296,6 +296,30 @@ application actor loads libraries
         return ($sealed_key -> (a2a_backup::seal_signing_secret (key_storage::export_identity_signing_secret()) (backup_pub?))).
     }
 
+    // Backup-service addressing + PUT auth (in-wasm; no words in host scope):
+    // the stable words-derived backup_id, and the identity-key signature over
+    // the domain-separated request digest (service pins identity pub at setup).
+    trn readonly backup_id _
+    {
+        abort "Backup not initialised (run backup_init first)." when backup_pub == NIL.
+        return ($backup_id -> (a2a_backup::backup_id_of (backup_pub?))).
+    }
+    trn readonly sign_backup_request _:($payload -> payload: any)
+    {
+        h = a2a_backup::request_hash payload.
+        return ($hash -> h, $sig -> (key_storage::default_sign h)).
+    }
+
+    // Recovery auth (fresh device, words in scope): answer a service challenge
+    // sealed to B.pub by unsealing it in-wasm — proof-of-words by decryption.
+    trn unseal_recovery_challenge _:($words -> words: str, $challenge -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return transaction::success [
+            _return_data ($answer -> (a2a_backup::unseal_state_with_words blob words))
+        ].
+    }
+
     // Restore bootstrap (runs on ANY packet, incl. a throwaway one): unseal
     // the sealed_key with the words, in-wasm; the returned hex goes straight
     // to --init_trn_argument of the real packet's recreation.
