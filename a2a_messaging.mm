@@ -70,6 +70,9 @@ library a2a_messaging loads libraries
     request_contact_restore_tx = "::a2a_messaging::request_contact_restore".
     submit_restore_response_tx = "::a2a_messaging::submit_restore_response".
     complete_restore_tx        = "::a2a_messaging::complete_restore".
+    // core 0.7.0 receipts inbound (LIBRARY-routed, new surface, no legacy
+    // listeners; reachable only behind positive core.receipts.* caps).
+    receive_receipt_tx         = "::a2a_messaging::receive_receipt".
 
     // Version stamp of the portable export blob (see import_core_state for the
     // migration contract). Bump ONLY on a breaking blob-shape change, together
@@ -268,6 +271,14 @@ library a2a_messaging loads libraries
         //   $reply_to): fired after the wire send is queued (agent: no-op;
         //   messenger: append an outgoing file history entry keyed by $wire_id).
         on_file_sent is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { abort "on_file_sent hook is unset in a2a_messaging (call a2a_messaging::init)." when TRUE. return []. }
+        // on_receipt_received ($sender_id, $kind "delivered"|"read", $wire_ids
+        //   str[], $date time+): a peer confirmed delivery/read of messages we
+        //   sent (core 0.7.0 receipts). DEFAULT NO-OP — receipts are best-effort
+        //   UX, never load-bearing; an app that doesn't wire the hook silently
+        //   drops them. Hook contract (normative): application is MONOTONIC per
+        //   (peer, wire_id) on unknown < sent < delivered < read — duplicates
+        //   and out-of-order arrivals collapse to no-ops.
+        on_receipt_received is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { return []. }
     }
 
     init = fn (_:(
@@ -276,7 +287,9 @@ library a2a_messaging loads libraries
         $on_message_sent -> sent_cb: (any -> transaction::action::type[]),
         $on_contact_removed -> removed_cb: (any -> transaction::action::type[]),
         $on_file_received -> file_received_cb: (any -> transaction::action::type[]),
-        $on_file_sent -> file_sent_cb: (any -> transaction::action::type[])
+        $on_file_sent -> file_sent_cb: (any -> transaction::action::type[]),
+        // core 0.7.0, OPTIONAL (absent from pre-0.7 callers): receipt consumer.
+        $on_receipt_received -> receipt_cb: (any -> transaction::action::type[])+
     ))
     {
         _read_or_abort -> read.
@@ -285,6 +298,7 @@ library a2a_messaging loads libraries
         on_contact_removed -> removed_cb.
         on_file_received -> file_received_cb.
         on_file_sent -> file_sent_cb.
+        if receipt_cb != NIL { on_receipt_received -> receipt_cb?. }
     }
 
     // ---- shared action builders -------------------------------------------
@@ -622,6 +636,69 @@ library a2a_messaging loads libraries
             return "An invite you created was accepted by a peer running an unsupported (too old) protocol version (v" + (_str (err $peer_version)) + "; minimum supported is v" + (_str (err $min_supported)) + "). The contact was not added — ask them to update their client, then they can redeem the same invite again.".
         }
         return "An invite you created was accepted by a peer whose payload matches no supported protocol shape. The contact was not added — ask them to update their client, then they can redeem the same invite again.".
+    }
+
+    // ---- core 0.7.0 receipts (delivery + read confirmations) -----------------
+    // Gate (BOTH kinds, one capability pair; polarity is deliberately the
+    // OPPOSITE of CAP-1): emit iff THIS node advertises core.receipts.emit
+    // (user policy, manifest-captured) AND the peer POSITIVELY advertises
+    // core.receipts.receive in learned contact_caps. Absent/unknown caps =>
+    // nothing is sent — emitting to a client that cannot parse receipts is the
+    // incident class (undeliverable inbound). REG-6: never authz.
+    fn receipt_gate (peer: global_id) -> bool
+    {
+        if a2a_capabilities::self_advertises a2a_capabilities::cap_receipts_emit != TRUE { return FALSE. }
+        caps = contact_caps peer.
+        if caps == NIL { return FALSE. }
+        found is bool = FALSE.
+        sc caps? -- ( -> c)
+        {
+            if c == a2a_capabilities::cap_receipts_receive { found -> TRUE. break. }
+        }
+        return found.
+    }
+
+    // Build the receipt send (fire-and-forget over the established encrypted
+    // channel; receipts always FOLLOW message traffic, so the channel exists).
+    // Returns [] when gated off or nothing to confirm — callers append blindly.
+    fn receipt_actions (peer: global_id, kind: str, wire_ids: str[]) -> transaction::action::type[]
+    {
+        if (_count wire_ids|) == 0 { return []. }
+        if receipt_gate peer != TRUE { return []. }
+        return [
+            encrypted_channel::send_encrypted_tx peer (
+                $name -> receive_receipt_tx,
+                $targ -> (
+                    $kind     -> kind,
+                    $wire_ids -> wire_ids,
+                    $date     -> (current_transaction_info::get_transaction_time())?,
+                    $pv       -> a2a_versions::wire_version
+                )
+            )
+        ].
+    }
+
+    // READ receipts ride the consumer's get/mark-read path: mufl readonly trns
+    // cannot emit sends, so the consumer's (mutating) unread->read MARK is the
+    // read event — it appends these actions for the ids it JUST transitioned,
+    // which makes emission exact-once for free (no transition, no receipt).
+    fn read_receipt_actions (sender_id: global_id, wire_ids: str[]) -> transaction::action::type[]
+    {
+        return receipt_actions sender_id "read" wire_ids.
+    }
+
+    // Sender-side expectation, DERIVED from learned caps (no wire traffic):
+    // "expected" iff the peer positively advertises the emit capability, else
+    // "unknown" — absence of a receipt is NEVER a failure state.
+    fn receipt_expectation (cid: global_id) -> str
+    {
+        caps = contact_caps cid.
+        if caps == NIL { return "unknown". }
+        sc caps? -- ( -> c)
+        {
+            if c == a2a_capabilities::cap_receipts_emit { return "expected". }
+        }
+        return "unknown".
     }
 
     // Verify a received identity bundle against the authenticated sender: D8
@@ -2089,6 +2166,17 @@ library a2a_messaging loads libraries
         {
             actions (_count actions|) -> a.
         }
+        // core 0.7.0: DELIVERED receipt, emitted atomically with acceptance
+        // (the hook above may abort = message rejected = no receipt; from here
+        // the message IS stored). Fire-and-forget; gated on positive caps;
+        // pre-wire_id senders have no handle (and no cap) — nothing emitted.
+        if wire_id != ""
+        {
+            sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a)
+            {
+                actions (_count actions|) -> a.
+            }
+        }
         return transaction::success actions.
     }
 
@@ -2146,12 +2234,71 @@ library a2a_messaging loads libraries
         {
             actions (_count actions|) -> a.
         }
+        // core 0.7.0: DELIVERED receipt (files share the wire_id namespace).
+        if wire_id != ""
+        {
+            sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a)
+            {
+                actions (_count actions|) -> a.
+            }
+        }
         return transaction::success actions.
     }
 
     trn receive_file args: any
     {
         return handle_receive_file args.
+    }
+
+    // core 0.7.0: receipt ingest — a peer confirms delivery/read of messages I
+    // sent. TOLERANT AND NEVER LOAD-BEARING: content problems are ignored
+    // (success no-op) — an unknown $kind is a future receipt kind (forward
+    // compat), an unparseable payload is dropped, unknown wire_ids are the
+    // hook's business (messages GC). Only channel/origin violations abort.
+    // NO receipt is ever emitted for a receipt (terminal surface, no recursion).
+    fn handle_receive_receipt (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+
+        // Unknown senders: silent success (best-effort surface, no probe oracle).
+        if (contacts sender_id) == NIL { return transaction::success []. }
+        // Registry classification (rcp, M1 abort-free): bad shape => ignore.
+        if a2a_versions::rcp_shape_ok args != TRUE { return transaction::success []. }
+        kind = (args $kind) safe str.
+        if kind != "delivered" && kind != "read" { return transaction::success []. }
+
+        // Tolerant per-element wire_id extraction (mistyped entries skipped).
+        ids is str[] = [].
+        sc (args $wire_ids) -- ( -> w)
+        {
+            if w != NIL && (_typeof w) == "STRING" { ids (_count ids|) -> (w safe str). }
+        }
+        if (_count ids|) == 0 { return transaction::success []. }
+
+        rdate is time+ = NIL.
+        if (args $date) != NIL && (_typeof (args $date)) == "TIME" { rdate -> (args $date) safe time. }
+
+        pv_seen = a2a_versions::peer_pv args.
+        if pv_seen != 0 { learn_contact_version sender_id pv_seen []. }
+
+        actions is transaction::action::type[] = [].
+        sc on_receipt_received (
+            $sender_id -> sender_id,
+            $kind      -> kind,
+            $wire_ids  -> ids,
+            $date      -> rdate
+        ) -- ( -> a)
+        {
+            actions (_count actions|) -> a.
+        }
+        return transaction::success actions.
+    }
+
+    trn receive_receipt args: any
+    {
+        return handle_receive_receipt args.
     }
 
     // ---- upgrade: state export / import helpers ------------------------------

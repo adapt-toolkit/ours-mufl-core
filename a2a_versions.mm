@@ -509,6 +509,30 @@ library a2a_versions
         return (pv != 0 ?? pv ; 2).
     }
 
+    // receive_receipt $targ (core 0.7.0, class-B new surface — single version;
+    // reachable only behind positive core.receipts.* caps, so no $pv bump).
+    metadef rcp_targ_v1_t: (
+        $kind     -> str,      // "delivered" | "read" (frozen id strings)
+        $wire_ids -> any,      // str[] — 1..N stable wire ids (shared msg+file namespace)
+        $date     -> time+,
+        $pv       -> int+
+    ).
+    metadef rcp_targ_t: rcp_targ_v1_t.
+    fn rcp_version_of (raw: any) -> int
+    {
+        pv = peer_pv raw.
+        return (pv != 0 ?? pv ; 7).
+    }
+    // Abort-free classification (M1): the handler IGNORES (success, no-op) any
+    // payload failing this — receipts are best-effort UX, never load-bearing.
+    // $wire_ids must be a real list (lists ride IMMUTABLE_DICTIONARY at
+    // runtime): iterating a scalar would char-walk strings / abort on ints.
+    fn rcp_shape_ok (raw: any) -> bool
+    {
+        ids = raw $wire_ids.
+        return is_str (raw $kind) && ids != NIL && (_typeof ids) == "IMMUTABLE_DICTIONARY".
+    }
+
     // receive_file $targ (v5 adds only the $pv stamp — same shape).
     metadef rfil_targ_v2_t: (
         $filename -> str,
