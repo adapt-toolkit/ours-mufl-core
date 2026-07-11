@@ -105,3 +105,14 @@ Crypto/tamper and identity-verification failures remain hard aborts.
 The binding rules (REG-1…6), the OSP declaration, the full registry index, and the wire-
 change PR checklist live in
 [`COMPATIBILITY.md`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/COMPATIBILITY.md).
+
+## Sealed backup artifacts (core 0.6.0)
+
+[`a2a_backup.mm`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/a2a_backup.mm)
+adds the words-rooted sealed backup: a 24-word BIP39 phrase (mintable **inside the
+packet**) deterministically derives a backup encryption keypair; the exported state and
+the root signing secret are sealed to it **in-wasm**, so hosts only ever store ciphertext.
+Restore preserves the container address via the key-through-init path (`__init` →
+`key_storage::reseed_identity_from_secret`). The sealed envelope (`$v`-versioned) and the
+purpose-tagged derivation chains are host-facing versioned artifacts governed by the same
+COMPATIBILITY.md discipline: frozen versions, dispatch on the tag, fail-closed on newer.
