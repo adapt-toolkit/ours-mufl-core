@@ -26,6 +26,7 @@ application actor loads libraries
     continuation,
     encrypted_channel,
     a2a_versions,
+    a2a_backup,
     a2a_protocol,
     a2a_messaging,
     a2a_notifications,
@@ -48,6 +49,7 @@ application actor loads libraries
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
         encrypted_channel::init ($_read_or_abort -> _read_or_abort).
+        a2a_backup::init ($_read_or_abort -> _read_or_abort).
 
         // Host-protocol action helpers (the driver resolves on kind "data").
         fn _save_state (_) = (transaction::action::return_data ($kind -> $save_state)).
@@ -235,6 +237,137 @@ application actor loads libraries
         a2a_messaging::import_core_state (data $core).
         if (data $notify) != NIL { a2a_notifications::import_notify_state (data $notify). }
         return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
+    }
+
+    // ==== sealed backup + key-through-init restore (core 0.6.0) ============
+    // The CONSUMER-ROLE stubs (this actor plays the panel/daemon part) — the
+    // same shape ours-mcp ships (actor.mu __init / export_signing_secret) and
+    // the panel's messenger.mu will adopt. Validated here in the loopback.
+
+    // The packet's own backup ENCRYPTION public key. Rides inside every
+    // sealed blob (so it survives restore); the matching SECRET half is
+    // returned ONCE by backup_init for host custody (package-key bundle) and
+    // is NEVER packet state.
+    backup_pub is publickey_encrypt+ = NIL.
+
+    // Key-through-init (ours-mcp pattern, verbatim): on recreation the host
+    // injects the persisted SIGN secret (hex of the Serialize()'d
+    // secretkey_sign) as init_arg; reseeding restores the container address.
+    trn __init arg
+    {
+        if _typeof arg == "STRING"
+        {
+            key_storage::reseed_identity_from_secret
+                ((_read_or_abort (_hex_string_to_binary (arg safe str))) safe secretkey_sign).
+        }
+        return transaction::success [].
+    }
+
+    // The package key, half 1: the root SIGN secret (Serialize()-hexed by the
+    // host, exactly like ours-mcp identity.key).
+    trn readonly export_signing_secret _
+    {
+        return key_storage::export_identity_signing_secret().
+    }
+
+    // Words-rooted backup setup (the ONE-human-secret collapse): mint (or
+    // accept) the BIP39 words IN-WASM, derive the backup keypair B, keep B's
+    // PUBLIC key (sealing needs only this), and return the words ONCE for
+    // user display plus the sealed_key artifact (root SIGN secret sealed to
+    // B) — pure ciphertext for host storage.
+    trn backup_init _:($words -> supplied: str+)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        words is str = (supplied == NIL ?? a2a_backup::generate_backup_words NIL ; supplied?).
+        kp = a2a_backup::derive_backup_keypair words.
+        backup_pub -> (kp $pub).
+        sealed_key = a2a_backup::seal_signing_secret (key_storage::export_identity_signing_secret()) (kp $pub).
+        return transaction::success [
+            _return_data ($words -> words, $sealed_key -> sealed_key),
+            _save_state NIL
+        ].
+    }
+
+    // Re-export the sealed_key artifact on demand (host lost it, rotation
+    // audit, etc.). Same ciphertext-only output as backup_init's.
+    trn readonly export_signing_secret_sealed _
+    {
+        abort "Backup not initialised (run backup_init first)." when backup_pub == NIL.
+        return ($sealed_key -> (a2a_backup::seal_signing_secret (key_storage::export_identity_signing_secret()) (backup_pub?))).
+    }
+
+    // Restore bootstrap (runs on ANY packet, incl. a throwaway one): unseal
+    // the sealed_key with the words, in-wasm; the returned hex goes straight
+    // to --init_trn_argument of the real packet's recreation.
+    trn unseal_signing_secret _:($words -> words: str, $sealed_key -> blob: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return transaction::success [
+            _return_data ($secret_hex -> (a2a_backup::unseal_signing_secret_hex blob words))
+        ].
+    }
+
+    // Sealed export: the composed state record (core + notify + THIS app's
+    // inbox/files — unlike the legacy plain export_state, the sealed backup
+    // carries the full app state), encrypted inside the packet — the host
+    // only ever sees the opaque blob.
+    trn readonly export_state_sealed _
+    {
+        abort "Backup not initialised (run backup_init first)." when backup_pub == NIL.
+        state = (
+            $core -> (a2a_messaging::export_core_state NIL),
+            $notify -> (a2a_notifications::export_notify_state NIL),
+            $inbox -> inbox,
+            $files -> files
+        ).
+        return ($sealed -> (a2a_backup::seal_state state (backup_pub?))).
+    }
+
+    // Self-calibrating confidentiality probe: returns the SAME record both as
+    // plaintext serialization and sealed — the driver proves the marker IS in
+    // the plain bytes (so its absence from the sealed bytes is meaningful).
+    trn readonly qa_seal_probe _:($marker -> marker: str)
+    {
+        abort "Backup not initialised (run backup_init first)." when backup_pub == NIL.
+        rec = ($probe_marker -> marker, $n -> 42).
+        return ($plain -> (_write rec), $sealed -> (a2a_backup::seal_state rec (backup_pub?))).
+    }
+
+    // Sealed restore: derive B from the words, unseal in-wasm, replay through
+    // the same import path import_state uses, and re-establish backup_pub so
+    // subsequent sealed exports work without the words.
+    trn import_state_sealed _:($sealed -> blob: bin, $words -> words: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        data = a2a_backup::unseal_state_with_words blob words.
+        a2a_messaging::import_core_state (data $core).
+        if (data $notify) != NIL { a2a_notifications::import_notify_state (data $notify). }
+        if (data $inbox) != NIL
+        {
+            new_inbox is msg_t[] = [].
+            sc (data $inbox) -- ( -> m) { new_inbox (_count new_inbox|) -> (m safe msg_t). }
+            inbox -> new_inbox.
+        }
+        if (data $files) != NIL
+        {
+            new_files is file_t[] = [].
+            sc (data $files) -- ( -> f) { new_files (_count new_files|) -> (f safe file_t). }
+            files -> new_files.
+        }
+        backup_pub -> ((a2a_backup::derive_backup_keypair words) $pub).
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
+    }
+
+    // Corpus negative: a future-versioned sealed envelope must be REJECTED
+    // with the stable fail-closed message, never mis-parsed.
+    trn qa_mk_future_sealed _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        eph = _crypto_construct_encryption_keypair (_crypto_default_scheme_id()).
+        ct = _crypto_encrypt_message (eph $secret_key) (eph $public_key) (_write ($x -> 1)).
+        return transaction::success [
+            _return_data ($blob -> (_write ($v -> 99, $epk -> (eph $public_key), $ct -> ct)))
+        ].
     }
 
     // ================= TEST PROBES =================

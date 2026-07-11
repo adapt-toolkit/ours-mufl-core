@@ -14,6 +14,7 @@ config script
             (
                 $version -> #"version.mm",
                 $a2a_versions -> #"a2a_versions.mm",
+                $a2a_backup -> #"a2a_backup.mm",
                 $a2a_capabilities -> #"a2a_capabilities.mm",
                 $a2a_protocol -> #"a2a_protocol.mm",
                 $a2a_messaging -> #"a2a_messaging.mm",
