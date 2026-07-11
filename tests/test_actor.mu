@@ -26,7 +26,6 @@ application actor loads libraries
     continuation,
     encrypted_channel,
     a2a_versions,
-    a2a_capabilities,
     a2a_protocol,
     a2a_messaging,
     a2a_notifications,
@@ -54,9 +53,6 @@ application actor loads libraries
         fn _save_state (_) = (transaction::action::return_data ($kind -> $save_state)).
         fn _return_data (payload: any) = (transaction::action::return_data ($kind -> $data, $payload -> payload)).
         fn _notify_agent (payload: any) = (transaction::action::return_data ($kind -> $notify_agent, $payload -> payload)).
-
-        // Receipt consumer log (core 0.7.0) — the driver's RC-series probe.
-        receipts_log is any[] = [].
 
         // Storage hooks: deposit inbound messages; send/remove are no-ops.
         a2a_messaging::init (
@@ -86,12 +82,7 @@ application actor loads libraries
                 files (_count files|) -> ($sender -> sid, $filename -> fname, $mime -> mt, $wire_id -> wid, $reply_wire -> rw).
                 return [ _notify_agent ($event -> $file_received), _save_state NIL ].
             },
-            $on_file_sent -> fn (_: any) -> transaction::action::type[] { return []. },
-            $on_receipt_received -> fn (arg: any) -> transaction::action::type[]
-            {
-                receipts_log (_count receipts_log|) -> arg.
-                return [ _notify_agent ($event -> $receipt_received), _save_state NIL ].
-            }
+            $on_file_sent -> fn (_: any) -> transaction::action::type[] { return []. }
         ).
 
         // Notification hook logs (the app owns notification storage; the core
@@ -689,60 +680,6 @@ application actor loads libraries
                 encrypted_channel::send_encrypted_tx tgt (
                     $name -> "::actor::receive_message",
                     $targ -> ($text -> text)
-                ),
-                _return_data ($sent -> TRUE)
-            ].
-        }).
-    }
-
-    // ---- core 0.7.0 receipts QA (RC-series) ----
-    trn readonly qa_receipts_log _ { return ($log -> receipts_log). }
-    trn readonly qa_receipt_expectation _:($cid -> cid: global_id)
-    {
-        return ($state -> (a2a_messaging::receipt_expectation cid)).
-    }
-    // (Re)declare this node's advertised protocol caps — drives the emit gate's
-    // self side (a2a_capabilities::init is re-callable; empty handlers, stub
-    // describe: receipts ids are $advertise-class, no control verbs).
-    trn qa_init_caps _:($advertise -> adv: str[])
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
-        a2a_capabilities::init (
-            $describe -> fn (_: any) -> a2a_capabilities::app_manifest_t
-            {
-                return ($version -> 1, $app_id -> "test.actor", $name -> "actor",
-                        $description -> "", $monitoring_status -> "off", $capabilities -> (,)).
-            },
-            $supported -> [],
-            $handlers -> (,),
-            $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
-            $authorizer -> NIL,
-            $advertise -> adv
-        ).
-        return transaction::success [ _return_data ($set -> TRUE) ].
-    }
-    // Consumer read-path emission (the get/mark-read moment): appends the core
-    // read_receipt_actions for ids just transitioned unread->read.
-    trn qa_mark_read _:($contact -> cid: global_id, $wire_ids -> wids: str[])
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
-        actions is transaction::action::type[] = [].
-        sc a2a_messaging::read_receipt_actions cid wids -- ( -> a)
-        {
-            actions (_count actions|) -> a.
-        }
-        actions (_count actions|) -> _return_data ($sent -> ((_count actions) > 0)).
-        return transaction::success actions.
-    }
-    // Raw receipt injector (forward-compat / shape-tolerance cells).
-    trn qa_send_raw_receipt _:($target -> tgt: global_id, $kind -> kind: any, $wire_ids -> wids: any)
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
-        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
-            return transaction::success [
-                encrypted_channel::send_encrypted_tx tgt (
-                    $name -> "::a2a_messaging::receive_receipt",
-                    $targ -> ($kind -> kind, $wire_ids -> wids, $pv -> a2a_versions::wire_version)
                 ),
                 _return_data ($sent -> TRUE)
             ].

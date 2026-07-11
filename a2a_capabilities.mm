@@ -80,13 +80,6 @@ library a2a_capabilities loads libraries
     // child.create/child.remove. Benign for messenger (only bound roots show the
     // Cluster tab); a false-positive for capability-presence-keyed UIs.
     cap_cluster       = "core.cluster".
-    // core 0.7.0 — message receipts (delivery + read), the emit/receive split
-    // (COMPATIBILITY.md §receipts). PROTOCOL-surface ids with NO control verbs:
-    // they gate receipt traffic (fail-CLOSED on absent caps — emitting to a
-    // client that can't parse receipts is the incident class), never authz
-    // (REG-6). Delivery-vs-read is the wire $kind, not a capability split.
-    cap_receipts_emit    = "core.receipts.emit".    // "I WILL emit receipts (delivered on arrival, read on my get path)"
-    cap_receipts_receive = "core.receipts.receive". // "I consume receipts — send me yours"
 
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
@@ -191,43 +184,18 @@ library a2a_capabilities loads libraries
         // controller-class verbs (e.g. the connector: only core.configuration via
         // its own path) may omit it. If omitted, dispatch fail-fasts on the first
         // controller-class verb, so a cluster app MUST wire it.
-        $authorizer -> authorizer_cb: (any -> bool)+,
-        // core 0.7.0, OPTIONAL (absent from pre-0.7 callers): PROTOCOL-surface
-        // capability ids advertised on the wire piggyback WITHOUT control-verb
-        // handlers (e.g. core.receipts.*). $supported keeps its declared-implies-
-        // implemented handler guard; $advertise is for ids that gate peer
-        // traffic shaping only and never route through dispatch.
-        $advertise  -> advertise_list: str[]+
+        $authorizer -> authorizer_cb: (any -> bool)+
     ))
     {
         describe -> describe_cb.
         handlers -> handler_map.
         on_unknown -> fallback.
         if authorizer_cb != NIL { authorizer -> authorizer_cb. }
-        merged is str[] = [].
-        sc supported_caps -- ( -> cap) { merged (_count merged|) -> cap. }
-        if advertise_list != NIL
-        {
-            sc advertise_list? -- ( -> cap) { merged (_count merged|) -> cap. }
-        }
-        self_caps -> merged.
+        self_caps -> supported_caps.
         sc supported_caps -- ( -> cap)
         {
             abort "Capability declared without a handler: " + cap when (handler_map cap) == NIL.
         }
-    }
-
-    // Does THIS node advertise `cap` on the wire piggyback ($supported ∪
-    // $advertise, captured at init)? Empty/uninited apps advertise nothing —
-    // degrade, never abort (the self_cap_ids contract).
-    fn self_advertises (cap: str) -> bool
-    {
-        found is bool = FALSE.
-        sc self_caps -- ( -> c)
-        {
-            if c == cap { found -> TRUE. break. }
-        }
-        return found.
     }
 
     // The capability ids THIS node advertises on the 0.5.0 wire piggyback
