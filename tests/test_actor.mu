@@ -615,7 +615,8 @@ application actor loads libraries
         }
         if shape == "v5"
         {
-            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name, $pv -> a2a_versions::wire_version, $caps -> ["core.notifications"])).
+            // literal 5: this shape emulates a 0.5.0 sender (wire_version moved on).
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name, $pv -> 5, $caps -> ["core.notifications"])).
         }
         if shape == "too_old"
         {

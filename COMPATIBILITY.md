@@ -22,7 +22,9 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
 
 ## The wire version id (`$pv`)
 
-- `wire_version = 5` (minor-version ints: core 0.5.0 stamps `$pv -> 5`). Monotone; bump
+- `wire_version = 7` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
+  rcp/receipts surface registered in 0.7 warranted the bump; the initial 0.7.0 under-bump left
+  pre-receipts contacts permanently receipt-gated, the fixed single-tick bug). Monotone; bump
   **only** when a wire surface registers a new versioned type — not on every release.
 - Stamped on every core-originated send: cleartext `$targ` envelopes **and** inside the
   boxed identity-bundle payloads (invite legs 1/3, restore legs 1/2).
@@ -162,6 +164,14 @@ by ONE new class-B transaction `::a2a_messaging::receive_receipt`
 `receive_message`/`receive_file` transaction (app-hook abort = no receipt); **read** fires on
 the consumer's get/mark-read path via `read_receipt_actions` (readonly trns cannot send, so
 the unread→read MARK is the read event — exact-once for free).
+
+**Gate (hybrid since the caps-relearn fix):** caps are exchanged only on invite/restore
+bundle legs and never re-negotiate on app update, so an EXPLICIT caps opinion (any
+`core.receipts.*` id in the learned set) is followed strictly (receive ⇒ send; opinion
+without receive ⇒ opt-out), while a caps-silent peer with learned dialect `pv >= 7` gets
+`receive` IMPLIED — `contact_pv` re-learns from every stamped ordinary message, so two
+upgraded peers self-heal on their first exchange, no re-pair. Old peers (`pv < 7`) stay
+silent. Same hybrid drives `receipt_expectation`.
 
 Capabilities (2 flat ids in `a2a_capabilities`, advertised via the new **`$advertise`** init
 param — protocol-surface ids with no control verbs, so the `$supported`
