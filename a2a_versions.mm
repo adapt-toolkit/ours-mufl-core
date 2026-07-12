@@ -72,6 +72,9 @@ library a2a_versions
 
     fn is_str (v: any) -> bool { return v != NIL && (_typeof v) == td_str. }
     fn is_int (v: any) -> bool { return v != NIL && (_typeof v) == td_int. }
+    // bool runtime domains are "TRUE"/"FALSE" (probed) — a value is a bool iff
+    // it is either. Used by the group invite-response shape guard.
+    fn is_bool (v: any) -> bool { return v != NIL && ((_typeof v) == "TRUE" || (_typeof v) == "FALSE"). }
 
     // $pv as sent by the peer; 0 = pre-0.5 peer (never stamped it). Tolerant
     // of a mistyped $pv (non-int => treated as unstamped, shape inference
@@ -555,4 +558,66 @@ library a2a_versions
         pv = peer_pv raw.
         return (pv != 0 ?? pv ; 2).
     }
+
+    // ========================================================================
+    // GROUP-CHAT registries (core 0.8.0) — the 11 group inbound surfaces
+    // (GROUP_CHAT_PLAN.md §3). All NEW class-B surfaces → single-version
+    // classification; a peer speaking them is >=0.8, so version_of defaults to
+    // 8 when unstamped (you only receive a group txn from a peer that
+    // invited/added you). M1 abort-free guards on the non-nullable fields via
+    // is_str/is_int; ADs stay `any` (PoP-verified downstream by
+    // process_address_document, never cast here — mirrors sir_payload's $ad).
+    // try_narrow_* returns error-as-data on a floor/shape miss so a malformed
+    // group payload never raw-aborts.
+    // ========================================================================
+    grp_max_version = 8.
+
+    fn grp_version_of (raw: any) -> int
+    {
+        pv = peer_pv raw.
+        return (pv != 0 ?? pv ; 8).
+    }
+
+    // Abort-free floor/shape classification for a group surface (payload stays
+    // `any`: each handler reads its own fields after the ok-gate; the registry
+    // does classification + error-as-data, not an exact cast — group payloads
+    // carry whole ADs that must not be cast/stripped).
+    metadef grp_narrowed_t: ($ok -> bool, $err -> version_error_t+).
+
+    fn grp_classify (surface: str, raw: any, shape_ok: bool) -> grp_narrowed_t
+    {
+        v = grp_version_of raw.
+        if v < min_wire_version
+        {
+            return ($ok -> FALSE, $err -> too_old_error surface v grp_max_version).
+        }
+        if shape_ok != TRUE
+        {
+            return ($ok -> FALSE, $err -> shape_error surface v grp_max_version).
+        }
+        return ($ok -> TRUE, $err -> NIL).
+    }
+
+    // Per-surface abort-free shape predicates (non-nullable fields only; ADs,
+    // members list elements and reply_to stay tolerant/`any`).
+    fn grp_invite_shape_ok        (raw: any) -> bool { return is_str (raw $chat_id) && is_str (raw $name) && is_str (raw $admin_cid). }
+    fn grp_invite_resp_shape_ok   (raw: any) -> bool { return is_str (raw $chat_id) && is_bool (raw $accepted). }
+    fn grp_member_add_shape_ok    (raw: any) -> bool { return is_str (raw $chat_id) && (raw $member_ad) != NIL && is_str (raw $name) && is_int (raw $epoch). }
+    fn grp_roster_sync_shape_ok   (raw: any) -> bool { return is_str (raw $chat_id) && is_int (raw $epoch) && (raw $members) != NIL && (_typeof (raw $members)) == "IMMUTABLE_DICTIONARY". }
+    fn grp_member_remove_shape_ok (raw: any) -> bool { return is_str (raw $chat_id) && is_str (raw $removed_cid) && is_int (raw $epoch). }
+    fn grp_chat_only_shape_ok     (raw: any) -> bool { return is_str (raw $chat_id). }
+    fn grp_msg_shape_ok           (raw: any) -> bool { return is_str (raw $chat_id) && is_int (raw $epoch) && is_str (raw $text). }
+    fn grp_epoch_hint_shape_ok    (raw: any) -> bool { return is_str (raw $chat_id) && is_int (raw $epoch). }
+
+    fn try_narrow_grp_invite        (raw: any) -> grp_narrowed_t { return grp_classify "grp_invite"        raw (grp_invite_shape_ok raw). }
+    fn try_narrow_grp_invite_resp   (raw: any) -> grp_narrowed_t { return grp_classify "grp_invite_resp"   raw (grp_invite_resp_shape_ok raw). }
+    fn try_narrow_grp_member_add    (raw: any) -> grp_narrowed_t { return grp_classify "grp_member_add"    raw (grp_member_add_shape_ok raw). }
+    fn try_narrow_grp_roster_sync   (raw: any) -> grp_narrowed_t { return grp_classify "grp_roster_sync"   raw (grp_roster_sync_shape_ok raw). }
+    fn try_narrow_grp_member_remove (raw: any) -> grp_narrowed_t { return grp_classify "grp_member_remove" raw (grp_member_remove_shape_ok raw). }
+    fn try_narrow_grp_member_leave  (raw: any) -> grp_narrowed_t { return grp_classify "grp_member_leave"  raw (grp_chat_only_shape_ok raw). }
+    fn try_narrow_grp_delete        (raw: any) -> grp_narrowed_t { return grp_classify "grp_delete"        raw (grp_chat_only_shape_ok raw). }
+    fn try_narrow_grp_message       (raw: any) -> grp_narrowed_t { return grp_classify "grp_message"       raw (grp_msg_shape_ok raw). }
+    fn try_narrow_grp_not_member    (raw: any) -> grp_narrowed_t { return grp_classify "grp_not_member"    raw (grp_chat_only_shape_ok raw). }
+    fn try_narrow_grp_stale         (raw: any) -> grp_narrowed_t { return grp_classify "grp_stale"         raw (grp_epoch_hint_shape_ok raw). }
+    fn try_narrow_grp_roster_req    (raw: any) -> grp_narrowed_t { return grp_classify "grp_roster_req"    raw (grp_epoch_hint_shape_ok raw). }
 }

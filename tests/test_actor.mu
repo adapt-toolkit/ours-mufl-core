@@ -29,6 +29,7 @@ application actor loads libraries
     a2a_capabilities,
     a2a_protocol,
     a2a_messaging,
+    a2a_group,
     a2a_notifications,
     current_transaction_info,
     protocol_container,
@@ -57,6 +58,17 @@ application actor loads libraries
 
         // Receipt consumer log (core 0.7.0) — the driver's RC-series probe.
         receipts_log is any[] = [].
+        // Group message log (core 0.8.0) — the G-series probe.
+        group_log is any[] = [].
+        a2a_group::init (
+            $_read_or_abort -> _read_or_abort,
+            $on_group_message_received -> fn (arg: any) -> transaction::action::type[]
+            {
+                group_log (_count group_log|) -> arg.
+                return [ _notify_agent ($event -> $group_message_received), _save_state NIL ].
+            },
+            $on_group_message_sent -> fn (_: any) -> transaction::action::type[] { return []. }
+        ).
 
         // Storage hooks: deposit inbound messages; send/remove are no-ops.
         a2a_messaging::init (
@@ -695,6 +707,13 @@ application actor loads libraries
             ].
         }).
     }
+
+    // ---- core 0.8.0 group-chat QA (G-series) ----
+    trn readonly qa_group_log _ { return ($log -> group_log). }
+    // NOTE: group state is read via the a2a_group::list_groups / get_group
+    // TRNs directly from the driver — NOT a forwarder fn here. A fn that
+    // touches the nested groups map is INLINED across the library boundary and
+    // blows the meta step budget; a trn returns an already-flattened value.
 
     // ---- core 0.7.0 receipts QA (RC-series) ----
     trn readonly qa_receipts_log _ { return ($log -> receipts_log). }

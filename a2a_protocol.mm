@@ -100,6 +100,40 @@ library a2a_protocol loads library
     // context for the recipient, not durable thread state.
     metadef reply_ref_t: ($wire_id -> str, $sentence -> int+).
 
+    // ---- group chat (core 0.8.0) ----------------------------------------
+    // A group = a shared chat_id + a creator-authoritative roster + the full
+    // mesh of mutual contacts it induces (GROUP_CHAT_DESIGN.md / _PLAN.md). A
+    // message is a bare N-way send_encrypted_tx over the existing 1:1 channels
+    // — no group key, no relay, no SPOF. The ONLY fixed wire metadef is the
+    // join offer below; every other group event rides as an `any` $targ
+    // (forward-compat, like receive_message), narrowed through the a2a_versions
+    // grp_* registry entries. All member ADs travel as whole t_address_document
+    // values and are PoP-verified via process_address_document, never cast here.
+    //
+    // The join OFFER. OWNER-ONLY DISCLOSURE: the group name + the owner cid,
+    // and NOTHING about the membership (no member list, no member ADs). A
+    // decliner therefore discloses nothing, and no member AD reaches a
+    // non-acceptor. The receiver PINS $admin_cid as the roster authority for
+    // this chat_id (all roster-mutating relays are honored only from it).
+    metadef group_invite_t: (
+        $chat_id   -> global_id,   // group id, minted by the owner (_new_id "ours group")
+        $name      -> str,         // display name, metadata only
+        $admin_cid -> global_id    // the owner/authority; receiver pins this
+    ).
+    // The remaining group `$targ` shapes (carried as `any`, documented here,
+    // registered in a2a_versions grp_*):
+    //   group_invite_response : ($chat_id, $accepted -> bool)
+    //   group_member_add      : ($chat_id, $member_ad -> t_address_document, $name -> str, $epoch -> int)
+    //   group_roster_sync     : ($chat_id, $epoch -> int,
+    //                            $members -> ($ad -> t_address_document, $name -> str)[])
+    //   group_member_remove   : ($chat_id, $removed_cid -> global_id, $epoch -> int)
+    //   group_member_leave    : ($chat_id)
+    //   group_delete          : ($chat_id)
+    //   group_message         : ($chat_id, $epoch -> int, $text -> str, $wire_id -> str, $reply_to -> reply_ref_t+)
+    //   group_not_member      : ($chat_id)                    // repair: "drop me"
+    //   group_stale           : ($chat_id, $epoch -> int)     // repair: epoch hint
+    //   request_group_roster  : ($chat_id, $epoch -> int)     // repair: pull roster
+
     // ---- local contact book wire shapes ---------------------------------
     // Introduction credential, minted PER CONNECT ATTEMPT by the host's
     // registrar packet (never stored in the book). It binds the joiner's
