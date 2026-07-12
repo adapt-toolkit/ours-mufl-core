@@ -31,9 +31,16 @@ library a2a_versions
     // ---- this build's wire dialect id -------------------------------------
     // Stamped as $pv on every 0.5.0+ core-originated send (cleartext $targ
     // envelopes AND inside the boxed identity-bundle payloads). Minor-version
-    // ints: core 0.5.0 -> 5. Monotone; bump ONLY when a wire surface registers
-    // a new versioned type (SPEC Q2), not on every release.
-    wire_version = 5.
+    // ints: core 0.5.0 -> 5, 0.7.0 -> 7. Monotone; bump ONLY when a wire
+    // surface registers a new versioned type (SPEC Q2), not on every release.
+    // 7: the rcp surface (receive_receipt) registered in 0.7 — a peer whose
+    // learned dialect is >= 7 is KNOWN to parse receipts-era transactions,
+    // which the receipts gate uses to self-heal stale-caps contacts (see
+    // a2a_messaging::receipt_gate). Correcting an under-bump: 0.7.0 initially
+    // shipped still stamping 5, which left pre-receipts contacts permanently
+    // gated (caps only re-learn on invite/restore legs — the owner-reported
+    // single-tick bug).
+    wire_version = 7.
     // The version floor: OSP (oldest supported peer) = core 0.2.0 -> 2.
     // Raising this = an owner decision recorded in COMPATIBILITY.md (drop the
     // v2 types from the unions + prune the corpus — a visible, reviewed act).

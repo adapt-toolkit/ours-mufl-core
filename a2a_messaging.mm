@@ -645,17 +645,44 @@ library a2a_messaging loads libraries
     // core.receipts.receive in learned contact_caps. Absent/unknown caps =>
     // nothing is sent — emitting to a client that cannot parse receipts is the
     // incident class (undeliverable inbound). REG-6: never authz.
+    // Does this caps list mention ANY receipts id (i.e. the peer's build is
+    // receipts-aware and its advertisement is an EXPLICIT opinion)?
+    fn caps_receipts_opinion (caps: str[]) -> bool
+    {
+        sc caps -- ( -> c)
+        {
+            if c == a2a_capabilities::cap_receipts_receive { return TRUE. }
+            if c == a2a_capabilities::cap_receipts_emit { return TRUE. }
+        }
+        return FALSE.
+    }
+    fn caps_contains (caps: str[], cap: str) -> bool
+    {
+        sc caps -- ( -> c) { if c == cap { return TRUE. } }
+        return FALSE.
+    }
+
+    // HYBRID GATE (stale-caps self-heal): capability ids are exchanged only on
+    // invite/restore bundle legs, so a contact paired PRE-receipts keeps its
+    // old caps forever unless re-paired — which froze receipts off for every
+    // existing contact after the 0.7 update (owner-reported single-tick bug).
+    // Rule: if the peer's learned caps express ANY receipts opinion, follow
+    // them STRICTLY (preserves explicit emit/receive toggles); if they are
+    // silent on receipts, imply `receive` from the peer's learned dialect
+    // pv >= 7 — pv IS re-learned from every stamped ordinary message (ongoing
+    // learning), and a pv>=7 peer is KNOWN to parse receive_receipt (the rcp
+    // surface registered in 0.7). Old peers (pv < 7 / unknown) stay silent.
+    // REG-6 holds: this shapes traffic, never authz.
     fn receipt_gate (peer: global_id) -> bool
     {
         if a2a_capabilities::self_advertises a2a_capabilities::cap_receipts_emit != TRUE { return FALSE. }
         caps = contact_caps peer.
-        if caps == NIL { return FALSE. }
-        found is bool = FALSE.
-        sc caps? -- ( -> c)
+        if caps != NIL && caps_receipts_opinion (caps?)
         {
-            if c == a2a_capabilities::cap_receipts_receive { found -> TRUE. break. }
+            return caps_contains (caps?) a2a_capabilities::cap_receipts_receive.
         }
-        return found.
+        pv = contact_pv peer.
+        return pv != NIL && pv? >= 7.
     }
 
     // Build the receipt send (fire-and-forget over the established encrypted
@@ -690,14 +717,17 @@ library a2a_messaging loads libraries
     // Sender-side expectation, DERIVED from learned caps (no wire traffic):
     // "expected" iff the peer positively advertises the emit capability, else
     // "unknown" — absence of a receipt is NEVER a failure state.
+    // Same hybrid as the gate: explicit caps opinion wins; otherwise a
+    // pv>=7 peer is expected to emit (its build does by default).
     fn receipt_expectation (cid: global_id) -> str
     {
         caps = contact_caps cid.
-        if caps == NIL { return "unknown". }
-        sc caps? -- ( -> c)
+        if caps != NIL && caps_receipts_opinion (caps?)
         {
-            if c == a2a_capabilities::cap_receipts_emit { return "expected". }
+            return (caps_contains (caps?) a2a_capabilities::cap_receipts_emit ?? "expected" ; "unknown").
         }
+        pv = contact_pv cid.
+        if pv != NIL && pv? >= 7 { return "expected". }
         return "unknown".
     }
 

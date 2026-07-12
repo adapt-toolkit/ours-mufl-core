@@ -1225,8 +1225,8 @@ async function main() {
     await sleep(2500);
     ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(R, I.cid) === '5', `responder learned contact_pv=5 (v5 leg-3 + stamped messages)`);
-    ok(pvOf(I, R.cid) === '5', `inviter learned contact_pv=5 (real 0.5.0 v5 leg-1)`);
+    ok(pvOf(R, I.cid) === '7', `responder learned contact_pv=7 (v7 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '7', `inviter learned contact_pv=7 (real current-build leg-1)`);
   }
 
   // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
@@ -1248,14 +1248,14 @@ async function main() {
     await sleep(2500);
     ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `post-upgrade stamped message delivered`);
-    ok(pvOf(I, R.cid) === '5', `UPGRADE: first v5-stamped ordinary message re-learned contact_pv 2→5 (ongoing learning)`);
+    ok(pvOf(I, R.cid) === '7', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→7 (ongoing learning)`);
     // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
     await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
     await sleep(2500);
     ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `legacy (pre-wire_id, unstamped) message still delivers`);
-    ok(pvOf(I, R.cid) === '5', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(pvOf(I, R.cid) === '7', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
     ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
       `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
   }
@@ -1347,6 +1347,50 @@ async function main() {
     await sleep(2000);
     ok(rcount(I) === c0, 'RC7: unknown kind / mistyped kind / scalar wire_ids — nothing reached the hook');
     ok(I.rejects.length === rejI, 'RC7: and nothing aborted (ignore-success, forward-compat)');
+  }
+
+  CUR = 'RC8 stale-caps self-heal';
+  console.log('\n=== RC8 hybrid gate: stale caps + learned pv>=7 → receipts fire (the upgrade fix) ===');
+  {
+    await mutate(R, '::actor::qa_init_caps', { advertise: ['core.receipts.emit', 'core.receipts.receive'] });
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: ['core.notifications'] });  // stale pre-receipts caps (no opinion)
+    await mutate(R, '::actor::qa_set_contact_pv', { cid: I.cid, pv: 7 });
+    const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc8-selfheal' });
+    await sleep(3000);
+    ok(rcount(I) === c0 + 1, 'RC8: delivered receipt fired despite stale caps (pv>=7 implied receive)');
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 7 });
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: R.cid }).Reduce('state').Visualize() === 'expected',
+      'RC8: expectation = expected via pv>=7 (caps silent)');
+  }
+
+  CUR = 'RC9 explicit opt-out';
+  console.log('\n=== RC9 hybrid gate: caps WITH receipts opinion but no receive → strict opt-out ===');
+  {
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: ['core.receipts.emit'] });  // opinion, no receive
+    await mutate(R, '::actor::qa_set_contact_pv', { cid: I.cid, pv: 7 });
+    const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc9-optout' });
+    await sleep(2500);
+    ok(rcount(I) === c0, 'RC9: NO receipt — explicit caps opinion without receive wins over pv (opt-out respected)');
+  }
+
+  CUR = 'RC10 old peer stays silent';
+  console.log('\n=== RC10 hybrid gate: no caps opinion + pv 5 (old peer) → silent ===');
+  {
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: [] });
+    const c0 = rcount(I);
+    // the OLD peer's message must itself carry the old dialect: the receiver
+    // learns pv from THIS message before gating (that's the self-heal), so a
+    // current-build send_message (stamps 7) cannot emulate a pv-5 peer.
+    await mutate(I, '::actor::qa_send_stamped_message', { target: R.cid, text: 'rc10-oldpeer', pv: 5, wire_id: 'rc10-w1' });
+    await sleep(2500);
+    ok(rcount(I) === c0, 'RC10: NO receipt toward a pv-5 peer (old clients stay silent, zero noise)');
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 5 });
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: R.cid }).Reduce('state').Visualize() === 'unknown',
+      'RC10: expectation = unknown toward a pv-5 peer');
   }
 
   console.log('\n================ SCORECARD ================');

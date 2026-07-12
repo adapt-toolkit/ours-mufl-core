@@ -615,7 +615,8 @@ application actor loads libraries
         }
         if shape == "v5"
         {
-            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name, $pv -> a2a_versions::wire_version, $caps -> ["core.notifications"])).
+            // literal 5: this shape emulates a 0.5.0 sender (wire_version moved on).
+            payload -> (_write ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d), $name -> name, $pv -> 5, $caps -> ["core.notifications"])).
         }
         if shape == "too_old"
         {
@@ -743,6 +744,26 @@ application actor loads libraries
                 encrypted_channel::send_encrypted_tx tgt (
                     $name -> "::a2a_messaging::receive_receipt",
                     $targ -> ($kind -> kind, $wire_ids -> wids, $pv -> a2a_versions::wire_version)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
+    // Emulate an OLD-dialect sender: a stamped message with an arbitrary $pv
+    // (+ wire_id so the receiver's delivered-emission path is actually
+    // evaluated, not short-circuited). Drives the RC10 old-peer-silence cell:
+    // the receiver LEARNS the stamped pv from this very message (learning
+    // precedes the gate — the self-heal mechanism), so presetting maps isn't
+    // enough; the message itself must carry the old dialect.
+    trn qa_send_stamped_message _:($target -> tgt: global_id, $text -> text: str, $pv -> pv: int, $wire_id -> wid: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::actor::receive_message",
+                    $targ -> ($text -> text, $wire_id -> wid, $pv -> pv)
                 ),
                 _return_data ($sent -> TRUE)
             ].
