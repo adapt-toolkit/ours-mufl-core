@@ -1380,9 +1380,11 @@ async function main() {
   console.log('\n=== RC10 hybrid gate: no caps opinion + pv 5 (old peer) → silent ===');
   {
     await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: [] });
-    await mutate(R, '::actor::qa_set_contact_pv', { cid: I.cid, pv: 5 });
     const c0 = rcount(I);
-    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc10-oldpeer' });
+    // the OLD peer's message must itself carry the old dialect: the receiver
+    // learns pv from THIS message before gating (that's the self-heal), so a
+    // current-build send_message (stamps 7) cannot emulate a pv-5 peer.
+    await mutate(I, '::actor::qa_send_stamped_message', { target: R.cid, text: 'rc10-oldpeer', pv: 5, wire_id: 'rc10-w1' });
     await sleep(2500);
     ok(rcount(I) === c0, 'RC10: NO receipt toward a pv-5 peer (old clients stay silent, zero noise)');
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });

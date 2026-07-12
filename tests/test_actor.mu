@@ -750,6 +750,26 @@ application actor loads libraries
         }).
     }
 
+    // Emulate an OLD-dialect sender: a stamped message with an arbitrary $pv
+    // (+ wire_id so the receiver's delivered-emission path is actually
+    // evaluated, not short-circuited). Drives the RC10 old-peer-silence cell:
+    // the receiver LEARNS the stamped pv from this very message (learning
+    // precedes the gate — the self-heal mechanism), so presetting maps isn't
+    // enough; the message itself must carry the old dialect.
+    trn qa_send_stamped_message _:($target -> tgt: global_id, $text -> text: str, $pv -> pv: int, $wire_id -> wid: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::actor::receive_message",
+                    $targ -> ($text -> text, $wire_id -> wid, $pv -> pv)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
     // ---- golden-wire corpus probes (COMPATIBILITY.md release gate) ----
     // One fixture per REGISTERED version per registry, built as the EXACT wire
     // shape that version's sender emits (fixtures-as-code: the payloads carry
