@@ -105,3 +105,12 @@ Crypto/tamper and identity-verification failures remain hard aborts.
 The binding rules (REG-1…6), the OSP declaration, the full registry index, and the wire-
 change PR checklist live in
 [`COMPATIBILITY.md`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/COMPATIBILITY.md).
+
+## Message receipts (core 0.7.0)
+
+Delivery + read confirmations, capability-gated and **fail-closed**: a recipient emits
+`receive_receipt` pings (`$kind "delivered"` on arrival, `"read"` on its get/mark-read path)
+only when it advertises `core.receipts.emit` AND the sender positively advertises
+`core.receipts.receive` — so old clients exchange no receipt traffic at all and the sender's
+per-peer state is simply *unknown*, never *failed*. Details in
+[`COMPATIBILITY.md`](https://github.com/adapt-toolkit/ours-mufl-core/blob/main/COMPATIBILITY.md).

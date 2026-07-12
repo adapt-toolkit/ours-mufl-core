@@ -123,6 +123,7 @@ hand-crafted box, which is the malformed/tamper class where an abort is correct.
 | legacy `accept_contact` args | **acc** | v2 / v3 (+`$joiner_name`) | `$pv`; else `$joiner_name` present ⇒ 3, else 2. Path slated for class-C removal at the next OSP raise |
 | `receive_message` `$targ` | **rmsg** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
 | `receive_file` `$targ` | **rfil** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
+| `receive_receipt` `$targ` (0.7.0) | **rcp** | single version (v1: `$kind`, `$wire_ids`, `$date+`, `$pv+`) | `$pv`; else 7 (surface cannot predate 0.7). Reachable only behind positive `core.receipts.*` caps |
 
 **Deferred surfaces** (tolerant field-by-field readers today; register on their first shape
 change, or when REG-1 is extended repo-wide — owner question SPEC Q9): invite/restore
@@ -151,6 +152,35 @@ pre-0.5-established contacts keep working). Owner-approved fail-open interpretat
 | **B** | new transaction (new inbound name) | new registry, single version; sends gated by CAP-1/`$pv`. MINOR |
 | **C** | change/remove a field, change semantics | BREAKING: parallel transaction (class B) or new registered version with a dual-accept window; old version leaves the union only on an OSP raise. MAJOR |
 | **D** | evolve a signed artifact | mint `vN+1` core metadef beside `vN`; verifiers accept an explicit version set; unknown version **fail-closed** (authz). Never mutate a signed shape |
+
+## Message receipts (core 0.7.0) — capability-gated, fail-closed
+
+Two protocol events on the recipient produce two pings to the message sender, both carried
+by ONE new class-B transaction `::a2a_messaging::receive_receipt`
+(`$kind "delivered"|"read"`, `$wire_ids str[]` — the shared message+file namespace, `$date+`,
+`$pv+`): **delivered** fires atomically inside the accepted
+`receive_message`/`receive_file` transaction (app-hook abort = no receipt); **read** fires on
+the consumer's get/mark-read path via `read_receipt_actions` (readonly trns cannot send, so
+the unread→read MARK is the read event — exact-once for free).
+
+Capabilities (2 flat ids in `a2a_capabilities`, advertised via the new **`$advertise`** init
+param — protocol-surface ids with no control verbs, so the `$supported`
+declared-implies-implemented handler guard doesn't apply to them):
+`core.receipts.emit` ("I will emit both kinds") and `core.receipts.receive` ("send me
+yours"). Delivery-vs-read is wire metadata, not a capability split.
+
+**Gate polarity — deliberately the OPPOSITE of CAP-1:** receipts fail **CLOSED** on
+unknown/absent caps. Emit iff self advertises `emit` AND the peer POSITIVELY advertises
+`receive` in learned `contact_caps`. Old clients advertise neither id ⇒ nothing is ever sent
+to them (nothing they can't parse) and nothing is expected from them — zero transaction
+failures both directions, by construction. Sender-side state is DERIVED
+(`receipt_expectation`: "expected" iff the peer advertises `emit`, else "unknown" — absence
+of a receipt is NEVER failure; no timeout state in core). Ingest is tolerant and never
+load-bearing: unknown `$kind` = future receipt kind (ignore-success), malformed shapes are
+dropped abort-free (rcp M1 checks incl. the list-domain guard), unknown senders get silent
+success, and no receipt is ever emitted for a receipt. Consumer hook
+(`on_receipt_received`, optional, default no-op) contract: application is MONOTONIC per
+(peer, wire_id) on `unknown < sent < delivered < read`.
 
 ## Golden-wire corpus (release gate)
 
