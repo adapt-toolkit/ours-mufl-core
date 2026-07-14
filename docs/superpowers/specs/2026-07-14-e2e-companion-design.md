@@ -55,7 +55,7 @@ metadef e2e_env_v1_t: (
     $session_id -> global_id,   // adapt-derived session id (hex string at runtime)
     $olm_type   -> int,         // 0 = PRE_KEY (establishment inside $ciphertext), 1 = normal ratchet
     $ciphertext -> bin,         // opaque Olm blob
-    $pv         -> int          // wire dialect stamp (= wire_version at send)
+    $pv         -> int+         // wire dialect stamp; NULLABLE in the cast (see $pv note below)
 ).
 metadef e2e_env_t: e2e_env_v1_t.
 e2e_max_version = 8.
@@ -63,11 +63,16 @@ e2e_max_version = 8.
 fn e2e_version_of (raw: any) -> int { pv = peer_pv raw.  return (pv != 0 ?? pv ; 8). }
 
 // Abort-free shape probe (M1): every non-nullable field checked against its runtime domain.
+// $pv: absent tolerated (defaults to 8); present MUST be int — every 0.8.0+ e2e sender stamps a real
+// int $pv, so a present-non-int is malformed -> shape_error (not the sir-style "tolerate as unstamped").
+// This is what keeps the `$pv -> int+` cast abort-free: single-version e2e cannot fall back to an older
+// type that omits $pv (as sir does), so a non-int $pv must be rejected at shape_ok, never reach the cast.
 fn e2e_env_shape_ok (raw: any) -> bool
 {
-    ct = raw $ciphertext.
+    ct = raw $ciphertext.  pv = raw $pv.
     return is_str (raw $session_id) && is_int (raw $olm_type)
-        && ct != NIL && (_typeof ct) == "BINARY".
+        && ct != NIL && (_typeof ct) == "BINARY"
+        && (pv == NIL || is_int pv).
 }
 
 metadef e2e_narrowed_t: ($ok -> bool, $payload -> e2e_env_t+, $err -> version_error_t+).

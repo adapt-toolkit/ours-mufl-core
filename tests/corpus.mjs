@@ -85,6 +85,19 @@ async function main() {
   ok(T(g('acc.v3.ok')) && g('acc.v3.name') === 'Joi', 'acc v3: ok, $joiner_name honored');
   ok(!T(g('acc.old.ok')) && g('acc.old.code') === 'peer_version_unsupported', 'acc below floor: error-as-data');
 
+  console.log('=== corpus: registry e2e (v1 + floor + shape + M1 wrong-domain + future) ===');
+  ok(T(g('e2e.pre.ok')) && g('e2e.pre.v') === '8' && g('e2e.pre.ot') === '0', 'e2e pre-key: ok, dispatched v8, $olm_type=0 round-trips');
+  ok(T(g('e2e.nrm.ok')) && g('e2e.nrm.ot') === '1', 'e2e normal ratchet: ok, $olm_type=1 round-trips');
+  ok(!T(g('e2e.old.ok')) && g('e2e.old.code') === 'peer_version_unsupported', 'e2e $pv=1 (below floor): error-as-data peer_version_unsupported');
+  ok(g('e2e.old.peer_v') === '1' && g('e2e.old.min') === '2' && /too old/.test(g('e2e.old.msg')), 'e2e too-old error carries peer_version=1 min=2, human-readable');
+  ok(!T(g('e2e.bad.ok')) && g('e2e.bad.code') === 'payload_shape_unrecognized' && /no supported wire shape/.test(g('e2e.bad.msg')), 'e2e unrecognized shape: error-as-data payload_shape_unrecognized (distinct msg)');
+  ok(!T(g('e2e.wsid.ok')) && g('e2e.wsid.code') === 'payload_shape_unrecognized', 'e2e mistyped $session_id (int): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('e2e.wot.ok')) && g('e2e.wot.code') === 'payload_shape_unrecognized', 'e2e mistyped $olm_type (str): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('e2e.wct.ok')) && g('e2e.wct.code') === 'payload_shape_unrecognized', 'e2e mistyped $ciphertext (str): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('e2e.wpv.ok')) && g('e2e.wpv.code') === 'payload_shape_unrecognized', 'e2e mistyped $pv (str): malformed discriminator -> shape error-as-data, no cast abort (M1)');
+  ok(T(g('e2e.uns.ok')) && g('e2e.uns.v') === '8' && g('e2e.uns.ot') === '0', 'e2e unstamped (no $pv): tolerated absent-discriminator, defaults to v8, ok (M1)');
+  ok(T(g('e2e.fut.ok')) && g('e2e.fut.ot') === '1', 'e2e $pv=99 (future): narrows as v1 (single registered version), ok');
+
   console.log('=== corpus: strict narrow aborts with the stable message ===');
   let strictMsg = '';
   try { await mutate('::actor::qa_corpus_narrow_strict_old', {}); } catch (e) { strictMsg = String(e.message); }
