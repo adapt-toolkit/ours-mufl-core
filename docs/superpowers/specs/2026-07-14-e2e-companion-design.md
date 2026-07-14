@@ -81,6 +81,15 @@ fn try_narrow_e2e (raw: any) -> e2e_narrowed_t
 }
 ```
 
+**Accepted residual (inherited from `sir`, critic B3):** `$session_id -> global_id` and `safe global_id`
+additionally hex-validates (`a2a_versions.mm:64-69`), while `e2e_env_shape_ok` only checks
+`is_str` (STRING domain). A value that is a valid STRING but **not valid hex** passes shape-ok and then
+aborts inside `raw safe e2e_env_v1_t`. This is the **identical documented residual `sir` carries**
+(`sir_shape_ok` checks `is_str($invite_id)` while the cast is to `global_id`) — the malformed/hostile
+class where a hard abort is the correct outcome (`a2a_versions.mm:67-69`). Consequence for §7 tests:
+the no-abort guarantee is scoped to **well-typed bodies** (old/short/unstamped, well-typed fields); a
+non-hex `$session_id` is the tamper class and MAY abort by design. Do NOT assert *unconditional* no-abort.
+
 Note: `try_narrow_e2e` operates on the **inner `$e2e_envelope`** (after the outer `e2e_signed_message`
 `$emsignature` is verified). Whether the outer `e2e_signed_message` wrapper also gets a registry entry or
 is a fixed 2-field shape read directly in the handler is a **receive-side** concern (adapt's decode hook);
@@ -99,7 +108,10 @@ cap_e2e = "core.e2e".              // "I speak the E2E signed-message envelope +
 Advertise it via the existing `$advertise` list in `init` (app passes `["core.e2e", ...]`). Learned
 per-contact through the existing `learn_contact_version` → `contact_caps` path — **no new learning code**.
 
-Anti-downgrade lives in `a2a_messaging.mm`, mirroring `receipt_gate`'s hybrid, plus a monotonic pin:
+Anti-downgrade lives in `a2a_messaging.mm`, mirroring `receipt_gate`'s hybrid, plus a monotonic pin.
+Three-state routing (not a bare bool) so a real downgrade is **error-as-data**, not a channel `abort`
+(critic N2 — align with Addition A discipline, which the rest of this repo uses in the send/negotiation
+path: `receipt_gate` returns `bool` and never aborts):
 
 ```mufl
 m_contact_e2e is (global_id ->> bool) = (,).     // highest-seen E2E state per contact (positive-evidence, monotone)
@@ -109,39 +121,58 @@ fn note_e2e_seen (cid: global_id, caps: str[]) -> nil
     if caps_contains caps a2a_capabilities::cap_e2e { m_contact_e2e cid -> TRUE. }
 }
 
-fn use_e2e (cid: global_id) -> bool
+// "e2e" -> send E2E ; "box" -> unchanged static-box fallback ; "downgrade_refused" -> fail-closed, typed refusal
+fn e2e_route (cid: global_id) -> str
 {
     seen = (m_contact_e2e cid) == TRUE.                          // ever advertised core.e2e
     v2   = peer_has_e2e_bundle cid.                              // AD v2 with a $e2e_bundle present
-    if seen && v2 != TRUE { abort "E2E downgrade refused for a peer previously seen at E2E." when TRUE. }
-    return seen || v2.                                           // first-contact v1-only peer => FALSE (correct floor)
+    if seen && v2 != TRUE { return "downgrade_refused". }        // known-E2E peer with no current bundle: fail closed
+    return ((seen || v2) ?? "e2e" ; "box").                     // first-contact v1-only peer => "box" (correct floor)
 }
 ```
 
 `note_e2e_seen` is called from the same inbound legs that already call `learn_contact_version` (so the
 pin is set from the same positive evidence). `peer_has_e2e_bundle` reads `peer_ads[cid]` (populated by
-adapt's `process_address_document`). The `abort` on a real downgrade is deliberate: refusing to send is
-strictly safer than silently boxing a peer the user believes is E2E. A brand-new peer that is genuinely
-v1-only (never advertised `core.e2e`, no v2 bundle) yields `FALSE` and takes the unchanged static-box path.
+adapt's `process_address_document`). On `"downgrade_refused"` the send trn returns a typed
+`_notify_agent ($protocol_error, ...)` (an `e2e_downgrade_refused` refusal) and emits **no send** — the
+app surfaces "this contact was E2E and can't currently be reached securely; re-verify" rather than
+silently boxing a peer the user believes is E2E (fail-closed) **and** without a hard `abort` that would
+crash the transaction on a legitimate bundle-loss/migration (avoids the DoS the critic flagged). A
+brand-new genuinely-v1-only peer yields `"box"` and takes the unchanged static-box path.
 
 ## 5. Send-side wiring (`a2a_messaging.mm`)
 
-Routing decision at the existing send seam. E2E replaces the static box (you do **not** static-box an
-already-E2E-encrypted payload); it carries its own outer `$emsignature` for `$from` binding.
+Routing at the existing send seam, keyed on `e2e_route cid` (§4). E2E replaces the static box (you do
+**not** static-box an already-E2E-encrypted payload).
+
+`$from` authentication note (critic B2): a **bare** send is already sender-authenticated — `#77` signs
+every envelope's `$ptsignature` and rejects unsigned/forged origin, so `get_external_envelope_or_abort()
+$from` **is** the authenticated sender regardless of any box (`a2a_messaging.mm:1844-1847`). The E2E
+`$emsignature` therefore does **not** provide `$from` binding; per contract line 31 it binds the
+**envelope contents** to that already-authenticated `$from` (prevents a MITM re-wrapping ciphertext under
+a different envelope). Verification of `$emsignature` is **receive-side (adapt)**; this repo only builds it.
+
+Real send primitive is `transaction::action::send` returned inside `transaction::success [...]` with
+`_save_state` (critic B1; template `a2a_messaging.mm:1742-1754`) — `send_bare`/`send_a2a` do not exist:
 
 ```mufl
-// use_e2e cid == TRUE branch (new); else the unchanged encrypted_channel::send_encrypted_tx fallback.
-enc = e2e::encrypt_to cid (_to_bin tx_body).       // adapt-STATEFUL: reads+commits adapt-held session[cid]
+// route == "e2e" branch. tx name is a bound constant (cf. complete_invite_tx); MUST equal adapt's decode-branch name.
+receive_e2e_message_tx = "::a2a_messaging::receive_e2e_message".   // module-const, see N4
+
+enc = e2e::encrypt_to cid (_to_bin tx_body).       // adapt-STATEFUL: reads+commits adapt-held session[cid] (§Q1)
 env = ($session_id -> enc $session_id, $olm_type -> enc $olm_type,
        $ciphertext -> enc $ciphertext, $pv -> a2a_versions::wire_version).
-sig = key_storage::default_sign (_value_id env).   // outer sender-auth over the WHOLE envelope (#77 pattern)
-send_bare cid "receive_e2e_message" ($e2e_envelope -> env, $emsignature -> sig).
+sig = key_storage::default_sign (_value_id env).   // binds envelope contents to the #77-authenticated $from
+return transaction::success [
+    transaction::action::send cid ($name -> receive_e2e_message_tx,
+                                   $targ -> ($e2e_envelope -> env, $emsignature -> sig)),
+    _save_state NIL
+].
 ```
 
-The E2E message is sent **bare** (not through `send_encrypted_tx`) because the E2E envelope *is* the
-confidentiality+auth layer; its `$emsignature` over `_value_id(env)` binds the sender. First send to a
-new peer establishes the session first (§Q2). On `use_e2e cid == FALSE`, the code path is exactly today's
-`encrypted_channel::send_encrypted_tx` — untouched.
+First send to a new peer establishes the session first (§Q2). `route == "box"` → exactly today's
+`encrypted_channel::send_encrypted_tx` path, untouched. `route == "downgrade_refused"` → the typed
+`_notify_agent ($protocol_error, ...)` refusal from §4, no send.
 
 ## 6. Version + wire bump
 
@@ -166,13 +197,17 @@ new peer establishes the session first (§Q2). On `use_e2e cid == FALSE`, the co
 These are the adapt↔ours seam questions the design depends on. Recommendations given; confirmation needed
 before the corresponding code is final.
 
-- **Q1 — Send-side session authority (blocking the §5 call shape).** The state-ownership note says adapt
-  holds `m_e2e_account`/`m_e2e_sessions[cid]` so the **receive** decode hook commits atomically. An Olm
-  session is a *single* bidirectional blob; if ours also held a send-side copy the two would desync the
-  ratchet. So send must route through an adapt **stateful** surface. **Recommend:**
-  `e2e::encrypt_to(cid, plaintext) -> ($ciphertext, $olm_type, $session_id)` where adapt reads+commits its
-  own session. (The contract's literal `persist session'` SEND block reflects the earlier app-held model
-  and cannot coexist with adapt-held receive state.) Confirm the exact adapt send-surface signature.
+- **Q1 — Single session-state owner (blocks the §5 call shape).** The real invariant is **one owner per
+  peer's Olm session** (a session pickle is a *single bidirectional* blob; a send-side ratchet advance
+  mutates the same chain state the receive side reads, so two independently-persisted copies desync).
+  The contract is internally inconsistent about *who* owns it: the SEND block (`:19-25`) shows app-held
+  `e2e::encrypt(session,...)` + `persist $session'`, while State-ownership (`:50-54`) says **adapt** holds
+  `m_e2e_sessions[cid]` for the decode-seam decrypt. Two coherent single-owner models exist: **(a)** adapt
+  owns both directions — ours send calls a stateful `e2e::encrypt_to(cid, plaintext) -> ($ciphertext,
+  $olm_type, $session_id)` (recommended, matches the LOCKED contract's adapt-held receive); **(b)** ours
+  owns both directions and decrypts in a **mutating handler** (not the decode seam), per
+  `e2e-mufl-sketch.md:112-152` / `e2e-ergonomic-api.md:33-45` — also desync-free. **Ask Dev-10 (via FC):
+  confirm which single owner, and the exact send-side surface signature.** Design assumes (a).
 - **Q2 — Session establishment.** Does ours call `e2e::create_session(cid, bundle)` (reading
   `peer_ads[cid].$e2e_bundle`) before first encrypt, or does adapt establish lazily inside `encrypt_to`
   given `cid`? **Recommend** adapt-lazy (ours only ensures the v2 bundle is present); confirm.
@@ -182,6 +217,10 @@ before the corresponding code is final.
 - **Q4 — Versioning + acceptance harness.** (a) OK to ship as core **0.8.0 / wire_version 8** off main,
   with the group-chat 0.8.0 collision flagged for merge sequencing? (b) How is the mixed-unit
   (old-unit↔new-unit, unit-hash-change) zero-reject gate run — outer ours-mcp harness, or add to `tests/`?
+- **Q5 — Wire tx name (critic N4).** The contract marker is *presence of `$e2e_envelope`* (`:16`), not the
+  tx name, but the send tx name must still match adapt's decode branch. Design uses
+  `receive_e2e_message`; the sketch used `e2e_message`. **Confirm the exact tx name with Dev-10** before
+  the send side is finalized.
 
 ## 9. Build order (feeds the implementation plan)
 
