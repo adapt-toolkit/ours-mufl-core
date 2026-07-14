@@ -828,30 +828,34 @@ application actor loads libraries
         a3 = a2a_versions::try_narrow_acc ($invite_id -> iid, $joiner_ad -> my_ad, $joiner_name -> "Joi").
         ao = a2a_versions::try_narrow_acc ($invite_id -> iid, $joiner_ad -> my_ad, $pv -> 1).
 
-        // registry "e2e" — t_e2e_envelope: single version, LOAD-BEARING (sir-style
-        // payload cast). Cases mirror sir's abort-free (M1) matrix.
+        // registry "e2e" — e2e_signed_message VARIANT ($e2e_envelope -> t_e2e_envelope,
+        // $emsignature): single version, LOAD-BEARING (sir-style payload cast). The $pv
+        // discriminator rides inside $e2e_envelope. Cases mirror sir's abort-free (M1) matrix.
         ct = _hex_string_to_binary "00112233445566778899aabbccddeeff".
         sid = _new_id "qa e2e session".
-        e_pre = ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct, $pv -> 8).   // PRE_KEY, stamped
-        e_nrm = ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 8).   // normal ratchet
-        e_old = ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 1).   // below floor
-        e_bad = ($nope -> 1).                                                        // unrecognized shape
-        // M1 wrong-domain: present-but-mistyped NON-nullable fields -> shape error, never a cast abort.
-        e_wsid = ($session_id -> 42,  $olm_type -> 1, $ciphertext -> ct, $pv -> 8).  // $session_id int
-        e_wot  = ($session_id -> sid, $olm_type -> "one", $ciphertext -> ct, $pv -> 8). // $olm_type str
-        e_wct  = ($session_id -> sid, $olm_type -> 1, $ciphertext -> "notbin", $pv -> 8). // $ciphertext str
-        // Mistyped $pv (str): every e2e sender stamps an int $pv, so a present-non-int is
+        sig = key_storage::default_sign (_value_id sid).
+        e_pre = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct, $pv -> 8), $emsignature -> sig).  // PRE_KEY
+        e_nrm = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 8), $emsignature -> sig).  // normal ratchet
+        e_old = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 1), $emsignature -> sig).  // inner $pv below floor
+        e_bad = ($nope -> 1).                                                                                              // no $e2e_envelope marker
+        e_nos = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct, $pv -> 8)).                      // missing $emsignature
+        // M1 wrong-domain: present-but-mistyped NON-nullable inner fields -> shape error, never a cast abort.
+        e_wsid = ($e2e_envelope -> ($session_id -> 42,  $olm_type -> 1, $ciphertext -> ct, $pv -> 8), $emsignature -> sig).  // $session_id int
+        e_wot  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> "one", $ciphertext -> ct, $pv -> 8), $emsignature -> sig). // $olm_type str
+        e_wct  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 1, $ciphertext -> "notbin", $pv -> 8), $emsignature -> sig). // $ciphertext str
+        // Mistyped inner $pv (str): every e2e sender stamps an int $pv, so a present-non-int is
         // malformed -> shape_error (error-as-data, abort-free), NOT tolerated as unstamped.
-        e_wpv  = ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct, $pv -> "eight").
-        // Unstamped (no $pv): the tolerated absent-discriminator path -> defaults to v8, ok.
-        e_uns  = ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct).
-        // Future dialect ($pv=99): single registered version -> narrows as v1 (class-A forward compat).
-        e_fut  = ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 99).
+        e_wpv  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct, $pv -> "eight"), $emsignature -> sig).
+        // Unstamped inner (no $pv): the tolerated absent-discriminator path -> defaults to v8, ok.
+        e_uns  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct), $emsignature -> sig).
+        // Future dialect (inner $pv=99): single registered version -> narrows as v1 (class-A forward compat).
+        e_fut  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 99), $emsignature -> sig).
 
         ep = a2a_versions::try_narrow_e2e (e_pre as any).
         en = a2a_versions::try_narrow_e2e (e_nrm as any).
         eo = a2a_versions::try_narrow_e2e (e_old as any).
         eb = a2a_versions::try_narrow_e2e (e_bad as any).
+        ens = a2a_versions::try_narrow_e2e (e_nos as any).
         ews = a2a_versions::try_narrow_e2e (e_wsid as any).
         ewo = a2a_versions::try_narrow_e2e (e_wot as any).
         ewc = a2a_versions::try_narrow_e2e (e_wct as any).
@@ -888,16 +892,17 @@ application actor loads libraries
                 $old -> ($ok -> (ao $ok), $code -> (((ao $err)?) $code))
             ),
             $e2e -> (
-                $pre -> ($ok -> (ep $ok), $v -> (a2a_versions::e2e_version_of (e_pre as any)), $ot -> (((ep $payload)?) $olm_type)),
-                $nrm -> ($ok -> (en $ok), $ot -> (((en $payload)?) $olm_type)),
+                $pre -> ($ok -> (ep $ok), $v -> (a2a_versions::e2e_version_of (e_pre as any)), $ot -> (((ep $payload)?) $e2e_envelope $olm_type)),
+                $nrm -> ($ok -> (en $ok), $ot -> (((en $payload)?) $e2e_envelope $olm_type)),
                 $old -> ($ok -> (eo $ok), $code -> (((eo $err)?) $code), $peer_v -> (((eo $err)?) $peer_version), $min -> (((eo $err)?) $min_supported), $msg -> (((eo $err)?) $message)),
                 $bad -> ($ok -> (eb $ok), $code -> (((eb $err)?) $code), $msg -> (((eb $err)?) $message)),
+                $nos -> ($ok -> (ens $ok), $code -> (((ens $err)?) $code)),
                 $wsid -> ($ok -> (ews $ok), $code -> (((ews $err)?) $code)),
                 $wot -> ($ok -> (ewo $ok), $code -> (((ewo $err)?) $code)),
                 $wct -> ($ok -> (ewc $ok), $code -> (((ewc $err)?) $code)),
                 $wpv -> ($ok -> (ewp $ok), $code -> (((ewp $err)?) $code)),
-                $uns -> ($ok -> (eu $ok), $v -> (a2a_versions::e2e_version_of (e_uns as any)), $ot -> (((eu $payload)?) $olm_type)),
-                $fut -> ($ok -> (ef $ok), $ot -> (((ef $payload)?) $olm_type))
+                $uns -> ($ok -> (eu $ok), $v -> (a2a_versions::e2e_version_of (e_uns as any)), $ot -> (((eu $payload)?) $e2e_envelope $olm_type)),
+                $fut -> ($ok -> (ef $ok), $ot -> (((ef $payload)?) $e2e_envelope $olm_type))
             )
         ) ].
     }
@@ -942,4 +947,5 @@ application actor loads libraries
             _return_data ($sent -> TRUE)
         ].
     }
+
 }

@@ -88,6 +88,13 @@ library a2a_capabilities loads libraries
     cap_receipts_emit    = "core.receipts.emit".    // "I WILL emit receipts (delivered on arrival, read on my get path)"
     cap_receipts_receive = "core.receipts.receive". // "I consume receipts — send me yours"
 
+    // core 0.8.0 — end-to-end encryption (Olm double-ratchet signed-message
+    // envelope). PROTOCOL-surface id with NO control verbs (cf. core.notifications):
+    // "I speak the e2e_signed_message envelope and publish an AD v2 $e2e_bundle."
+    // Gates E2E traffic + drives monotonic anti-downgrade (a2a_messaging::e2e_route);
+    // never authz (REG-6). Crypto + session state live in the adapt `e2e` library.
+    cap_e2e = "core.e2e".
+
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
     // these sentinels, and writes interpret them. "$needs_reentry" is the

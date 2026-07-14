@@ -90,7 +90,8 @@ async function main() {
   ok(T(g('e2e.nrm.ok')) && g('e2e.nrm.ot') === '1', 'e2e normal ratchet: ok, $olm_type=1 round-trips');
   ok(!T(g('e2e.old.ok')) && g('e2e.old.code') === 'peer_version_unsupported', 'e2e $pv=1 (below floor): error-as-data peer_version_unsupported');
   ok(g('e2e.old.peer_v') === '1' && g('e2e.old.min') === '2' && /too old/.test(g('e2e.old.msg')), 'e2e too-old error carries peer_version=1 min=2, human-readable');
-  ok(!T(g('e2e.bad.ok')) && g('e2e.bad.code') === 'payload_shape_unrecognized' && /no supported wire shape/.test(g('e2e.bad.msg')), 'e2e unrecognized shape: error-as-data payload_shape_unrecognized (distinct msg)');
+  ok(!T(g('e2e.bad.ok')) && g('e2e.bad.code') === 'payload_shape_unrecognized' && /no supported wire shape/.test(g('e2e.bad.msg')), 'e2e no $e2e_envelope marker: error-as-data payload_shape_unrecognized (distinct msg)');
+  ok(!T(g('e2e.nos.ok')) && g('e2e.nos.code') === 'payload_shape_unrecognized', 'e2e missing $emsignature: shape error-as-data (variant requires the outer sig)');
   ok(!T(g('e2e.wsid.ok')) && g('e2e.wsid.code') === 'payload_shape_unrecognized', 'e2e mistyped $session_id (int): shape error-as-data, no cast abort (M1)');
   ok(!T(g('e2e.wot.ok')) && g('e2e.wot.code') === 'payload_shape_unrecognized', 'e2e mistyped $olm_type (str): shape error-as-data, no cast abort (M1)');
   ok(!T(g('e2e.wct.ok')) && g('e2e.wct.code') === 'payload_shape_unrecognized', 'e2e mistyped $ciphertext (str): shape error-as-data, no cast abort (M1)');
@@ -103,6 +104,12 @@ async function main() {
   try { await mutate('::actor::qa_corpus_narrow_strict_old', {}); } catch (e) { strictMsg = String(e.message); }
   ok(/too old/.test(strictMsg) && /minimum supported is v2/.test(strictMsg),
     `strict narrow on below-floor payload aborts with the registry message (got: ${strictMsg.split('\n')[0].slice(0, 120)})`);
+
+  // NOTE: the e2e caps/anti-downgrade routing (a2a_messaging::e2e_route) is
+  // production code that compiles clean, but its MUFL unit test cannot live in
+  // this test_actor — adding a state-touching trn tips test_actor over the
+  // meta-stage type-reduction ceiling (1M steps). Routing is covered by the
+  // Step-5 mixed-unit integration gate (which needs adapt's compiled e2e unit).
 
   console.log('\n================ CORPUS ================');
   if (scorecard.length === 0) console.log('CORPUS: ALL GREEN');

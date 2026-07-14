@@ -109,6 +109,13 @@ library a2a_messaging loads libraries
     // guarded on import (pre-0.5 exports import unchanged).
     contact_pv is (global_id ->> int) = (,).
     contact_caps is (global_id ->> str[]) = (,).
+    // core 0.8.0: monotonic E2E anti-downgrade pin (SPEC §4). Positive-evidence,
+    // set TRUE the first time a peer advertises core.e2e and NEVER cleared — it
+    // CANNOT be derived from contact_caps (which is last-seen-wins, so a later
+    // caps-absent inbound would erase the evidence and permit a silent downgrade).
+    // Exported so the guarantee survives restart/migration. Gates send-side routing
+    // (e2e_route), never authz (REG-6).
+    contact_e2e_seen is (global_id ->> bool) = (,).
     // core 3.0: invites I generated, keyed by invite id. Holds the NON-secret
     // per-invite material — the assigned contact name ("" = none), the ephemeral
     // encryption PUBLIC key shipped in the slim invite, and the crypto scheme id.
@@ -613,6 +620,46 @@ library a2a_messaging loads libraries
         return ($ad -> address_document::get_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
     }
 
+    // ---- core 0.8.0 E2E capability + monotonic anti-downgrade ----------------
+    // Positive-evidence pin: the FIRST time a peer's advertised caps include
+    // core.e2e, mark it — and never unmark. Called from every version-learning
+    // leg (via learn_contact_version), so the pin tracks the same evidence as
+    // contact_caps but MONOTONICALLY (contact_caps is last-seen-wins and would
+    // lose the evidence on a caps-absent inbound). A no-op when caps lack core.e2e.
+    // Inline cap-scan (not caps_contains, which is defined later — MUFL resolves
+    // symbols define-before-use).
+    fn note_e2e_seen (cid: global_id, caps: str[]) -> nil
+    {
+        sc caps -- ( -> c) { if c == a2a_capabilities::cap_e2e { contact_e2e_seen cid -> TRUE.  return. } }
+    }
+    fn e2e_pinned (cid: global_id) -> bool { return (contact_e2e_seen cid) == TRUE. }
+
+    // Does the peer's cached AD carry an AD v2 $e2e_bundle (adapt owns the type
+    // and populates it via process_address_document)? Read via `as any` so this
+    // compiles against a pre-v2 address_document type and lights up once adapt's
+    // AD v2 lands. NIL/absent -> FALSE (no bundle -> cannot establish a session).
+    fn peer_has_e2e_bundle (cid: global_id) -> bool
+    {
+        ad = peer_ads cid.
+        if ad == NIL { return FALSE. }
+        return (((ad?) as any) $identity $e2e_bundle) != NIL.
+    }
+
+    // Send-side routing (three-state, error-as-data — NOT a hard abort, per
+    // Addition A discipline; cf. receipt_gate which returns without aborting):
+    //   "e2e"               -> send the e2e_signed_message envelope
+    //   "box"               -> first-contact / genuinely-v1 peer: unchanged static box
+    //   "downgrade_refused" -> peer once seen at E2E but no current v2 bundle:
+    //                          fail CLOSED (never silently box a known-E2E peer),
+    //                          surfaced as a typed refusal by the send trn.
+    fn e2e_route (cid: global_id) -> str
+    {
+        seen = e2e_pinned cid.
+        v2   = peer_has_e2e_bundle cid.
+        if seen && v2 != TRUE { return "downgrade_refused". }
+        return ((seen || v2) ?? "e2e" ; "box").
+    }
+
     // ---- core 0.5.0 versioning helpers ---------------------------------------
     // Passive version learning (SPEC §3): record the peer's wire dialect (and
     // its advertised capability ids, when it piggybacked any) off an inbound
@@ -623,7 +670,7 @@ library a2a_messaging loads libraries
     {
         prev = contact_pv cid.
         if prev == NIL || prev? != pv { contact_pv cid -> pv. }
-        if (_count caps|) != 0 { contact_caps cid -> caps. }
+        if (_count caps|) != 0 { contact_caps cid -> caps.  note_e2e_seen cid caps. }
     }
 
     // Owner Addition B: the inviter-facing, render-ready message for a version-
@@ -2359,7 +2406,8 @@ library a2a_messaging loads libraries
             $format_version  -> core_format_version,
             $deferred_msgs   -> deferred_msgs,
             $contact_pv      -> contact_pv,
-            $contact_caps    -> contact_caps
+            $contact_caps    -> contact_caps,
+            $contact_e2e_seen -> contact_e2e_seen
         ).
     }
 
@@ -2471,6 +2519,12 @@ library a2a_messaging loads libraries
         if (data $contact_caps) != NIL
         {
             contact_caps -> (data $contact_caps) safe (global_id ->> str[]).
+        }
+        // core 0.8.0: E2E anti-downgrade pin (absent from pre-0.8 exports →
+        // stays empty; re-learned positively from inbound core.e2e evidence).
+        if (data $contact_e2e_seen) != NIL
+        {
+            contact_e2e_seen -> (data $contact_e2e_seen) safe (global_id ->> bool).
         }
 
         // Re-register every peer's keys so encrypted channels keep working after

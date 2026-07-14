@@ -492,17 +492,18 @@ library a2a_versions
     }
 
     // ========================================================================
-    // REGISTRY "e2e" — t_e2e_envelope, the end-to-end-encrypted message body
-    // (core 0.8.0, class-B NEW surface). Single registered version, but
-    // LOAD-BEARING (the handler acts on the narrowed payload), so it follows the
-    // `sir` shape — returns $payload with an exact `safe` cast — NOT the
-    // best-effort `rcp` ignore shape. $ciphertext is an OPAQUE Olm blob the core
-    // never parses; all crypto + session state live in the adapt `e2e` library.
-    // Reachable only behind the core.e2e cap + AD v2 bundle; the floor + shape
-    // guards here are defense-in-depth so a downgraded/hostile peer that emits an
-    // e2e_signed_message degrades as error-as-data (Addition A), never a cast
-    // abort (the fix-3 class). See docs/superpowers/specs/2026-07-14-e2e-companion-design.md.
+    // REGISTRY "e2e" — e2e_signed_message, the end-to-end-encrypted message
+    // VARIANT (core 0.8.0, class-B NEW surface). The decode branch (adapt) keys
+    // on presence of the $e2e_envelope MARKER field, NOT a tx name; ours
+    // registers the wire variant so an old/hostile unit narrows it as
+    // error-as-data instead of a SAFE-cast crash (the fix-3 class). Single
+    // registered version, LOAD-BEARING (returns $payload via an exact `safe`
+    // cast, `sir`-style — not the best-effort `rcp` ignore shape). $ciphertext is
+    // an OPAQUE Olm blob the core never parses; all crypto + session state live
+    // in the adapt `e2e` library, which also owns the receive-side decrypt+verify.
     // ========================================================================
+    // The INNER opaque body (contract `t_e2e_envelope`). $pv rides HERE — it is
+    // the version discriminator for the whole signed message.
     metadef e2e_env_v1_t: (
         $session_id -> global_id,   // adapt-derived session id (hex string at runtime)
         $olm_type   -> int,         // 0 = PRE_KEY (establishment inside $ciphertext), 1 = normal ratchet
@@ -510,36 +511,59 @@ library a2a_versions
         $pv         -> int+         // wire dialect stamp (= wire_version at send); nullable in the cast so an
                                     // unstamped body narrows (shape_ok guards present-non-int -> shape_error)
     ).
-    metadef e2e_env_t:      e2e_env_v1_t.
-    metadef e2e_versions_t: [e2e_env_v1_t].
+    // The registered WIRE MESSAGE VARIANT (contract `e2e_signed_message`). Both
+    // fields are `any`: the inner envelope is fully validated by e2e_env_shape_ok
+    // BEFORE the cast (exactly as `sir` validates then leaves $ad `any`), and
+    // $emsignature — the outer sender-auth (default_sign over _value_id(env),
+    // a crypto_signature on the wire) — is verified by adapt's decode hook, not
+    // ours. Keeping both `any` makes the cast a flat abort-free pass-through and
+    // avoids a nested-metadef type-level reduction. e2e_env_v1_t above documents
+    // the inner shape (used by the send-side builder + e2e_env_shape_ok's reads).
+    metadef e2e_signed_message_v1_t: (
+        $e2e_envelope -> any,
+        $emsignature  -> any
+    ).
+    metadef e2e_msg_t:      e2e_signed_message_v1_t.
+    metadef e2e_versions_t: [e2e_signed_message_v1_t].
     e2e_max_version = 8.
 
-    // $pv when stamped; unstamped defaults to e2e's introduction dialect (8) —
-    // an e2e envelope only exists 0.8.0+ (cf. rcp defaulting to its own 7).
+    // Discriminator lives INSIDE $e2e_envelope. Unstamped defaults to e2e's
+    // introduction dialect (8) — an e2e envelope only exists 0.8.0+ (cf. rcp -> 7).
     fn e2e_version_of (raw: any) -> int
     {
-        pv = peer_pv raw.
+        env = raw $e2e_envelope.
+        if env == NIL { return 8. }             // no $e2e_envelope marker -> default; shape_ok rejects it
+        pv = peer_pv env.
         return (pv != 0 ?? pv ; 8).
     }
 
-    // Abort-free shape probe (M1): every NON-nullable field checked against its
-    // runtime domain before the cast. Accepted residual (as `sir`): `safe
-    // global_id` additionally hex-validates, so a valid-STRING-but-non-hex
+    // Abort-free INNER-envelope probe (M1): every NON-nullable field checked
+    // against its runtime domain before the cast. Accepted residual (as `sir`):
+    // `safe global_id` additionally hex-validates, so a valid-STRING-but-non-hex
     // $session_id passes here then aborts in the cast — the tamper class, where a
     // hard abort is correct (:64-69).
-    fn e2e_env_shape_ok (raw: any) -> bool
+    fn e2e_env_shape_ok (env: any) -> bool
     {
-        ct = raw $ciphertext.
-        pv = raw $pv.
+        ct = env $ciphertext.
+        pv = env $pv.
         // $pv: absent is tolerated (defaults to 8 in e2e_version_of); present MUST be an int.
         // Every 0.8.0+ e2e sender stamps a real int $pv, so a present-non-int is malformed ->
         // shape_error (error-as-data), which also keeps the `$pv -> int+` cast abort-free.
-        return is_str (raw $session_id) && is_int (raw $olm_type)
+        return is_str (env $session_id) && is_int (env $olm_type)
             && ct != NIL && (_typeof ct) == "BINARY"
             && (pv == NIL || is_int pv).
     }
 
-    metadef e2e_narrowed_t: ($ok -> bool, $payload -> e2e_env_t+, $err -> version_error_t+).
+    // Whole-variant shape: the $e2e_envelope MARKER present + a valid inner
+    // envelope + an $emsignature present (its crypto domain is adapt's to verify).
+    fn e2e_msg_shape_ok (raw: any) -> bool
+    {
+        env = raw $e2e_envelope.
+        if env == NIL { return FALSE. }
+        return e2e_env_shape_ok env && (raw $emsignature) != NIL.
+    }
+
+    metadef e2e_narrowed_t: ($ok -> bool, $payload -> e2e_msg_t+, $err -> version_error_t+).
 
     // REG-4 dispatch-then-narrow, error-as-data (Addition A). Single registered
     // version: any $pv >= floor with a valid shape narrows as v1 (class-A forward
@@ -551,15 +575,15 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "e2e" v e2e_max_version).
         }
-        if e2e_env_shape_ok raw != TRUE
+        if e2e_msg_shape_ok raw != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "e2e" v e2e_max_version).
         }
-        return ($ok -> TRUE, $payload -> raw safe e2e_env_v1_t, $err -> NIL).
+        return ($ok -> TRUE, $payload -> raw safe e2e_signed_message_v1_t, $err -> NIL).
     }
 
     // Strict form — same dispatch, aborts with the stable surface-named message.
-    fn narrow_e2e (raw: any) -> e2e_env_t
+    fn narrow_e2e (raw: any) -> e2e_msg_t
     {
         r = try_narrow_e2e raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
