@@ -22,10 +22,11 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
 
 ## The wire version id (`$pv`)
 
-- `wire_version = 7` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
+- `wire_version = 8` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
   rcp/receipts surface registered in 0.7 warranted the bump; the initial 0.7.0 under-bump left
-  pre-receipts contacts permanently receipt-gated, the fixed single-tick bug). Monotone; bump
-  **only** when a wire surface registers a new versioned type — not on every release.
+  pre-receipts contacts permanently receipt-gated, the fixed single-tick bug; 0.8.0 stamps `8` —
+  the **e2e** signed-message surface registered in 0.8). Monotone; bump **only** when a wire
+  surface registers a new versioned type — not on every release.
 - Stamped on every core-originated send: cleartext `$targ` envelopes **and** inside the
   boxed identity-bundle payloads (invite legs 1/3, restore legs 1/2).
 - Absence ⇒ pre-0.5 peer; the registry's per-surface **shape-inference rule** applies.
@@ -126,6 +127,7 @@ hand-crafted box, which is the malformed/tamper class where an abort is correct.
 | `receive_message` `$targ` | **rmsg** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
 | `receive_file` `$targ` | **rfil** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
 | `receive_receipt` `$targ` (0.7.0) | **rcp** | single version (v1: `$kind`, `$wire_ids`, `$date+`, `$pv+`) | `$pv`; else 7 (surface cannot predate 0.7). Reachable only behind positive `core.receipts.*` caps |
+| `e2e_signed_message` variant (0.8.0) | **e2e** | single version (v1: `$e2e_envelope` = `t_e2e_envelope`(`$session_id`,`$olm_type`,`$ciphertext`,`$pv+`), `$emsignature`) | inner `$e2e_envelope.$pv`; else 8 (surface cannot predate 0.8). Reachable only behind the `core.e2e` cap + AD v2 bundle; decode branch keys on the `$e2e_envelope` marker |
 
 **Deferred surfaces** (tolerant field-by-field readers today; register on their first shape
 change, or when REG-1 is extended repo-wide — owner question SPEC Q9): invite/restore

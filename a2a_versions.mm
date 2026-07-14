@@ -40,7 +40,11 @@ library a2a_versions
     // shipped still stamping 5, which left pre-receipts contacts permanently
     // gated (caps only re-learn on invite/restore legs — the owner-reported
     // single-tick bug).
-    wire_version = 7.
+    // 8: the e2e surface (e2e_signed_message) registered in 0.8 — a peer whose
+    // learned dialect is >= 8 is KNOWN to parse the E2E signed-message envelope,
+    // the belt to the core.e2e-cap suspenders for send-side routing (mirrors the
+    // receipts -> 7 precedent). Additive; no existing >= 7 gate changes (8 >= 7).
+    wire_version = 8.
     // The version floor: OSP (oldest supported peer) = core 0.2.0 -> 2.
     // Raising this = an owner decision recorded in COMPATIBILITY.md (drop the
     // v2 types from the unions + prune the corpus — a visible, reviewed act).
