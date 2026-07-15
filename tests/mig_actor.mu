@@ -168,6 +168,35 @@ application actor loads libraries
     trn readonly qa_e2e_active _:($cid -> cid: global_id) { return ($sid -> (e2e::active_session_id cid)). }
     trn readonly qa_e2e_staged _:($cid -> cid: global_id) { return ($sid -> (e2e::staged_session_id cid)). }
 
+    // ---- decode_migration_envelope GUARD matrix (point-1 divergence + binding + forgery/replay) ----
+    // This packet's OWN address document (e2e bundle + sign keys), so a receiver can authenticate a
+    // migration envelope as coming from this cid (the sender AD decode_migration_envelope binds to).
+    trn readonly qa_produce_ad _ { return ($ad -> (_write (address_document::produce_my_address_document()))). }
+    // Encrypt on the STAGED session and return the FULL e2e envelope + emsig (blobs), so the driver
+    // can feed them (and tampered variants) to qa_mig_decode.
+    trn qa_mig_enc_full _:($cid -> cid: global_id, $pt -> pt: bin)
+    {
+        env = e2e::encrypt_staged cid pt.
+        return transaction::success [ _return_data ($env -> (_write (env $e2e_envelope)), $emsig -> (_write (env $emsignature))) ].
+    }
+    // Drive e2e::decode_migration_envelope with driver-supplied (tamperable) from/to/AD/env/emsig.
+    // Forgery — bad wire_pv (S2), tampered/foreign emsig or wrong $to (S1), AD.cid≠from_cid (binding)
+    // — ABORTS the tx (§1.1); an Olm-level failure / replayed pre-key returns $ok=FALSE. Proves the
+    // shared S1/S2 path is REAL (not a no-op → the recv_authenticated divergence guard) and that the
+    // forgery-abort vs replay-reject split + decode_migration_envelope's own binding gates hold.
+    // pv_override >= 0 rebuilds the envelope with that $pv (to exercise the S2 dialect check).
+    trn qa_mig_decode _:($from -> from_cid: global_id, $to -> to_cid: global_id, $ad -> ad_blob: bin, $env -> env_blob: bin, $emsig -> emsig_blob: bin, $pv_override -> pvo: int)
+    {
+        ad = (_read_or_abort ad_blob) safe address_document_types::t_address_document.
+        e0 = (_read_or_abort env_blob) safe e2e::t_e2e_envelope.
+        emsig = (_read_or_abort emsig_blob) safe crypto_signature.
+        env is e2e::t_e2e_envelope+ = e0.
+        if pvo >= 0 { env -> ( $session_id -> ((e0?) $session_id), $olm_type -> ((e0?) $olm_type), $ciphertext -> ((e0?) $ciphertext), $pv -> pvo ) safe e2e::t_e2e_envelope. }
+        r = e2e::decode_migration_envelope from_cid to_cid (ad?) (env?) (emsig?).
+        pt is bin+ = NIL.  if r $ok { pt -> (r $plaintext) as bin. }
+        return transaction::success [ _return_data ( $ok -> (r $ok), $plaintext -> pt, $code -> ((r $ok) ?? "" ; ((r $error)?) $code) ) ].
+    }
+
     // Decode-seam test controls: install a mig-pending hook that reads the togglable flag,
     // then flip the flag to steer decrypt_and_commit's stage-vs-replace decision.
     trn qa_e2e_install_mig_hook _

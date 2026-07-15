@@ -2736,8 +2736,10 @@ library a2a_messaging loads libraries
         // TRUE, so the decode-seam STAGES onto a fresh session (the live session is untouched).
         r = e2e::decode_migration_envelope sender_id (_get_container_id()) (pad?) (env?) (emsig?).
         if (r $ok) != TRUE
-        {   // tampered / session_mismatch / no_session / replay-at-acknowledged: reject, drop the
-            // staged rotation, REMAIN acknowledged (never fall back to legacy). The sweep re-drives.
+        {   // OLM-LEVEL failure only — tampered ciphertext / session_mismatch / no_session /
+            // replay-at-acknowledged → !ok reject-as-data. (emsig/wire FORGERY already ABORTED
+            // inside decode_migration_envelope, §1.1 — it never reaches here.) Drop the staged
+            // rotation, REMAIN acknowledged (never fall back to legacy). The sweep re-drives.
             e2e::discard_rotation sender_id.
             return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_decrypt_failed), _save_state NIL ].
         }

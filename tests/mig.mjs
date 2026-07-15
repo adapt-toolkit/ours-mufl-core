@@ -286,6 +286,37 @@ async function main() {
   const hiAct2 = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
   ok(hex(hiAct2) === hex(hiAct), 'idempotency: duplicate offer does NOT disturb the active session');
 
+  // decode_migration_envelope guard matrix — the point-1 divergence guard (recv_authenticated's
+  // S1/S2 is REAL) + decode_migration_envelope binding gates + the forgery-abort vs replay-reject
+  // split. P (sender) stages a rotation to M (receiver) and encrypts a known plaintext; M then
+  // decodes it (happy) and rejects tampered variants.
+  console.log('=== mig: decode_migration_envelope GUARD (divergence + binding + forgery/replay split) ===');
+  const P = await mkNode('mig-guard-P', 'P');
+  const M = await mkNode('mig-guard-M', 'M'); await sleep(800);
+  const pAd = getBin(ro(P, '::actor::qa_produce_ad', {}), 'ad');
+  const mBundle = getBin(ro(M, '::actor::qa_e2e_bundle', {}), 'bundle');
+  await mutate(P, '::actor::qa_e2e_stage_out', { cid: M.cid, peer: binv(P, mBundle) });
+  const marker = Buffer.from('guard-roundtrip-marker');
+  const enc1 = await mutate(P, '::actor::qa_mig_enc_full', { cid: M.cid, pt: binv(P, marker) });
+  const gEnv1 = getBin(enc1, 'env'), emsig1 = getBin(enc1, 'emsig');
+  const enc2 = await mutate(P, '::actor::qa_mig_enc_full', { cid: M.cid, pt: binv(P, Buffer.from('guard-second')) });
+  const emsig2 = getBin(enc2, 'emsig');   // a VALID emsig over a DIFFERENT envelope (foreign-emsig case)
+  const dec = (t) => mutate(M, '::actor::qa_mig_decode', {
+    from: t.from ?? P.cid, to: t.to ?? M.cid, ad: binv(M, t.ad ?? pAd),
+    env: binv(M, t.env ?? gEnv1), emsig: binv(M, t.emsig ?? emsig1), pv_override: t.pv_override ?? -1 });
+  const expectAbort = async (label, targ) => { try { await dec(targ); ok(false, label + ' (expected ABORT, got success)'); } catch { ok(true, label); } };
+  // Forgery → ABORT (these never mutate M's session — atomicity), run before the happy establish.
+  await expectAbort('guard: bad wire_pv (S2) → abort', { pv_override: 99 });
+  await expectAbort('guard: foreign/tampered emsig (S1) → abort', { emsig: emsig2 });
+  await expectAbort('guard: wrong $to recipient (S1) → abort', { to: P.cid });
+  await expectAbort('guard: AD.cid ≠ box sender (relay re-box, binding) → abort', { from: M.cid });
+  // Happy round-trip → establishes M's inbound session + returns the RIGHT plaintext.
+  const hap = await dec({});
+  ok(T(hap.Reduce('ok').Visualize()) && hex(getBin(hap, 'plaintext')) === hex(marker), 'guard: happy path decodes to the RIGHT plaintext (round-trip)');
+  // Replay the SAME pre-key → session_matches → replayed() → !ok (reject, NOT abort): the split.
+  const rep = await dec({});
+  ok(!T(rep.Reduce('ok').Visualize()) && rep.Reduce('code').Visualize() === 'replayed_handshake', 'guard: replay (valid emsig, replayed ciphertext) → !ok reject NOT abort (forgery/replay split)');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
