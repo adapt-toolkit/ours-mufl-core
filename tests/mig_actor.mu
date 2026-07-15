@@ -207,6 +207,18 @@ application actor loads libraries
             $attempts -> n, $updated -> ((st?) $updated) ).
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
+    // Simulate my published bundle rotating since the snapshot: corrupt $local_fp so it no longer
+    // matches the live produce-fp (drives the sweep's §5.4-5 supersession path).
+    trn qa_mig_corrupt_fp _:($cid -> cid: global_id)
+    {
+        st = a2a_messaging::contact_migration cid.
+        bogus is bin = _hash_code_to_binary (_value_id ($x -> "bogus-rotated-fp")).
+        a2a_messaging::contact_migration cid -> ( $phase -> ((st?) $phase), $initiator -> ((st?) $initiator),
+            $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> ((st?) $epoch),
+            $session_id -> ((st?) $session_id), $local_bundle -> ((st?) $local_bundle), $local_fp -> bogus,
+            $attempts -> ((st?) $attempts), $updated -> ((st?) $updated) ).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
 
     // Phase D §5.6 flush test helpers. Inject a 3-message mig_deferred queue for `cid` (via the
     // import path — REPLACE-if-present, leaves the active pin untouched), read the queued wire_ids

@@ -3077,7 +3077,16 @@ library a2a_messaging loads libraries
                 ph = (st $phase).
                 do_supersede is bool = FALSE.
                 leg is transaction::action::type[] = [].
-                if ph == "offered" { leg -> mig_resend_offer_actions cid st. }
+                if ph == "offered"
+                {
+                    // §5.4-5 ROTATION DETECTOR: if my published bundle rotated since this snapshot, a
+                    // byte-identical resend would carry a STALE fp under the SAME nonce (breaking epoch
+                    // equality with the responder's already-acked bundle) → SUPERSEDE (fresh nonce/epoch)
+                    // instead of resending. Unchanged fp → byte-identical retransmit (idempotent).
+                    live_fp = e2e_bundle_fp (address_document::produce_my_address_document()).
+                    if (st $local_fp) != NIL && ((st $local_fp)?) != live_fp { do_supersede -> TRUE. }
+                    else { leg -> mig_resend_offer_actions cid st. }
+                }
                 elif ph == "acknowledged" { leg -> mig_resend_ack_actions cid st. }
                 else
                 {

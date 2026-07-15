@@ -319,6 +319,12 @@ async function main() {
   await mutate(loN, '::actor::qa_mig_set_attempts', { cid: hiN.cid, n: 30 });
   const sw2 = await mutate(loN, '::a2a_messaging::sweep_e2e_migrations', {});
   ok(sw2.Reduce('stalled').Visualize() === '1' && sw2.Reduce('redriven').Visualize() === '0', 'sweep(§5.6): $attempts cap → $migration_stalled (state kept, no re-drive)');
+  // §5.4-5 rotation detector: my published bundle rotated since the snapshot → a byte-identical
+  // resend would carry a stale fp under the same nonce → SUPERSEDE (fresh offer/epoch) instead.
+  await mutate(loN, '::actor::qa_mig_force_offered', { cid: hiN.cid });
+  await mutate(loN, '::actor::qa_mig_corrupt_fp', { cid: hiN.cid });
+  const sw3 = await mutate(loN, '::a2a_messaging::sweep_e2e_migrations', {});
+  ok(sw3.Reduce('superseded').Visualize() === '1' && sw3.Reduce('redriven').Visualize() === '0', 'sweep(§5.4-5): local bundle-fp rotation → SUPERSEDE (fresh offer/epoch), not stale byte-identical resend');
   // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');
