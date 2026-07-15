@@ -211,6 +211,33 @@ async function main() {
   const gLive2 = getBin(ro(G, '::actor::qa_e2e_active', { cid: fCid }), 'sid');
   ok(hex(gLive2) === hex(gLive), 'fault-injection: live session UNCHANGED after the aborted self-heal (atomicity protects the immediate-replace)');
 
+  console.log('=== mig: Phase-C §5.2 helpers (election + epoch) ===');
+  // election: exactly one of the pair initiates (lower cid), both agree
+  const aInit = T(ro(A, '::actor::qa_mig_initiator', { peer: bCid }).Reduce('initiator').Visualize());
+  const bInit = T(ro(B, '::actor::qa_mig_initiator', { peer: aCid }).Reduce('initiator').Visualize());
+  ok(aInit !== bInit, 'mig_initiator: exactly ONE of the pair initiates (deterministic election)');
+  ok(aInit === (aCid < bCid), 'mig_initiator: the LOWER cid initiates (lexicographic total order)');
+  // epoch: both sides derive the SAME epoch from the SAME cid-ordered inputs
+  const lo = aCid < bCid ? aCid : bCid, hi = aCid < bCid ? bCid : aCid;
+  const nlo = binv(A, Buffer.from('11111111111111111111111111111111', 'hex'));
+  const nhi = binv(A, Buffer.from('22222222222222222222222222222222', 'hex'));
+  const flo = binv(A, Buffer.from('33333333333333333333333333333333', 'hex'));
+  const fhi = binv(A, Buffer.from('44444444444444444444444444444444', 'hex'));
+  const epA = getBin(ro(A, '::actor::qa_mig_epoch', { lo, hi, nlo, nhi, flo, fhi }), 'epoch');
+  const nloB = binv(B, Buffer.from('11111111111111111111111111111111', 'hex'));
+  const nhiB = binv(B, Buffer.from('22222222222222222222222222222222', 'hex'));
+  const floB = binv(B, Buffer.from('33333333333333333333333333333333', 'hex'));
+  const fhiB = binv(B, Buffer.from('44444444444444444444444444444444', 'hex'));
+  const epB = getBin(ro(B, '::actor::qa_mig_epoch', { lo, hi, nlo: nloB, nhi: nhiB, flo: floB, fhi: fhiB }), 'epoch');
+  ok(epA.length === 32 && hex(epA) === hex(epB), 'mig_epoch: both sides derive the SAME 32-byte epoch from identical cid-ordered inputs');
+  // input sensitivity: swap a nonce → different epoch (domain/agreement binding)
+  const epA2 = getBin(ro(A, '::actor::qa_mig_epoch', { lo, hi, nlo: nhi, nhi: nlo, flo, fhi }), 'epoch');
+  ok(hex(epA2) !== hex(epA), 'mig_epoch: swapping the nonces yields a DIFFERENT epoch (agreement-bound)');
+  // e2e_bundle_fp is deterministic + 32 bytes
+  const fpA = getBin(ro(A, '::actor::qa_mig_bundle_fp', {}), 'fp');
+  const fpA2 = getBin(ro(A, '::actor::qa_mig_bundle_fp', {}), 'fp');
+  ok(fpA.length === 32 && hex(fpA) === hex(fpA2), 'e2e_bundle_fp: deterministic 32-byte fingerprint of my e2e bundle');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

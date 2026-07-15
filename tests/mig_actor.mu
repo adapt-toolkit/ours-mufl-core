@@ -207,6 +207,14 @@ application actor loads libraries
         abort ("fault-injection: inner dispatch aborts after self-heal replace (ok=" + (_str (r $ok)) + ")") when TRUE.
         return transaction::success [ _return_data ($ok -> (r $ok)) ].
     }
+    // ---- Phase-C §5.2 helpers (election + epoch determinism) ----
+    trn readonly qa_mig_initiator _:($peer -> peer: global_id)
+    { return ($initiator -> (a2a_messaging::mig_initiator peer), $mycid -> (_get_container_id())). }
+    trn readonly qa_mig_epoch _:($lo -> lo: global_id, $hi -> hi: global_id, $nlo -> nlo: bin, $nhi -> nhi: bin, $flo -> flo: bin, $fhi -> fhi: bin)
+    { return ($epoch -> (a2a_messaging::mig_epoch lo hi nlo nhi flo fhi)). }
+    trn readonly qa_mig_bundle_fp _
+    { return ($fp -> (a2a_messaging::e2e_bundle_fp (address_document::produce_my_address_document()))). }
+
     // Read both libraries' state for `cid` AFTER the aborted tx: both must be absent.
     trn readonly qa_atomicity_check _:($cid -> cid: global_id)
     {

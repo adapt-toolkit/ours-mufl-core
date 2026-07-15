@@ -73,6 +73,12 @@ library a2a_messaging loads libraries
     // core 0.7.0 receipts inbound (LIBRARY-routed, new surface, no legacy
     // listeners; reachable only behind positive core.receipts.* caps).
     receive_receipt_tx         = "::a2a_messaging::receive_receipt".
+    // core 0.9.0 E2E-migration inbound (LIBRARY-routed, wire 9). offer/ack ride the
+    // legacy encrypted_channel; commit/confirm are inner txs on the fresh e2e session.
+    e2e_migrate_offer_tx       = "::a2a_messaging::e2e_migrate_offer".
+    e2e_migrate_ack_tx         = "::a2a_messaging::e2e_migrate_ack".
+    e2e_migrate_commit_tx      = "::a2a_messaging::e2e_migrate_commit".
+    e2e_migrate_confirm_tx     = "::a2a_messaging::e2e_migrate_confirm".
 
     // Version stamp of the portable export blob (see import_core_state for the
     // migration contract). Bump ONLY on a breaking blob-shape change, together
@@ -704,6 +710,55 @@ library a2a_messaging loads libraries
         v2   = peer_has_e2e_bundle cid.
         if seen && v2 != TRUE { return "downgrade_refused". }
         return ((seen || v2) ?? "e2e" ; "box").
+    }
+
+    // ---- core 0.9.0 migration helpers (spec §5.2) ----------------------------
+    // Deterministic total order on the hex container ids. MUFL '<' is lexicographic
+    // on strings (pinned in tests/mufl_semantics), which is a total order — both
+    // sides compute the same answer from the pinned cids (§5.9-2: any deterministic
+    // shared order works). Used ONLY to elect exactly one proposer; never authz.
+    fn str_lt (a: str, b: str) -> bool { return a < b. }
+
+    // Exactly-once agreement needs exactly one proposer: the LOWER cid initiates.
+    // Stable across restarts/imports/simultaneous upgrades — both sides derive it
+    // from the pinned ids, so no tie-breaking state is ever needed.
+    fn mig_initiator (peer: global_id) -> bool
+    { return str_lt (_str (_get_container_id())) (_str peer). }
+
+    // Fingerprint of an AD's E2E prekey bundle — the epoch input AND the rotation
+    // detector (a live-vs-snapshot fp mismatch at retransmit forces supersession).
+    fn e2e_bundle_fp (ad: address_document_types::t_address_document) -> bin
+    { return _hash_code_to_binary (_value_id (((ad as any) $identity $e2e_bundle))). }
+
+    // Epoch: both parties derive the SAME 32-byte id from authenticated inputs — the
+    // cid-ORDERED ids, both proposal nonces, both FRESH bundle fingerprints. Domain-
+    // separated; any input change (re-offer / re-published AD) => a new epoch, so a
+    // stale commit can never validate against a refreshed agreement. Callers MUST pass
+    // the inputs in cid order (lo < hi) so both sides agree regardless of who proposed.
+    fn mig_epoch (lo: global_id, hi: global_id, n_lo: bin, n_hi: bin, f_lo: bin, f_hi: bin) -> bin
+    {
+        return _hash_code_to_binary (_value_id (
+            $proto -> "ours/e2e-migration/v1",
+            $a -> lo, $b -> hi, $na -> n_lo, $nb -> n_hi, $fa -> f_lo, $fb -> f_hi )).
+    }
+
+    // FRESH identity bundle (§5.9-4): the migration legs must carry the CURRENT
+    // signed AD, so they build via produce_my_address_document (rebuild + re-sign,
+    // embedding e2e::my_public_bundle) rather than the CACHED get_my_address_document
+    // (which can pre-date the live account fallback). Same shape as
+    // my_identity_bundle_fields; only the AD source differs.
+    fn my_identity_bundle_fields_fresh (_) -> ($ad -> address_document_types::t_address_document, $cert -> bin+, $root_profile -> bin+, $cp_binding -> bin+)
+    {
+        my_cert_blob is bin+ = NIL.
+        my_rp_blob is bin+ = NIL.
+        my_rpb_blob is bin+ = NIL.
+        if delegation_cert != NIL && root_profile != NIL
+        {
+            my_cert_blob -> (_write delegation_cert?).
+            my_rp_blob -> (_write root_profile?).
+            if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
+        }
+        return ($ad -> address_document::produce_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
     }
 
     // ---- core 0.5.0 versioning helpers ---------------------------------------
