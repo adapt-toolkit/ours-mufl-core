@@ -275,6 +275,18 @@ async function main() {
   const hiAct = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
   ok(loAct.length > 0 && hex(loAct) === hex(hiAct), 'handshake: both sides share the SAME active (fresh, rotated) session_id');
   ok(hex(getBin(loPin, 'session_id')) === hex(loAct), 'handshake: epoch pin session_id == active session_id (the exactly-once rotation)');
+  // ★ Q1=A test-only demonstration (endorsed by FleetCoordinator + MigrationReview): the rotated
+  // session carries APP DATA end-to-end. Post-active, encrypt_to(peer) rides m_sessions[peer] —
+  // the MIGRATED session (commit_rotation promoted it in) — which is the SAME call the daemon uses
+  // for its app-e2e send (e2e.mm:281,290). Proves double-ratchet app delivery at the core-gate
+  // level; the owner's real-node test covers the daemon-delivery-in-logs side. Zero prod surface.
+  const hiBundle = getBin(ro(hiN, '::actor::qa_e2e_bundle', {}), 'bundle');
+  const loIk = getBin(ro(loN, '::actor::qa_e2e_ik', {}), 'ik');
+  const appPt = Buffer.from('post-migration app message over the rotated double-ratchet');
+  const appEnv = await mutate(loN, '::actor::qa_e2e_first_send', { cid: hiN.cid, pt: binv(loN, appPt), peer: binv(loN, hiBundle) });
+  ok(hex(getBin(appEnv, 'session_id')) === hex(loAct), 'app-data(§5.6/A): initiator app send rides the MIGRATED (pinned) session_id (not a stale/old session)');
+  const appRec = await mutate(hiN, '::actor::qa_e2e_recv', { from: loN.cid, ik: binv(hiN, loIk), olm_type: +appEnv.Reduce('olm_type').Visualize(), ciphertext: binv(hiN, getBin(appEnv, 'ciphertext')) });
+  ok(T(appRec.Reduce('ok').Visualize()) && hex(getBin(appRec, 'plaintext')) === hex(appPt), 'app-data(§5.6/A): responder decrypts the app message on the migrated session (double-ratchet delivers app data e2e)');
   // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');
