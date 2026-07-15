@@ -168,4 +168,51 @@ application actor loads libraries
         qa_mig_pending -> p.
         return transaction::success [ _return_data ($pending -> qa_mig_pending) ].
     }
+
+    // ---- Cross-library atomicity gate (spec §5.5 / plan B gate 5, blocks C/D) ----
+    // Within ONE transaction: write ADAPT-library state (e2e m_staged via
+    // stage_outbound_rotation), write CORE-library state (a2a_messaging
+    // contact_migration), queue an ACTION (a send), then ABORT. If the toolchain
+    // gives cross-library atomic rollback, a subsequent read sees NEITHER write
+    // (and the action never fired). If it does NOT, §5.5 handlers must switch to
+    // explicit prepare/commit records — so this gate's result decides phase C's shape.
+    trn qa_atomicity_abort _:($cid -> cid: global_id, $peer -> peer_blob: bin)
+    {
+        peer = (_read_or_abort peer_blob) safe address_document_types::t_e2e_bundle.
+        now = (current_transaction_info::get_transaction_time())?.
+        // 1) ADAPT-library state write (e2e packet state):
+        sid = e2e::stage_outbound_rotation cid peer.
+        // 2) CORE-library state write (a2a_messaging packet state):
+        a2a_messaging::contact_migration cid -> (
+            $phase -> "offered", $initiator -> TRUE, $local_nonce -> sid,
+            $peer_nonce -> NIL, $epoch -> NIL, $session_id -> NIL,
+            $local_bundle -> NIL, $local_fp -> NIL, $attempts -> 1, $updated -> now ).
+        // 3) ABORT the whole tx AFTER both cross-library writes. Any transaction::action
+        //    (send / _save_state) would ride the success return, which is never reached — so
+        //    a queued action is inherently discarded on abort (MUFL actions fire ONLY on
+        //    success). The load-bearing question is whether the two cross-LIBRARY STATE writes
+        //    above roll back together; qa_atomicity_check reads them after.
+        abort ("atomicity probe: forced rollback after adapt-write + core-write (staged " + (_str (_value_id sid)) + ")") when TRUE.
+        return transaction::success [ _return_data ($unreachable -> TRUE) ].
+    }
+    // Fault injection (MigrationReview): a self-heal REPLACE on a live session whose inner
+    // dispatch then ABORTS. decrypt_and_commit replaces m_sessions[from_cid] (0.8.0 self-heal),
+    // then we abort — modelling the inner tx failing. If the decode tx is atomic, the replace
+    // rolls back and the live session is UNCHANGED (the immediate-replace design is only safe
+    // BECAUSE of this; without it, an aborted dispatch would clobber the live session — the very
+    // unilateral-reset the seam closes).
+    trn qa_e2e_recv_abort _:($from -> from_cid: global_id, $ik -> ik: bin, $olm_type -> ot: int, $ciphertext -> ct: bin)
+    {
+        r = e2e::decrypt_and_commit from_cid ik ot ct.
+        abort ("fault-injection: inner dispatch aborts after self-heal replace (ok=" + (_str (r $ok)) + ")") when TRUE.
+        return transaction::success [ _return_data ($ok -> (r $ok)) ].
+    }
+    // Read both libraries' state for `cid` AFTER the aborted tx: both must be absent.
+    trn readonly qa_atomicity_check _:($cid -> cid: global_id)
+    {
+        return (
+            $core_present  -> ((a2a_messaging::contact_migration cid) != NIL),
+            $adapt_present -> ((e2e::staged_session_id cid) != NIL)
+        ).
+    }
 }

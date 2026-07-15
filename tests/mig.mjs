@@ -181,6 +181,36 @@ async function main() {
   const dLive3 = getBin(ro(D, '::actor::qa_e2e_active', { cid: cCid }), 'sid');
   ok(hex(dLive3) === hex(stagedC2) && hex(dLive3) !== hex(dLive1), 'seam: SELF-HEAL — live session REPLACED (no migration pending → 0.8.0 behavior)');
 
+  console.log('=== mig: cross-lib atomicity gate (abort after adapt-write + core-write + action) ===');
+  const E = await mkNode('mig-gate-E', 'E'); await sleep(600);
+  let aborted = false;
+  await mutate(E, '::actor::qa_atomicity_abort', { cid: dCid, peer: binv(E, dBundle) }).catch(() => { aborted = true; });
+  ok(aborted, 'atomicity: the probe tx aborted as designed (adapt-write + core-write + queued action, then abort)');
+  const ck = ro(E, '::actor::qa_atomicity_check', { cid: dCid });
+  ok(!T(ck.Reduce('core_present').Visualize()), 'atomicity: CORE-library write (a2a_messaging contact_migration) rolled back on abort');
+  ok(!T(ck.Reduce('adapt_present').Visualize()), 'atomicity: ADAPT-library write (e2e staged session) rolled back on abort');
+
+  console.log('=== mig: fault-injection — self-heal replace whose inner dispatch ABORTS → live unchanged ===');
+  const F = await mkNode('mig-gate-F', 'F');
+  const G = await mkNode('mig-gate-G', 'G'); await sleep(800);
+  const fCid = F.cid, gCid = G.cid;
+  const gBundle = getBin(ro(G, '::actor::qa_e2e_bundle', {}), 'bundle');
+  const fIk = getBin(ro(F, '::actor::qa_e2e_ik', {}), 'ik');
+  await mutate(G, '::actor::qa_e2e_install_mig_hook', {});   // default FALSE → self-heal path
+  const fenv1 = await mutate(F, '::actor::qa_e2e_first_send', { cid: gCid, pt: binv(F, Buffer.from('fi-live')), peer: binv(F, gBundle) });
+  await mutate(G, '::actor::qa_e2e_recv', { from: fCid, ik: binv(G, fIk),
+    olm_type: +fenv1.Reduce('olm_type').Visualize(), ciphertext: binv(G, getBin(fenv1, 'ciphertext')) });
+  const gLive = getBin(ro(G, '::actor::qa_e2e_active', { cid: fCid }), 'sid');
+  ok(gLive.length > 0, 'fault-injection: G established a live session with F');
+  await mutate(F, '::actor::qa_e2e_stage_out', { cid: gCid, peer: binv(F, gBundle) });
+  const fenvH = await mutate(F, '::actor::qa_e2e_enc_staged', { cid: gCid, pt: binv(F, Buffer.from('fi-selfheal')) });
+  let fiAborted = false;
+  await mutate(G, '::actor::qa_e2e_recv_abort', { from: fCid, ik: binv(G, fIk),
+    olm_type: +fenvH.Reduce('olm_type').Visualize(), ciphertext: binv(G, getBin(fenvH, 'ciphertext')) }).catch(() => { fiAborted = true; });
+  ok(fiAborted, 'fault-injection: the self-heal recv tx aborted (inner-dispatch failure modelled)');
+  const gLive2 = getBin(ro(G, '::actor::qa_e2e_active', { cid: fCid }), 'sid');
+  ok(hex(gLive2) === hex(gLive), 'fault-injection: live session UNCHANGED after the aborted self-heal (atomicity protects the immediate-replace)');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
