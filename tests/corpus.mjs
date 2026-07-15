@@ -107,9 +107,10 @@ async function main() {
 
   // NOTE: the e2e caps/anti-downgrade routing (a2a_messaging::e2e_route) is
   // production code that compiles clean, but its MUFL unit test cannot live in
-  // this test_actor — adding a state-touching trn tips test_actor over the
-  // meta-stage type-reduction ceiling (1M steps). Routing is covered by the
-  // Step-5 mixed-unit integration gate (which needs adapt's compiled e2e unit).
+  // the corpus unit — corpus_actor.mu deliberately does not load a2a_messaging
+  // (the meta-stage type-reduction fuel is per compiled unit; see the header
+  // comment in corpus_actor.mu). Routing is covered by the scenario suite
+  // (test_actor.mu / test.mjs), which owns all state-touching trns.
 
   console.log('\n================ CORPUS ================');
   if (scorecard.length === 0) console.log('CORPUS: ALL GREEN');

@@ -19,7 +19,7 @@ BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir -p "$BUILD/core"
 cp "$CORE_DIR"/*.mm "$CORE_DIR"/config.mufl "$BUILD/core/"
-cp "$HERE/test_actor.mu" "$HERE/corpus.mjs" "$HERE/protocol_container.mm" "$BUILD/"
+cp "$HERE/corpus_actor.mu" "$HERE/corpus.mjs" "$HERE/protocol_container.mm" "$BUILD/"
 ln -sfn "$SDK_NM" "$BUILD/node_modules"
 cat > "$BUILD/config.mufl" <<'CFG'
 config script
@@ -35,7 +35,7 @@ CFG
 
 cd "$BUILD"
 echo "compiling test actor against $CORE_DIR core…"
-MUFL_STDLIB_PATH="$AT/mufl_stdlib" "$COMPILE" -mp "$AT/meta" -mp "$AT/transactions" test_actor.mu 2>&1 \
+MUFL_STDLIB_PATH="$AT/mufl_stdlib" "$COMPILE" -mp "$AT/meta" -mp "$AT/transactions" corpus_actor.mu 2>&1 \
   | grep -vE "Unused symbol|browser_attestation|identity_proof_document_impl" | tail -4
 ls ./*.muflo >/dev/null 2>&1 || { echo "COMPILE FAILED"; exit 1; }
 
