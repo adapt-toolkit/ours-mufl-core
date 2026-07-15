@@ -80,6 +80,11 @@ library a2a_messaging loads libraries
     e2e_migrate_ack_tx         = "::a2a_messaging::e2e_migrate_ack".
     e2e_migrate_commit_tx      = "::a2a_messaging::e2e_migrate_commit".
     e2e_migrate_confirm_tx     = "::a2a_messaging::e2e_migrate_confirm".
+    // core 0.9.0 boxed APP-E2E (Option B): app data over the MIGRATED session rides these named
+    // boxes ($targ = the e2e_signed_message). DISTINCT from legacy receive_message_tx so the wire
+    // separates e2e-carrying box from legacy box (an attacker cannot confuse them).
+    receive_e2e_message_tx     = "::a2a_messaging::receive_e2e_message".
+    receive_e2e_file_tx        = "::a2a_messaging::receive_e2e_file".
 
     // Version stamp of the portable export blob (see import_core_state for the
     // migration contract). Bump ONLY on a breaking blob-shape change, together
@@ -1222,12 +1227,25 @@ library a2a_messaging loads libraries
             return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $downgrade_refused -> TRUE, $code -> $e2e_downgrade_refused) ].
         }
         if route == "e2e" && (e2e_pinned target_id || (contact_e2e_epoch target_id) != NIL)
-        {   // KNOWN-E2E peer (epoch-pinned or once-seen): box is unreachable — the DAEMON owns the
-            // app-data e2e send (§5.6); core returns the verdict WITHOUT boxing. A FRESH v2 contact
-            // (never pinned/seen) FALLS THROUGH to the legacy box below: box is a legacy-ALLOWED
-            // transport pre-migration (§5.6 absent row), so pre-migration app delivery is UNCHANGED
-            // (no regression); the daemon may separately use a pre-epoch e2e session.
-            return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e) ].
+        {   // KNOWN-E2E peer (epoch-pinned): CORE DELIVERS over the MIGRATED session (Option B —
+            // the thin daemon has no transport, and a bare e2e envelope can't be action::send-ed).
+            // encrypt_to advances m_sessions[cid] (the migrated session); the e2e ciphertext rides
+            // a DISTINCT box (receive_e2e_message_tx) so the wire separates it from legacy plaintext.
+            // A FRESH v2 contact (never pinned) falls through to the legacy box below (unchanged).
+            epb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+            einner = _write ( $text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
+            eenv = e2e::encrypt_to target_id einner epb.
+            esid = e2e::active_session_id target_id.
+            eacts is transaction::action::type[] = [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> receive_e2e_message_tx,
+                    $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
+            sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
+            sc monitor_copy_actions "out" target_id sent_date text -- ( -> a) { eacts (_count eacts|) -> a. }
+            eacts (_count eacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> (esid?), $olm_type -> ((eenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
+            eacts (_count eacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
+            eacts (_count eacts|) -> _save_state NIL.
+            return transaction::success eacts.
         }
         // route == "legacy" (or a fresh-v2 "e2e", box legacy-allowed) -> unchanged box send below.
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
@@ -1289,7 +1307,22 @@ library a2a_messaging loads libraries
         if froute == "downgrade_refused"
         { return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $downgrade_refused -> TRUE, $code -> $e2e_downgrade_refused) ]. }
         if froute == "e2e" && (e2e_pinned target_id || (contact_e2e_epoch target_id) != NIL)
-        { return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e) ]. }
+        {   // CORE delivers the file over the MIGRATED session (Option B), boxed under a distinct name.
+            fepb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+            finner = _write ( $filename -> filename, $mime -> mime_s, $data -> data, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
+            fenv = e2e::encrypt_to target_id finner fepb.
+            fsid = e2e::active_session_id target_id.
+            feacts is transaction::action::type[] = [
+                encrypted_channel::send_encrypted_tx target_id (
+                    $name -> receive_e2e_file_tx,
+                    $targ -> ( $e2e_envelope -> (fenv $e2e_envelope), $emsignature -> (fenv $emsignature) ) ) ].
+            sc on_file_sent ($target_id -> target_id, $filename -> filename, $mime -> mime_s, $data -> data, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { feacts (_count feacts|) -> a. }
+            sc monitor_copy_actions "out" target_id sent_date (file_monitor_summary filename mime_s data) -- ( -> a) { feacts (_count feacts|) -> a. }
+            feacts (_count feacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> (fsid?), $olm_type -> ((fenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
+            feacts (_count feacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
+            feacts (_count feacts|) -> _save_state NIL.
+            return transaction::success feacts.
+        }
         // route == "legacy" (or a fresh-v2 "e2e", box legacy-allowed) -> unchanged box send below.
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             actions is transaction::action::type[] = [
