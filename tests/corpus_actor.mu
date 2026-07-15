@@ -121,6 +121,47 @@ application actor loads libraries
         eu = a2a_versions::try_narrow_e2e (e_uns as any).
         ef = a2a_versions::try_narrow_e2e (e_fut as any).
 
+        // registry "mgb" — e2e-migration offer/ack bundle (wire 9, single version).
+        // sir-shape identity bundle ($ad any) + agreement fields: the offer omits
+        // $peer_nonce, the ack echoes the offer nonce. Introduction dialect 9, so
+        // an unstamped body (no $pv) is malformed on this surface -> shape error.
+        mna = _hex_string_to_binary "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf".   // offer nonce (bin)
+        mnb = _hex_string_to_binary "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf".   // ack nonce (bin)
+        mgb_off = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> mna, $peer_nonce -> NIL, $pv -> 9, $caps -> ["core.e2e.migrate"]).  // offer form
+        mgb_ack = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> mnb, $peer_nonce -> mna, $pv -> 9, $caps -> ["core.e2e.migrate"]).  // ack form (echoes offer nonce)
+        mgb_old = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> mna, $peer_nonce -> NIL, $pv -> 1, $caps -> []).       // below floor
+        mgb_wn  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> "notbin", $peer_nonce -> NIL, $pv -> 9, $caps -> []).  // mistyped $nonce (str)
+        mgb_uns = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> mna, $peer_nonce -> NIL, $caps -> []).                 // unstamped (no $pv)
+        mgb_fut = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $nonce -> mna, $peer_nonce -> NIL, $pv -> 10, $caps -> []).      // future dialect
+
+        gmo   = a2a_versions::try_narrow_mgb (mgb_off as any).
+        gma   = a2a_versions::try_narrow_mgb (mgb_ack as any).
+        gmold = a2a_versions::try_narrow_mgb (mgb_old as any).
+        gmwn  = a2a_versions::try_narrow_mgb (mgb_wn as any).
+        gmuns = a2a_versions::try_narrow_mgb (mgb_uns as any).
+        gmfut = a2a_versions::try_narrow_mgb (mgb_fut as any).
+
+        // registry "mgc" — e2e-migration commit/confirm inner $targ (wire 9). The
+        // commit carries $session_id; the confirm omits it. $epoch is the required
+        // domain-checked field; $pv is nullable (the E2E session authenticates).
+        mep = _hex_string_to_binary "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf".   // epoch (bin)
+        msd = _hex_string_to_binary "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf".   // session_id (bin)
+        mgc_com = ($epoch -> mep, $session_id -> msd, $pv -> 9).          // COMMIT form
+        mgc_con = ($epoch -> mep, $pv -> 9).                             // CONFIRM form (no $session_id)
+        mgc_old = ($epoch -> mep, $session_id -> msd, $pv -> 1).          // below floor
+        mgc_ne  = ($session_id -> msd, $pv -> 9).                        // no $epoch -> shape err (epoch-domain)
+        mgc_we  = ($epoch -> "notbin", $session_id -> msd, $pv -> 9).     // mistyped $epoch (str) -> shape err
+        mgc_ws  = ($epoch -> mep, $session_id -> 42, $pv -> 9).           // mistyped $session_id (int) -> shape err (M1)
+        mgc_uns = ($epoch -> mep, $session_id -> msd).                   // unstamped (no $pv) -> tolerated, ok
+
+        cco   = a2a_versions::try_narrow_mgc (mgc_com as any).
+        ccn   = a2a_versions::try_narrow_mgc (mgc_con as any).
+        ccold = a2a_versions::try_narrow_mgc (mgc_old as any).
+        ccne  = a2a_versions::try_narrow_mgc (mgc_ne as any).
+        ccwe  = a2a_versions::try_narrow_mgc (mgc_we as any).
+        ccws  = a2a_versions::try_narrow_mgc (mgc_ws as any).
+        ccuns = a2a_versions::try_narrow_mgc (mgc_uns as any).
+
         return transaction::success [ _return_data (
             $sir -> (
                 $v2  -> ($ok -> (r2 $ok), $v -> (a2a_versions::sir_version_of (sir_v2 as any)), $name -> (a2a_versions::sir_joiner_name ((r2 $payload)?))),
@@ -161,6 +202,23 @@ application actor loads libraries
                 $wpv -> ($ok -> (ewp $ok), $code -> (((ewp $err)?) $code)),
                 $uns -> ($ok -> (eu $ok), $v -> (a2a_versions::e2e_version_of (e_uns as any)), $ot -> (((eu $payload)?) $e2e_envelope $olm_type)),
                 $fut -> ($ok -> (ef $ok), $ot -> (((ef $payload)?) $e2e_envelope $olm_type))
+            ),
+            $mgb -> (
+                $off -> ($ok -> (gmo $ok), $v -> (a2a_versions::mgb_version_of (mgb_off as any)), $pn_absent -> ((((gmo $payload)?) as any) $peer_nonce == NIL)),
+                $ack -> ($ok -> (gma $ok), $pn_present -> ((((gma $payload)?) as any) $peer_nonce != NIL)),
+                $old -> ($ok -> (gmold $ok), $code -> (((gmold $err)?) $code), $peer_v -> (((gmold $err)?) $peer_version), $min -> (((gmold $err)?) $min_supported)),
+                $wn  -> ($ok -> (gmwn $ok), $code -> (((gmwn $err)?) $code)),
+                $uns -> ($ok -> (gmuns $ok), $code -> (((gmuns $err)?) $code)),
+                $fut -> ($ok -> (gmfut $ok), $v -> (a2a_versions::mgb_version_of (mgb_fut as any)))
+            ),
+            $mgc -> (
+                $com -> ($ok -> (cco $ok), $has_sid -> ((((cco $payload)?) as any) $session_id != NIL)),
+                $con -> ($ok -> (ccn $ok), $no_sid -> ((((ccn $payload)?) as any) $session_id == NIL)),
+                $old -> ($ok -> (ccold $ok), $code -> (((ccold $err)?) $code)),
+                $ne  -> ($ok -> (ccne $ok), $code -> (((ccne $err)?) $code)),
+                $we  -> ($ok -> (ccwe $ok), $code -> (((ccwe $err)?) $code)),
+                $ws  -> ($ok -> (ccws $ok), $code -> (((ccws $err)?) $code)),
+                $uns -> ($ok -> (ccuns $ok))
             )
         ) ].
     }

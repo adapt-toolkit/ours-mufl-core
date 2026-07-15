@@ -99,6 +99,23 @@ async function main() {
   ok(T(g('e2e.uns.ok')) && g('e2e.uns.v') === '8' && g('e2e.uns.ot') === '0', 'e2e unstamped (no $pv): tolerated absent-discriminator, defaults to v8, ok (M1)');
   ok(T(g('e2e.fut.ok')) && g('e2e.fut.ot') === '1', 'e2e $pv=99 (future): narrows as v1 (single registered version), ok');
 
+  console.log('=== corpus: registry mgb (offer/ack + floor + shape + unstamped + future) ===');
+  ok(T(g('mgb.off.ok')) && g('mgb.off.v') === '9' && T(g('mgb.off.pn_absent')), 'mgb offer: ok, dispatched v9, $peer_nonce absent (offer form)');
+  ok(T(g('mgb.ack.ok')) && T(g('mgb.ack.pn_present')), 'mgb ack: ok, $peer_nonce present (echoes offer nonce)');
+  ok(!T(g('mgb.old.ok')) && g('mgb.old.code') === 'peer_version_unsupported' && g('mgb.old.peer_v') === '1' && g('mgb.old.min') === '2', 'mgb $pv=1 (below floor): error-as-data peer_version_unsupported');
+  ok(!T(g('mgb.wn.ok')) && g('mgb.wn.code') === 'payload_shape_unrecognized', 'mgb mistyped $nonce (str): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('mgb.uns.ok')) && g('mgb.uns.code') === 'payload_shape_unrecognized', 'mgb unstamped (no $pv): shape error-as-data (surface requires the $pv stamp)');
+  ok(T(g('mgb.fut.ok')) && g('mgb.fut.v') === '10', 'mgb $pv=10 (future): narrows as v1 (single registered version), ok');
+
+  console.log('=== corpus: registry mgc (commit/confirm + floor + epoch-domain + M1) ===');
+  ok(T(g('mgc.com.ok')) && T(g('mgc.com.has_sid')), 'mgc commit: ok, $session_id present (commit form)');
+  ok(T(g('mgc.con.ok')) && T(g('mgc.con.no_sid')), 'mgc confirm: ok, $session_id absent (confirm form)');
+  ok(!T(g('mgc.old.ok')) && g('mgc.old.code') === 'peer_version_unsupported', 'mgc $pv=1 (below floor): error-as-data peer_version_unsupported');
+  ok(!T(g('mgc.ne.ok')) && g('mgc.ne.code') === 'payload_shape_unrecognized', 'mgc no $epoch: shape error-as-data (epoch-domain required)');
+  ok(!T(g('mgc.we.ok')) && g('mgc.we.code') === 'payload_shape_unrecognized', 'mgc mistyped $epoch (str): shape error-as-data, no cast abort (M1)');
+  ok(!T(g('mgc.ws.ok')) && g('mgc.ws.code') === 'payload_shape_unrecognized', 'mgc mistyped $session_id (int): shape error-as-data, no cast abort (M1)');
+  ok(T(g('mgc.uns.ok')), 'mgc unstamped (no $pv): tolerated (E2E session authenticates), narrows v1');
+
   console.log('=== corpus: strict narrow aborts with the stable message ===');
   let strictMsg = '';
   try { await mutate('::actor::qa_corpus_narrow_strict_old', {}); } catch (e) { strictMsg = String(e.message); }

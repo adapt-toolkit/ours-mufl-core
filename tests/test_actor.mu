@@ -376,7 +376,11 @@ application actor loads libraries
     {
         inv = (_read_or_abort blob) safe a2a_protocol::invite_eph_t.
         kpr = _crypto_construct_encryption_keypair (inv $v).
-        foreign = (_read_or_abort fad) safe address_document_types::t_address_document.
+        // Bound `any`, not `safe t_address_document`: the AD is embedded as the
+        // `$ad -> any` payload field and re-verified downstream; casting to the
+        // full AD type here needlessly deepens meta-stage type reduction (AD-v2
+        // embeds t_e2e_bundle) — the per-unit fuel budget is scarce (corpus split).
+        foreign = _read_or_abort fad.
         payload = _write ($ad -> foreign, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d)).
         data = _crypto_encrypt_message (kpr $secret_key) (inv $k) payload.
         return transaction::success [
@@ -389,7 +393,7 @@ application actor loads libraries
         inv = (_read_or_abort blob) safe a2a_protocol::invite_eph_t.
         kpr = _crypto_construct_encryption_keypair (inv $v).
         my_ad = address_document::get_my_address_document().
-        forged is address_document_types::t_address_document = ($version -> (my_ad $version), $identity -> (my_ad $identity), $authorizations -> (,)).
+        forged = ($version -> (my_ad $version), $identity -> (my_ad $identity), $authorizations -> (,)).   // untyped: embedded as $ad -> any, verified downstream (fuel budget)
         payload = _write ($ad -> forged, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> (inv $d)).
         data = _crypto_encrypt_message (kpr $secret_key) (inv $k) payload.
         return transaction::success [
@@ -790,8 +794,8 @@ application actor loads libraries
         scheme = _crypto_default_scheme_id().
         kpi = _crypto_construct_encryption_keypair scheme.
         my_ad = address_document::get_my_address_document().
-        ad is address_document_types::t_address_document = my_ad.
-        if mode == "foreign" { ad -> (_read_or_abort fad) safe address_document_types::t_address_document. }
+        ad = my_ad as any.   // any, not typed AD: embedded as $ad -> any downstream (meta-stage fuel budget)
+        if mode == "foreign" { ad -> (_read_or_abort fad). }
         if mode == "forged"  { ad -> ($version -> (my_ad $version), $identity -> (my_ad $identity), $authorizations -> (,)). }
         payload = _write ($ad -> ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid).
         data = _crypto_encrypt_message (kpi $secret_key) rpk payload.

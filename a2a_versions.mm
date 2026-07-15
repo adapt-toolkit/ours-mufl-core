@@ -658,4 +658,134 @@ library a2a_versions
         pv = peer_pv raw.
         return (pv != 0 ?? pv ; 2).
     }
+
+    // ========================================================================
+    // REGISTRY "mgb" — e2e-migration bundle (core 0.9.0, class-B NEW surface,
+    // wire 9). The offer ($name e2e_migrate_offer) and ack (e2e_migrate_ack)
+    // legs SHARE this one registry, exactly as "rst" serves both restore legs.
+    // The payload IS an identity bundle (sir-shape: $ad `any`, verified
+    // downstream by verify_identity_bundle on the RAW value, never by this cast)
+    // PLUS the agreement fields ($nonce, ack-only $peer_nonce). Introduction
+    // dialect 9 — this surface cannot predate 0.9.0, so an unstamped body is
+    // malformed (a real sender always stamps $pv, cf. the offer/ack builders).
+    // ========================================================================
+    metadef mgb_targ_v1_t: (
+        $ad           -> any,       // FRESH signed ADv2 (must carry $e2e_bundle — checked downstream)
+        $cert         -> bin+,
+        $root_profile -> bin+,
+        $cp_binding   -> bin+,
+        $nonce        -> bin,       // sender's proposal nonce (agreement uniquifier, not key material)
+        $peer_nonce   -> bin+,      // ack only: echo of the offer nonce (pairs the exchange); absent on offer
+        $pv           -> int,       // wire dialect stamp (= wire_version at send); REQUIRED on this surface
+        $caps         -> str[]+     // capability piggyback (the missing caps/AD refresh, spec §5.4 step 2)
+    ).
+    metadef mgb_targ_t:     mgb_targ_v1_t.
+    metadef mgb_versions_t: [mgb_targ_v1_t].
+    mgb_max_version = 9.
+
+    // Discriminator: $pv when stamped; unstamped defaults to the introduction
+    // dialect 9 (cf. e2e -> 8). shape_ok then rejects the unstamped body since
+    // every real mgb sender stamps an int $pv.
+    fn mgb_version_of (raw: any) -> int
+    {
+        pv = peer_pv raw.
+        return (pv != 0 ?? pv ; 9).
+    }
+
+    // Abort-free classification (M1): the load-bearing NON-nullable fields
+    // ($ad present, $nonce a real BINARY, $pv a real int) checked before the
+    // cast so no-match is error-as-data, not a SAFE-cast abort. Nullable fields
+    // ($cert/$root_profile/$cp_binding bin+, $peer_nonce bin+, $caps str[]+) are
+    // excluded: absent reads NIL and passes; present-but-mistyped is the
+    // hostile/malformed class (aborts in the cast, correctly). $ad is `any`.
+    fn mgb_shape_ok (raw: any) -> bool
+    {
+        n = raw $nonce.
+        return (raw $ad) != NIL && n != NIL && (_typeof n) == "BINARY" && is_int (raw $pv).
+    }
+
+    metadef mgb_narrowed_t: ($ok -> bool, $payload -> mgb_targ_t+, $err -> version_error_t+).
+
+    // REG-4 dispatch-then-narrow, error-as-data. Single registered version: any
+    // $pv >= floor with a valid shape narrows as v1 (class-A forward compat).
+    fn try_narrow_mgb (raw: any) -> mgb_narrowed_t
+    {
+        v = mgb_version_of raw.
+        if v < min_wire_version
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "mgb" v mgb_max_version).
+        }
+        if mgb_shape_ok raw != TRUE
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "mgb" v mgb_max_version).
+        }
+        return ($ok -> TRUE, $payload -> raw safe mgb_targ_v1_t, $err -> NIL).
+    }
+
+    // Strict form — same dispatch, aborts with the stable surface-named message.
+    fn narrow_mgb (raw: any) -> mgb_targ_t
+    {
+        r = try_narrow_mgb raw.
+        if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
+        return (r $payload)?.
+    }
+
+    // ========================================================================
+    // REGISTRY "mgc" — e2e-migration commit/confirm inner $targ (core 0.9.0,
+    // class-B NEW surface, wire 9). Both the commit (e2e_migrate_commit) and
+    // confirm (e2e_migrate_confirm) inner transactions SHARE this registry.
+    // These ride INSIDE the fresh Olm session (the commit is a PRE_KEY on the
+    // staged session; the confirm rides the new session), so $pv is nullable
+    // here — the E2E transcript already authenticates the sender. $epoch binds
+    // the agreement; $session_id (commit only) must byte-equal the CARRIER
+    // envelope's session id, binding the epoch to the concrete fresh session.
+    // Both are CANONICAL BYTES (adapt session_id() output) — every comparison in
+    // the FSM path is byte-equality on this form, no hex re-encoding anywhere.
+    // ========================================================================
+    metadef mgc_targ_v1_t: (
+        $epoch      -> bin,         // the agreement epoch id (32 bytes, mig_epoch)
+        $session_id -> bin+,        // present on COMMIT, absent on CONFIRM
+        $pv         -> int+         // nullable: the E2E session authenticates; unstamped defaults to 9
+    ).
+    metadef mgc_targ_t:     mgc_targ_v1_t.
+    metadef mgc_versions_t: [mgc_targ_v1_t].
+    mgc_max_version = 9.
+
+    fn mgc_version_of (raw: any) -> int
+    {
+        pv = peer_pv raw.
+        return (pv != 0 ?? pv ; 9).
+    }
+
+    // Abort-free classification (M1): $epoch is the only required field (a real
+    // BINARY); $session_id, when present, MUST be BINARY (commit form) — absent
+    // is the confirm form and passes. $pv is nullable (int+), tolerated absent.
+    fn mgc_shape_ok (raw: any) -> bool
+    {
+        e = raw $epoch.   s = raw $session_id.
+        return e != NIL && (_typeof e) == "BINARY" && (s == NIL || (_typeof s) == "BINARY").
+    }
+
+    metadef mgc_narrowed_t: ($ok -> bool, $payload -> mgc_targ_t+, $err -> version_error_t+).
+
+    fn try_narrow_mgc (raw: any) -> mgc_narrowed_t
+    {
+        v = mgc_version_of raw.
+        if v < min_wire_version
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "mgc" v mgc_max_version).
+        }
+        if mgc_shape_ok raw != TRUE
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "mgc" v mgc_max_version).
+        }
+        return ($ok -> TRUE, $payload -> raw safe mgc_targ_v1_t, $err -> NIL).
+    }
+
+    fn narrow_mgc (raw: any) -> mgc_targ_t
+    {
+        r = try_narrow_mgc raw.
+        if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
+        return (r $payload)?.
+    }
 }

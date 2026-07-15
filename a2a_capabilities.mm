@@ -95,6 +95,15 @@ library a2a_capabilities loads libraries
     // never authz (REG-6). Crypto + session state live in the adapt `e2e` library.
     cap_e2e = "core.e2e".
 
+    // core 0.9.0 — the per-connection E2E migration FSM (offer/ack/commit/confirm
+    // + exactly-once bilateral key rotation, a2a_messaging §5). PROTOCOL-surface
+    // id with NO control verbs, $advertise-carried: "I run the migration FSM."
+    // Gates offer emission (fail-closed + pv self-heal, spec §5.4); never authz
+    // (REG-6). SINGLE id, deliberately: migration has NO peer opt-out semantics —
+    // a peer that doesn't want it simply never advertises/answers and legacy
+    // continues untouched (so the receipts-style id PAIR is not needed here).
+    cap_e2e_migrate = "core.e2e.migrate".
+
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
     // these sentinels, and writes interpret them. "$needs_reentry" is the

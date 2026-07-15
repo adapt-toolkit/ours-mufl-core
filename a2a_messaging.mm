@@ -84,6 +84,11 @@ library a2a_messaging loads libraries
     restore_max_attempts = 30.
     // Per-contact cap on messages queued while its keys are being restored.
     deferred_msgs_cap = 50.
+    // core 0.9.0: give up re-driving a per-contact E2E migration after this many
+    // host-sweep attempts (mirrors restore_max_attempts). Exhaustion surfaces a
+    // $migration_stalled notify and KEEPS the FSM state — legacy still flows in
+    // offered/acknowledged; committed keeps queueing — nothing silently downgrades.
+    mig_max_attempts = 30.
 
     // 6-digit bind ceremony limits (code is generated host-side — MUFL has no
     // random source — and handed to set_proxy_pending).
@@ -145,6 +150,47 @@ library a2a_messaging loads libraries
     // flush_deferred) once its AD is re-established. Plain data — EXPORTED.
     metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time).
     deferred_msgs is (global_id ->> deferred_msg_t[]) = (,).
+
+    // ---- core 0.9.0: per-connection E2E migration FSM (spec §5) -----------
+    // ABSENCE = legacy (pre-migration, or the peer is not yet capable). Every
+    // store is keyed by cid, so mixed-contact independence is structural: no
+    // global mode flag exists anywhere. Exported/imported additively (guarded,
+    // absent -> empty); a pre-0.9 blob imports with all three empty = legacy.
+    // Phase A lands the TYPES + STORES + export/import wiring only — NO handlers,
+    // NO route change, NO advertise wiring (those are phases C/D).
+    metadef mig_state_t: (
+        $phase        -> str,        // "offered" | "acknowledged" | "committed" | "active"
+        $initiator    -> bool,       // deterministic election result (mig_initiator; lower cid initiates)
+        $local_nonce  -> bin,        // my proposal nonce (agreement uniquifier, not key material)
+        $peer_nonce   -> bin+,       // set from acknowledged on
+        $epoch        -> bin+,       // set from acknowledged on (mig_epoch)
+        $session_id   -> bin+,       // CANONICAL session-id BYTES (adapt session_id()); set from committed on
+        $local_bundle -> bin+,       // _write'd SNAPSHOT of ($ad,$cert,$root_profile,$cp_binding) THIS attempt —
+                                     // retransmits reuse it byte-identically (§5.4-5); PUBLIC signed material
+                                     // only, so INV-4 holds (no session pickle ever rides the FSM entry)
+        $local_fp     -> bin+,       // e2e_bundle_fp of the snapshot — the epoch input AND the rotation
+                                     // detector (live-fp != $local_fp at retransmit => supersede)
+        $attempts     -> int,        // sweep re-send counter (cap: mig_max_attempts)
+        $updated      -> time
+    ).
+    // $local_bundle/$local_fp are bin+ ONLY for import compatibility (pre-0.9
+    // blobs lack them); semantically offered/acknowledged REQUIRE both non-NIL —
+    // they are written together with the phase in one record assignment, so no
+    // code path produces the phase without the snapshot (spec §5.4 phase invariant).
+    contact_migration is (global_id ->> mig_state_t) = (,).
+
+    // The COMMITTED-EPOCH pin — the §5.7 split of contact_e2e_seen. Set ONLY at
+    // the `active` transition (cryptographic commit); superseded only by a NEWER
+    // committed epoch via a full FSM run; NEVER cleared. Once set, legacy APP-DATA
+    // transport to this contact is PROHIBITED (§5.6 carves out migration-CONTROL
+    // legs). Strictly stronger than contact_e2e_seen (which is advertisement-class
+    // and kept, unchanged, with its 0.8.0 refusal semantics). Canonical bytes.
+    metadef e2e_epoch_t: ($epoch -> bin, $session_id -> bin).
+    contact_e2e_epoch is (global_id ->> e2e_epoch_t) = (,).
+
+    // Sends queued during the initiator's commit window; flushed E2E on `active`.
+    // Reuses deferred_msg_t; bounded by deferred_msgs_cap (same overflow abort).
+    mig_deferred is (global_id ->> deferred_msg_t[]) = (,).
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -2407,7 +2453,13 @@ library a2a_messaging loads libraries
             $deferred_msgs   -> deferred_msgs,
             $contact_pv      -> contact_pv,
             $contact_caps    -> contact_caps,
-            $contact_e2e_seen -> contact_e2e_seen
+            $contact_e2e_seen -> contact_e2e_seen,
+            // core 0.9.0 migration FSM metadata — additive, all keyed by cid. Only
+            // PUBLIC FSM/epoch/queue metadata travels; the staged/active Olm session
+            // pickles stay packet-local in the adapt e2e library (INV-4 / spec §5.1).
+            $contact_migration  -> contact_migration,
+            $contact_e2e_epoch  -> contact_e2e_epoch,
+            $mig_deferred       -> mig_deferred
         ).
     }
 
@@ -2525,6 +2577,23 @@ library a2a_messaging loads libraries
         if (data $contact_e2e_seen) != NIL
         {
             contact_e2e_seen -> (data $contact_e2e_seen) safe (global_id ->> bool).
+        }
+        // core 0.9.0: migration FSM metadata (absent from pre-0.9 exports → all
+        // three stay empty = legacy, spec §5.1). Guarded exactly like the pins.
+        // The adapt staged/active session pickles are packet-local and gone after
+        // an export/import; a non-active FSM entry is re-driven by the host sweep,
+        // an `active` entry with a lost session takes the recovery path (phases C-E).
+        if (data $contact_migration) != NIL
+        {
+            contact_migration -> (data $contact_migration) safe (global_id ->> mig_state_t).
+        }
+        if (data $contact_e2e_epoch) != NIL
+        {
+            contact_e2e_epoch -> (data $contact_e2e_epoch) safe (global_id ->> e2e_epoch_t).
+        }
+        if (data $mig_deferred) != NIL
+        {
+            mig_deferred -> (data $mig_deferred) safe (global_id ->> deferred_msg_t[]).
         }
 
         // Re-register every peer's keys so encrypted channels keep working after
