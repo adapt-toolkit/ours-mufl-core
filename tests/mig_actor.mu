@@ -236,6 +236,21 @@ application actor loads libraries
         actions (_count actions|) -> (transaction::action::return_data ($kind -> $save_state)).
         return transaction::success actions.
     }
+    // Re-send the STORED offer byte-identically from the initiator's FSM snapshot
+    // (simulates the sweep retransmit / a broker duplicate — same nonce, same bundle).
+    trn qa_mig_resend_offer _:($peer -> peer: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        st = a2a_messaging::contact_migration peer.
+        s = _read_or_abort (((st?) $local_bundle)?).
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx peer (
+                $name -> a2a_messaging::e2e_migrate_offer_tx,
+                $targ -> ( $ad -> (s $ad), $cert -> (s $cert), $root_profile -> (s $root_profile),
+                           $cp_binding -> (s $cp_binding), $nonce -> ((st?) $local_nonce), $peer_nonce -> NIL,
+                           $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL) ) ),
+            (transaction::action::return_data ($kind -> $data, $payload -> ($resent -> TRUE))) ].
+    }
     // Read the FSM entry for a contact (phase / epoch / initiator).
     trn readonly qa_mig_state _:($cid -> cid: global_id)
     {

@@ -258,6 +258,16 @@ async function main() {
   const loEp = getBin(loSt, 'epoch'), hiEp = getBin(hiSt, 'epoch');
   ok(loEp.length === 32 && hex(loEp) === hex(hiEp), 'offer/ack: both sides CONVERGE on the same 32-byte epoch');
 
+  // §5.4-5 idempotency: a REDELIVERED offer (same nonce) must NOT recompute a fresh epoch —
+  // the responder re-sends the stored ack byte-identically; its acknowledged epoch is UNCHANGED.
+  await mutate(loN, '::actor::qa_mig_resend_offer', { peer: hiN.cid });
+  await sleep(4000);
+  const hiSt2 = ro(hiN, '::actor::qa_mig_state', { cid: loN.cid });
+  ok(hiSt2.Reduce('phase').Visualize() === 'acknowledged', 'offer idempotency: responder still acknowledged after a duplicate offer');
+  ok(hex(getBin(hiSt2, 'epoch')) === hex(hiEp), 'offer idempotency: duplicate offer does NOT change the responder epoch (§5.4-5 retransmit reproducibility)');
+  const loSt2 = ro(loN, '::actor::qa_mig_state', { cid: hiN.cid });
+  ok(hex(getBin(loSt2, 'epoch')) === hex(loEp), 'offer idempotency: initiator epoch unchanged (no divergence)');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

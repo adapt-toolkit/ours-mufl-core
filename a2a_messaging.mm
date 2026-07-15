@@ -2546,8 +2546,33 @@ library a2a_messaging loads libraries
         }
         // Otherwise the offer came from the LOWER (elected) cid: proceed to ACK,
         // abandoning any competing proposal of mine (deterministic collapse).
-        // GATE 5 — nonce/epoch. Snapshot my fresh bundle, compute the shared epoch.
         offer_nonce = (p $nonce) safe bin.
+        // §5.4-5 IDEMPOTENCY / retransmit reproducibility: a REDELIVERED offer (SAME nonce —
+        // broker dup or the initiator's sweep retransmit) must re-send the STORED ack
+        // byte-identically from the snapshot — NEVER recompute a fresh nonce/epoch, which
+        // would diverge from the epoch the initiator already holds from the first ack. First
+        // verify my snapshot fp still matches my LIVE produce-path bundle; on mismatch (my
+        // bundle rotated since acknowledging) supersede with a fresh nonce/epoch instead of
+        // re-sending a stale ack under the same nonce.
+        prev = contact_migration sender_id.
+        if prev != NIL && ((prev?) $phase) == "acknowledged" && ((prev?) $peer_nonce) != NIL && ((prev?) $peer_nonce) == offer_nonce
+        {
+            live_fp = e2e_bundle_fp (address_document::produce_my_address_document()).
+            if ((prev?) $local_fp) != NIL && ((prev?) $local_bundle) != NIL && live_fp == ((prev?) $local_fp)?
+            {
+                // Byte-identical re-send from the snapshot — NO state write, NO _save_state.
+                rs = _read_or_abort (((prev?) $local_bundle)?).
+                return transaction::success [
+                    encrypted_channel::send_encrypted_tx sender_id (
+                        $name -> e2e_migrate_ack_tx,
+                        $targ -> ( $ad -> (rs $ad), $cert -> (rs $cert), $root_profile -> (rs $root_profile),
+                                   $cp_binding -> (rs $cp_binding), $nonce -> ((prev?) $local_nonce), $peer_nonce -> offer_nonce,
+                                   $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL) ) ) ].
+            }
+            // else: my bundle rotated since acknowledging — fall through to supersede below.
+        }
+        // GATE 5 — nonce/epoch (first offer, a NEW nonce that supersedes, or supersession after
+        // an fp mismatch). Snapshot my fresh bundle, compute the shared epoch.
         b  = my_identity_bundle_fields_fresh NIL.
         lb = _write ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile), $cp_binding -> (b $cp_binding) ).
         my_fp   = e2e_bundle_fp (b $ad).
