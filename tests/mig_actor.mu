@@ -168,6 +168,9 @@ application actor loads libraries
     trn readonly qa_e2e_active _:($cid -> cid: global_id) { return ($sid -> (e2e::active_session_id cid)). }
     trn readonly qa_e2e_staged _:($cid -> cid: global_id) { return ($sid -> (e2e::staged_session_id cid)). }
 
+    // Phase D §5.6 — the app-data route verdict for a cid (5-state).
+    trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
+
     // ---- decode_migration_envelope GUARD matrix (point-1 divergence + binding + forgery/replay) ----
     // This packet's OWN address document (e2e bundle + sign keys), so a receiver can authenticate a
     // migration envelope as coming from this cid (the sender AD decode_migration_envelope binds to).

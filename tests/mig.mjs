@@ -275,6 +275,10 @@ async function main() {
   const hiAct = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
   ok(loAct.length > 0 && hex(loAct) === hex(hiAct), 'handshake: both sides share the SAME active (fresh, rotated) session_id');
   ok(hex(getBin(loPin, 'session_id')) === hex(loAct), 'handshake: epoch pin session_id == active session_id (the exactly-once rotation)');
+  // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
+  // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
+  ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');
+  ok(ro(hiN, '::actor::qa_e2e_route', { cid: loN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): responder app-data route == "e2e" at active (box unreachable)');
 
   // Exhaustive phase handling: a duplicate offer redelivered when the pair is already ACTIVE
   // must be an idempotent NO-OP (not restart the FSM), per §5.6 / MigrationReview C.3 watch-item.

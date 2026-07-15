@@ -711,19 +711,32 @@ library a2a_messaging loads libraries
         return (((ad?) as any) $identity $e2e_bundle) != NIL.
     }
 
-    // Send-side routing (three-state, error-as-data — NOT a hard abort, per
-    // Addition A discipline; cf. receipt_gate which returns without aborting):
-    //   "e2e"               -> send the e2e_signed_message envelope
-    //   "box"               -> first-contact / genuinely-v1 peer: unchanged static box
-    //   "downgrade_refused" -> peer once seen at E2E but no current v2 bundle:
-    //                          fail CLOSED (never silently box a known-E2E peer),
-    //                          surfaced as a typed refusal by the send trn.
+    // Send-side APP-DATA routing (spec §5.6, five-state, error-as-data — NOT a hard
+    // abort; cf. receipt_gate which returns without aborting). Core is the single
+    // routing authority; the daemon obeys this verdict for its e2e app-send path.
+    // The four e2e_migrate_* CONTROL legs are EXEMPT (carve-out, must-fix #5): they
+    // ride encrypted_channel (mgb offer/ack) / the fresh e2e session (mgc commit/
+    // confirm) BY CONSTRUCTION and never pass through this route.
+    //   "e2e"               -> app data rides the migrated e2e session (daemon path)
+    //   "legacy"            -> first-contact / genuinely-v1 peer / pre-commit: box
+    //                          (or a pre-epoch e2e session for already-E2E pairs)
+    //   "migrating"         -> initiator commit window: QUEUE in mig_deferred, flush on active
+    //   "downgrade_refused" -> once E2E (pinned) but no current v2 bundle: fail CLOSED
+    //                          (never silently box a migrated peer) → typed refusal + recovery
     fn e2e_route (cid: global_id) -> str
     {
-        seen = e2e_pinned cid.
-        v2   = peer_has_e2e_bundle cid.
-        if seen && v2 != TRUE { return "downgrade_refused". }
-        return ((seen || v2) ?? "e2e" ; "box").
+        ep = contact_migration cid.
+        if (contact_e2e_epoch cid) != NIL
+        {   // cryptographically committed (epoch pinned): legacy PROHIBITED, irreversibly.
+            if peer_has_e2e_bundle cid { return "e2e". }   // session errors surface at the adapt seam
+            return "downgrade_refused".
+        }
+        // Only the INITIATOR sits in a committed app-send window (the responder's
+        // committed->active is atomic in one tx, so it never queues app data).
+        if ep != NIL && ((ep?) $phase) == "committed" && ((ep?) $initiator) == TRUE { return "migrating". }
+        seen = e2e_pinned cid.   v2 = peer_has_e2e_bundle cid.
+        if seen && v2 != TRUE { return "downgrade_refused". }   // imported 0.8.0 pin, AD absent
+        return ((seen || v2) ?? "e2e" ; "legacy").
     }
 
     // ---- core 0.9.0 migration helpers (spec §5.2) ----------------------------
@@ -1138,6 +1151,37 @@ library a2a_messaging loads libraries
             return transaction::success actions.
         }
 
+        // Phase D §5.6 — APP-DATA traffic barrier. Consult the route BEFORE the box send
+        // (core is the single routing authority; the daemon obeys the verdict for its e2e
+        // app-send path). Every non-legacy verdict is DATA, never an abort, never a silent box.
+        route = e2e_route target_id.
+        if route == "migrating"
+        {   // initiator commit window: QUEUE in mig_deferred (distinct from the restore
+            // deferred_msgs), preserving per-contact order; flushed E2E on active. Bounded.
+            mq is deferred_msg_t[] = [].
+            mcur = mig_deferred target_id.
+            if mcur != NIL { mq -> mcur?. }
+            abort "Migration queue for this contact is full (" + (_str deferred_msgs_cap) + ") — commit window still open." when (_count mq|) >= deferred_msgs_cap.
+            mq (_count mq|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date).
+            mig_deferred target_id -> mq.
+            return transaction::success [
+                _return_data ($sent_to -> target_id, $wire_id -> wire_id, $deferred -> TRUE, $migrating -> TRUE, $queued -> (_count mq|)),
+                _save_state NIL ].
+        }
+        if route == "downgrade_refused"
+        {   // epoch-pinned but no current v2 bundle: fail CLOSED (never box a migrated peer).
+            // Recovery (re-offer over the carve-out) is driven by the migration sweep.
+            return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $downgrade_refused -> TRUE, $code -> $e2e_downgrade_refused) ].
+        }
+        if route == "e2e" && (e2e_pinned target_id || (contact_e2e_epoch target_id) != NIL)
+        {   // KNOWN-E2E peer (epoch-pinned or once-seen): box is unreachable — the DAEMON owns the
+            // app-data e2e send (§5.6); core returns the verdict WITHOUT boxing. A FRESH v2 contact
+            // (never pinned/seen) FALLS THROUGH to the legacy box below: box is a legacy-ALLOWED
+            // transport pre-migration (§5.6 absent row), so pre-migration app delivery is UNCHANGED
+            // (no regression); the daemon may separately use a pre-epoch e2e session.
+            return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e) ].
+        }
+        // route == "legacy" (or a fresh-v2 "e2e", box legacy-allowed) -> unchanged box send below.
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             actions is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
@@ -1188,6 +1232,17 @@ library a2a_messaging loads libraries
         mime_s is str = "".
         if mime != NIL { mime_s -> mime safe str. }
 
+        // Phase D §5.6 — app-data barrier. Files NEVER queue (bulk binary); a non-legacy
+        // route is a typed result telling the caller to retry (migrating) or that box is
+        // refused (downgrade_refused) / to use e2e (daemon path). Never a silent box.
+        froute = e2e_route target_id.
+        if froute == "migrating"
+        { return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $migrating -> TRUE, $code -> $e2e_migrating) ]. }
+        if froute == "downgrade_refused"
+        { return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $downgrade_refused -> TRUE, $code -> $e2e_downgrade_refused) ]. }
+        if froute == "e2e" && (e2e_pinned target_id || (contact_e2e_epoch target_id) != NIL)
+        { return transaction::success [ _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e) ]. }
+        // route == "legacy" (or a fresh-v2 "e2e", box legacy-allowed) -> unchanged box send below.
         return encrypted_channel::execute_transaction target_id (fn (_) -> transaction::results::type {
             actions is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
