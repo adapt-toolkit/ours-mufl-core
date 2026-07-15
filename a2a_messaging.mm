@@ -2489,7 +2489,15 @@ library a2a_messaging loads libraries
         if icst != NIL && ((icst?) $phase) == "committed" && ((icst?) $initiator) == TRUE
         {
             ic_sid = e2e::staged_session_id sender_id.
-            if ic_sid != NIL && ((icst?) $session_id) != NIL && ic_sid == ((icst?) $session_id)
+            // SAFE-INTERIM restriction (MigrationReview): fire ONLY for a BOX-ONLY pair — i.e. NO
+            // pre-migration live session (active_session_id == NIL). Then any inbound e2e message
+            // MUST have decrypted on the STAGED slot (there is no live session to fall through to),
+            // so it IS the §5.5 staged-slot proof. For an ALREADY-E2E pair (live session present) a
+            // legacy message from a still-`acknowledged` responder could decrypt on the OLD session
+            // and would NOT be proof — those pairs rely on the explicit confirm + replay path. The
+            // spec-faithful gate (envelope $session_id == committed.$session_id) needs the decode
+            // path to surface the session_id to this handler (potential __t_wrapper touch) — deferred.
+            if ic_sid != NIL && ((icst?) $session_id) != NIL && ic_sid == ((icst?) $session_id) && (e2e::active_session_id sender_id) == NIL
             {
                 e2e::commit_rotation sender_id.
                 ic_fin = e2e::active_session_id sender_id.
@@ -3004,6 +3012,97 @@ library a2a_messaging loads libraries
         acts (_count acts|) -> _return_data ($flushed -> n, $route -> $e2e).
         acts (_count acts|) -> _save_state NIL.
         return transaction::success acts.
+    }
+
+    // ---- §5.6 recovery sweep (host boot/GC cadence, mirrors restore_degraded_contacts) --------
+    // Re-drive a stalled migration by RETRANSMITTING the persisted phase's leg. offer/ack rebuild
+    // BYTE-IDENTICALLY from the $local_bundle snapshot (§5.4-5 — same nonce, so the peer's already-
+    // computed epoch stays valid); commit re-encrypts on the SURVIVING staged session. Pure builders
+    // (no state write) — the sweep trn bumps $attempts + persists.
+    fn mig_resend_offer_actions (cid: global_id, st: mig_state_t) -> transaction::action::type[]
+    {
+        if (st $local_bundle) == NIL { return []. }
+        s = _read_or_abort ((st $local_bundle)?).
+        return [ encrypted_channel::send_encrypted_tx cid (
+            $name -> e2e_migrate_offer_tx,
+            $targ -> ( $ad -> (s $ad), $cert -> (s $cert), $root_profile -> (s $root_profile),
+                       $cp_binding -> (s $cp_binding), $nonce -> (st $local_nonce), $peer_nonce -> NIL,
+                       $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL) ) ) ].
+    }
+    fn mig_resend_ack_actions (cid: global_id, st: mig_state_t) -> transaction::action::type[]
+    {
+        if (st $local_bundle) == NIL || (st $peer_nonce) == NIL { return []. }
+        s = _read_or_abort ((st $local_bundle)?).
+        return [ encrypted_channel::send_encrypted_tx cid (
+            $name -> e2e_migrate_ack_tx,
+            $targ -> ( $ad -> (s $ad), $cert -> (s $cert), $root_profile -> (s $root_profile),
+                       $cp_binding -> (s $cp_binding), $nonce -> (st $local_nonce), $peer_nonce -> ((st $peer_nonce)?),
+                       $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL) ) ) ].
+    }
+    // Commit re-drive: re-encrypt on the SURVIVING staged session (still PRE_KEY; the responder's
+    // session_matches collapses the duplicate). NIL when the staged session is GONE (crash / m_staged
+    // lost, e.g. post-import) → UNRESUMABLE; the caller abandons + supersedes (fresh offer/epoch).
+    fn mig_resend_commit_actions (cid: global_id, st: mig_state_t) -> transaction::action::type[]+
+    {
+        sid = e2e::staged_session_id cid.
+        if sid == NIL { return NIL. }
+        commit_body = _write ( $name -> e2e_migrate_commit_tx,
+                               $targ -> ( $epoch -> ((st $epoch)?), $session_id -> sid, $pv -> a2a_versions::wire_version ) ).
+        env = e2e::encrypt_staged cid commit_body.
+        return [ encrypted_channel::send_encrypted_tx cid (
+            $name -> e2e_migrate_commit_tx,
+            $targ -> ( $e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature) ) ) ].
+    }
+
+    // Host-fired sweep (boot + GC cadence): re-drive every non-terminal migration. $attempts capped
+    // at mig_max_attempts → $migration_stalled notify (state KEPT — legacy still flows offered/ack,
+    // committed keeps queueing; NOTHING silently downgrades). A committed entry whose staged session
+    // was lost is abandoned + superseded (fresh offer). Idempotent; re-fires on the host cadence.
+    trn sweep_e2e_migrations _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        actions is transaction::action::type[] = [].
+        redriven is int = 0.  stalled is int = 0.  superseded is int = 0.
+        now = (current_transaction_info::get_transaction_time())?.
+        sc contact_migration -- (cid -> st) ?? (((st) $phase) == "offered" || ((st) $phase) == "acknowledged" || ((st) $phase) == "committed")
+        {
+            att is int = (st $attempts).
+            if att >= mig_max_attempts
+            {
+                actions (_count actions|) -> _notify_agent ($event -> $migration_stalled, $cid -> cid, $phase -> (st $phase), $attempts -> att).
+                stalled -> stalled + 1.
+            }
+            else
+            {
+                ph = (st $phase).
+                do_supersede is bool = FALSE.
+                leg is transaction::action::type[] = [].
+                if ph == "offered" { leg -> mig_resend_offer_actions cid st. }
+                elif ph == "acknowledged" { leg -> mig_resend_ack_actions cid st. }
+                else
+                {
+                    rc = mig_resend_commit_actions cid st.
+                    if rc == NIL { do_supersede -> TRUE. } else { leg -> rc?. }
+                }
+                if do_supersede
+                {
+                    sc mig_offer_actions cid -- ( -> a) { actions (_count actions|) -> a. }   // fresh offer/epoch
+                    superseded -> superseded + 1.
+                }
+                else
+                {
+                    sc leg -- ( -> a) { actions (_count actions|) -> a. }
+                    contact_migration cid -> ( $phase -> (st $phase), $initiator -> (st $initiator),
+                        $local_nonce -> (st $local_nonce), $peer_nonce -> (st $peer_nonce), $epoch -> (st $epoch),
+                        $session_id -> (st $session_id), $local_bundle -> (st $local_bundle), $local_fp -> (st $local_fp),
+                        $attempts -> (att + 1), $updated -> now ).
+                    redriven -> redriven + 1.
+                }
+            }
+        }
+        actions (_count actions|) -> _return_data ($redriven -> redriven, $stalled -> stalled, $superseded -> superseded).
+        if (redriven + superseded) > 0 { actions (_count actions|) -> _save_state NIL. }
+        return transaction::success actions.
     }
 
     // ---- upgrade: state export / import helpers ------------------------------

@@ -310,6 +310,15 @@ async function main() {
   await mutate(loN, '::actor::qa_learn_peer', { cid: synC, pv: 8, caps: [] });
   ok(!fires(synC), 'trigger(§5.4): OLD peer (pv<9, no cap) → NO offer (CRITERION 1)');
   ok(!fires(hiN.cid), 'trigger(§5.4): already-migrated contact → NO offer (fires-once / in-flight gate)');
+  // §5.6 recovery sweep: re-drive a stalled migration + $attempts cap → $migration_stalled. (Runs
+  // LAST — qa_mig_force_offered overwrites loN's contact_migration[hiN].) hiN is a registered contact
+  // so the re-drive's send does not abort; hiN is active so it no-ops the stray re-offer.
+  await mutate(loN, '::actor::qa_mig_force_offered', { cid: hiN.cid });
+  const sw1 = await mutate(loN, '::a2a_messaging::sweep_e2e_migrations', {});
+  ok(sw1.Reduce('redriven').Visualize() === '1' && sw1.Reduce('stalled').Visualize() === '0', 'sweep(§5.6): re-drives an offered migration (byte-identical retransmit), bumps $attempts');
+  await mutate(loN, '::actor::qa_mig_set_attempts', { cid: hiN.cid, n: 30 });
+  const sw2 = await mutate(loN, '::a2a_messaging::sweep_e2e_migrations', {});
+  ok(sw2.Reduce('stalled').Visualize() === '1' && sw2.Reduce('redriven').Visualize() === '0', 'sweep(§5.6): $attempts cap → $migration_stalled (state kept, no re-drive)');
   // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');

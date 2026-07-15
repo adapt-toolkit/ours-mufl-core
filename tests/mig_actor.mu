@@ -191,6 +191,23 @@ application actor loads libraries
     }
     trn readonly qa_mig_should_trigger _:($cid -> cid: global_id) { return ($fire -> (a2a_messaging::mig_should_trigger cid)). }
 
+    // §5.6 sweep test helpers. Force an `offered` FSM entry (real snapshot, via mig_offer_actions —
+    // discard the send) so the sweep has something to re-drive; and set $attempts to exercise the cap.
+    trn qa_mig_force_offered _:($cid -> cid: global_id)
+    {
+        sc a2a_messaging::mig_offer_actions cid -- ( -> a) { }   // side-effect: writes contact_migration=offered
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+    trn qa_mig_set_attempts _:($cid -> cid: global_id, $n -> n: int)
+    {
+        st = a2a_messaging::contact_migration cid.
+        a2a_messaging::contact_migration cid -> ( $phase -> ((st?) $phase), $initiator -> ((st?) $initiator),
+            $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> ((st?) $epoch),
+            $session_id -> ((st?) $session_id), $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp),
+            $attempts -> n, $updated -> ((st?) $updated) ).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
     // Phase D §5.6 flush test helpers. Inject a 3-message mig_deferred queue for `cid` (via the
     // import path — REPLACE-if-present, leaves the active pin untouched), read the queued wire_ids
     // in order, and invoke the real flush (drain FIFO + clear via a2a_messaging::flush_mig_deferred_actions).
