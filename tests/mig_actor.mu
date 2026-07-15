@@ -262,6 +262,20 @@ application actor loads libraries
             $initiator -> ((st == NIL ?? FALSE ; ((st?) $initiator)))
         ).
     }
+    // Read the committed-epoch pin (contact_e2e_epoch) + the advertisement pin (contact_e2e_seen).
+    trn readonly qa_mig_pin _:($cid -> cid: global_id)
+    {
+        ep = a2a_messaging::contact_e2e_epoch cid.
+        epb is bin+ = NIL.
+        esid is bin+ = NIL.
+        if ep != NIL { epb -> (ep?) $epoch.  esid -> (ep?) $session_id. }
+        return (
+            $pinned     -> (ep != NIL),
+            $epoch      -> epb,
+            $session_id -> esid,
+            $seen       -> ((a2a_messaging::contact_e2e_seen cid) == TRUE)
+        ).
+    }
 
     // Read both libraries' state for `cid` AFTER the aborted tx: both must be absent.
     trn readonly qa_atomicity_check _:($cid -> cid: global_id)

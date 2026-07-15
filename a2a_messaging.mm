@@ -32,6 +32,7 @@ library a2a_messaging loads libraries
     key_storage,
     current_transaction_info,
     encrypted_channel,
+    e2e,
     a2a_versions,
     a2a_protocol,
     a2a_capabilities,
@@ -358,6 +359,19 @@ library a2a_messaging loads libraries
         on_file_received -> file_received_cb.
         on_file_sent -> file_sent_cb.
         if receipt_cb != NIL { on_receipt_received -> receipt_cb?. }
+        // core 0.9.0 (spec §5.5): register the decode-seam migration-pending predicate so
+        // the adapt e2e receive path STAGES an inbound migration-commit PRE_KEY (instead of
+        // unilaterally replacing the live session). TRUE only while a migration is genuinely
+        // IN-FLIGHT for the cid (offered/acknowledged/committed) — NEVER post-active: an
+        // epoch-pinned contact's self-heal pre-key must go through recovery/route, not raw
+        // staging. Empty FSM (no migration) -> FALSE -> pure 0.8.0 decode behavior.
+        e2e::set_mig_pending_hook (fn (c: global_id) -> bool
+        {
+            st = contact_migration c.
+            if st == NIL { return FALSE. }
+            ph = (st?) $phase.
+            return ph == "offered" || ph == "acknowledged" || ph == "committed".
+        }).
     }
 
     // ---- shared action builders -------------------------------------------
@@ -2555,6 +2569,12 @@ library a2a_messaging loads libraries
         // bundle rotated since acknowledging) supersede with a fresh nonce/epoch instead of
         // re-sending a stale ack under the same nonce.
         prev = contact_migration sender_id.
+        // §5.6 / exhaustive phase handling: a redelivered offer AFTER the migration already
+        // progressed to committed/active is an idempotent NO-OP — never restart the FSM. Only a
+        // genuinely new agreement after `active` (a NEW nonce/epoch, epoch-pinned) triggers §5.6
+        // re-rotation recovery (phase D/E); a stale same-nonce redeliver here is a late duplicate.
+        if prev != NIL && (((prev?) $phase) == "committed" || ((prev?) $phase) == "active")
+        { return transaction::success []. }
         if prev != NIL && ((prev?) $phase) == "acknowledged" && ((prev?) $peer_nonce) != NIL && ((prev?) $peer_nonce) == offer_nonce
         {
             live_fp = e2e_bundle_fp (address_document::produce_my_address_document()).
@@ -2630,15 +2650,194 @@ library a2a_messaging loads libraries
         peer_fp = e2e_bundle_fp (vb $ad).
         now = (current_transaction_info::get_transaction_time())?.
         epoch = mig_epoch (_get_container_id()) sender_id my_local_nonce ack_nonce my_fp peer_fp.
-        // WRITES LAST — persist acknowledged (keep my snapshot). §5.5 commit is next.
-        contact_migration sender_id -> ( $phase -> "acknowledged", $initiator -> TRUE,
-            $local_nonce -> my_local_nonce, $peer_nonce -> ack_nonce, $epoch -> epoch, $session_id -> NIL,
+        // §5.5 COMMIT (same tx, atomic — cross-lib rollback proven, plan B gate 5): stage a
+        // FRESH outbound session to the peer's ACKED bundle, encrypt the commit body on it
+        // (PRE_KEY), persist committed, send. The commit is END-TO-END bound — epoch +
+        // session_id ride INSIDE the fresh session's ciphertext (a relay cannot re-target,
+        // replay across pairs, or splice epochs; the outer $emsignature binds $from/$to).
+        pb = (((vb $ad) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        sid = e2e::stage_outbound_rotation sender_id pb.
+        commit_body = _write ( $name -> e2e_migrate_commit_tx,
+                               $targ -> ( $epoch -> epoch, $session_id -> sid, $pv -> a2a_versions::wire_version ) ).
+        env = e2e::encrypt_staged sender_id commit_body.
+        // WRITES LAST — persist committed(session_id) atomically with the commit send.
+        contact_migration sender_id -> ( $phase -> "committed", $initiator -> TRUE,
+            $local_nonce -> my_local_nonce, $peer_nonce -> ack_nonce, $epoch -> epoch, $session_id -> sid,
             $local_bundle -> ((st?) $local_bundle), $local_fp -> my_fp, $attempts -> ((st?) $attempts), $updated -> now ).
+        // BOXED transport (B): the SDK wire schema has no e2e_signed_message transaction variant
+        // yet (a coordinated plan-F SDK-bundle regen), so the staged-session Olm ciphertext rides
+        // as $targ INSIDE the legacy encrypted_channel box; the responder handler drives the e2e
+        // decode. The box is PURE TRANSPORT — epoch + session_id stay INSIDE the Olm ciphertext,
+        // the $emsignature still binds $from/$to/$envelope (verified handler-side, decode_migration_envelope).
         return transaction::success [
+            encrypted_channel::send_encrypted_tx sender_id (
+                $name -> e2e_migrate_commit_tx,
+                $targ -> ( $e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature) ) ),
             _notify_agent ($event -> $migration_started, $cid -> sender_id, $role -> $initiator),
             _save_state NIL ].
     }
     trn e2e_migrate_ack args: any { return handle_e2e_migrate_ack args. }
+
+    // A redelivered migration COMMIT after we already promoted to active (§5.5 lost-confirm: the
+    // initiator's sweep re-sends its commit because our confirm was lost). Evidence rule: re-send
+    // the confirm ONLY when we are genuinely active for this cid on the PINNED session (the epoch
+    // pin's $session_id == the live active session) — proof we already completed THIS rotation.
+    // NO decode (never risk self-healing the live session at active), NO inner re-dispatch, NO
+    // state change; a stale/foreign replay drops silently.
+    fn mig_handle_replayed_commit (sender_id: global_id) -> transaction::results::type
+    {
+        st = contact_migration sender_id.
+        if st == NIL || ((st?) $phase) != "active" { return transaction::success []. }
+        pin = contact_e2e_epoch sender_id.
+        active_sid = e2e::active_session_id sender_id.
+        if pin == NIL || active_sid == NIL || ((pin?) $session_id) != active_sid { return transaction::success []. }
+        confirm_body = _write ( $name -> e2e_migrate_confirm_tx, $targ -> ( $epoch -> ((pin?) $epoch), $pv -> a2a_versions::wire_version ) ).
+        cpb = ((((peer_ads sender_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        cenv = e2e::encrypt_to sender_id confirm_body cpb.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx sender_id (
+                $name -> e2e_migrate_confirm_tx,
+                $targ -> ( $e2e_envelope -> (cenv $e2e_envelope), $emsignature -> (cenv $emsignature) ) ) ].
+    }
+
+    // COMMIT handler (responder). Under B the commit rides a NAMED box carrying the staged-session
+    // Olm ciphertext as $targ = {$e2e_envelope, $emsignature}; the __t_wrapper decode-seam is NOT
+    // invoked, so THIS handler drives the e2e decode (via the shared, audited e2e::decode_migration_
+    // envelope — S1/S2 verify bound to the box sender + me, then decrypt+STAGE on the fresh session).
+    // Gate ALL before any write: phase==acknowledged; carrier shape; S1/S2 + decrypt; narrow(mgc) of
+    // the DECRYPTED inner body; inner $epoch==stored epoch; inner $session_id==the CARRIER session
+    // (staged if staged, else the just-installed active). ANY mismatch: discard the staged rotation,
+    // typed reject, REMAIN acknowledged (sweep re-drives). A dup at active -> idempotent re-confirm.
+    // Success: promote atomically in ONE tx — commit_rotation + BOTH pins + active + send confirm.
+    fn handle_e2e_migrate_commit (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        st = contact_migration sender_id.
+        if st == NIL { return transaction::success []. }
+        ph = ((st?) $phase).
+        // A commit arriving after we went active (peer lost our confirm): idempotent re-confirm on
+        // the pinned active session — NO decode. Any other non-acknowledged phase drops as data.
+        if ph == "active" { return mig_handle_replayed_commit sender_id. }
+        if ph != "acknowledged" { return transaction::success []. }
+        // GATE 0 — carrier shape (no-downgrade: a missing/garbage e2e envelope FAILS closed; the
+        // box is never treated as a legacy/plaintext commit).
+        env is e2e::t_e2e_envelope+ = (args $e2e_envelope) safe e2e::t_e2e_envelope.
+        emsig is crypto_signature+ = (args $emsignature) safe crypto_signature.
+        if env == NIL || emsig == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_malformed_envelope) ]. }
+        // GATE 1 — need the box sender's VERIFIED AD (refreshed at offer/ack) to authenticate the
+        // envelope: sign key + e2e identity key are read from THIS cid's AD (tight $from binding).
+        pad = peer_ads sender_id.
+        if pad == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_no_peer_ad) ]. }
+        // GATE 2 — handler-driven e2e decode (ALL crypto in e2e.mm). At acknowledged mig_pending is
+        // TRUE, so the decode-seam STAGES onto a fresh session (the live session is untouched).
+        r = e2e::decode_migration_envelope sender_id (_get_container_id()) (pad?) (env?) (emsig?).
+        if (r $ok) != TRUE
+        {   // tampered / session_mismatch / no_session / replay-at-acknowledged: reject, drop the
+            // staged rotation, REMAIN acknowledged (never fall back to legacy). The sweep re-drives.
+            e2e::discard_rotation sender_id.
+            return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_decrypt_failed), _save_state NIL ].
+        }
+        // GATE 3 — narrow the DECRYPTED inner commit body (used ONLY for gating, never emitted).
+        inner = (key_storage::read_external ((r $plaintext)?)) safe transaction::unsigned_message.
+        if inner == NIL
+        { e2e::discard_rotation sender_id.
+          return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_inner_malformed), _save_state NIL ]. }
+        nr = a2a_versions::try_narrow_mgc ((inner?) $targ).
+        if (nr $ok) != TRUE
+        { e2e::discard_rotation sender_id.
+          return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_inner_malformed), _save_state NIL ]. }
+        p = (nr $payload)?.
+        stored_epoch = ((st?) $epoch)?.
+        staged_sid = e2e::staged_session_id sender_id.
+        active_sid = e2e::active_session_id sender_id.
+        carrier_sid = (staged_sid != NIL ?? staged_sid ; active_sid).   // where the commit landed
+        inner_sid = (p $session_id).
+        if (p $epoch) != stored_epoch || inner_sid == NIL || carrier_sid == NIL || inner_sid != carrier_sid
+        {
+            e2e::discard_rotation sender_id.
+            return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $commit_epoch_or_session_mismatch), _save_state NIL ].
+        }
+        // SUCCESS — one atomic tx. commit_rotation is the SOLE promotion point (promotes a
+        // staged rotation; a no-op when the fresh session was already installed directly).
+        e2e::commit_rotation sender_id.
+        final_sid = e2e::active_session_id sender_id.   // the now-active fresh session (== carrier)
+        contact_e2e_epoch sender_id -> ( $epoch -> stored_epoch, $session_id -> (final_sid?) ).
+        contact_e2e_seen sender_id -> TRUE.
+        now = (current_transaction_info::get_transaction_time())?.
+        contact_migration sender_id -> ( $phase -> "active", $initiator -> FALSE,
+            $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> stored_epoch, $session_id -> (final_sid?),
+            $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp), $attempts -> ((st?) $attempts), $updated -> now ).
+        // Confirm rides the NEW (now-active) session — encrypt_to targets m_sessions[sender] —
+        // BOXED (same wire-schema constraint). The initiator decodes it on its staged slot.
+        confirm_body = _write ( $name -> e2e_migrate_confirm_tx, $targ -> ( $epoch -> stored_epoch, $pv -> a2a_versions::wire_version ) ).
+        cpb = ((((peer_ads sender_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        cenv = e2e::encrypt_to sender_id confirm_body cpb.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx sender_id (
+                $name -> e2e_migrate_confirm_tx,
+                $targ -> ( $e2e_envelope -> (cenv $e2e_envelope), $emsignature -> (cenv $emsignature) ) ),
+            _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $responder),
+            _save_state NIL ].
+    }
+    trn e2e_migrate_commit args: any { return handle_e2e_migrate_commit args. }
+
+    // CONFIRM handler (initiator). Under B the confirm rides a NAMED box carrying the responder's
+    // olm_type=1 ciphertext (encrypted on its now-active session) as $targ; THIS handler drives the
+    // decode via e2e::decode_migration_envelope, which decrypts on the initiator's STAGED slot (not
+    // yet promoted). Gate: phase==committed; carrier shape; S1/S2 + decrypt; narrow(mgc); inner
+    // $epoch matches. Success: promote atomically — commit_rotation + BOTH pins + active
+    // (+ flush mig_deferred over the new e2e path — that flush is wired in phase D).
+    fn handle_e2e_migrate_confirm (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        st = contact_migration sender_id.
+        if st == NIL { return transaction::success []. }
+        ph = ((st?) $phase).
+        if ph == "active" { return transaction::success []. }   // dup confirm after promotion: no-op
+        if ph != "committed" { return transaction::success []. }
+        // GATE 0 — carrier shape (no-downgrade).
+        env is e2e::t_e2e_envelope+ = (args $e2e_envelope) safe e2e::t_e2e_envelope.
+        emsig is crypto_signature+ = (args $emsignature) safe crypto_signature.
+        if env == NIL || emsig == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $confirm_malformed_envelope) ]. }
+        pad = peer_ads sender_id.
+        if pad == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $confirm_no_peer_ad) ]. }
+        // GATE 1 — handler-driven decode: olm_type=1 on the STAGED slot (initiator reads confirm
+        // pre-promotion). A tampered/foreign confirm fails closed; the staged slot is untouched.
+        r = e2e::decode_migration_envelope sender_id (_get_container_id()) (pad?) (env?) (emsig?).
+        if (r $ok) != TRUE
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $confirm_decrypt_failed) ]. }
+        // GATE 2 — narrow the DECRYPTED inner confirm body + epoch match (used ONLY for gating).
+        inner = (key_storage::read_external ((r $plaintext)?)) safe transaction::unsigned_message.
+        if inner == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $confirm_inner_malformed) ]. }
+        nr = a2a_versions::try_narrow_mgc ((inner?) $targ).
+        if (nr $ok) != TRUE
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $confirm_inner_malformed) ]. }
+        p = (nr $payload)?.
+        stored_epoch = ((st?) $epoch)?.
+        if (p $epoch) != stored_epoch { return transaction::success []. }   // stale/foreign confirm, drop
+        // SUCCESS — promote atomically. commit_rotation promotes the initiator's staged session.
+        e2e::commit_rotation sender_id.
+        final_sid = e2e::active_session_id sender_id.
+        contact_e2e_epoch sender_id -> ( $epoch -> stored_epoch, $session_id -> (final_sid?) ).
+        contact_e2e_seen sender_id -> TRUE.
+        now = (current_transaction_info::get_transaction_time())?.
+        contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
+            $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> stored_epoch, $session_id -> (final_sid?),
+            $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp), $attempts -> ((st?) $attempts), $updated -> now ).
+        return transaction::success [
+            _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator),
+            _save_state NIL ].
+    }
+    trn e2e_migrate_confirm args: any { return handle_e2e_migrate_confirm args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state trn composes these

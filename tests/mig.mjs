@@ -29,7 +29,8 @@ function mk(name) { return { name, pw: null, cid: '', pending: [] }; }
 function wire(id) {
   id.pw.on_return_data = (d) => {
     const kind = d.Reduce('kind').Visualize();
-    if (kind === 'notify_agent' || kind === 'save_state') return;
+    if (kind === 'notify_agent') { try { const pl=d.Reduce('payload'); const ev=pl.Reduce('event').Visualize(); if(/migration|protocol_error/.test(ev)) process.stderr.write(`[notify ${id.name}] ${ev} reason=${pl.Reduce('reason').Visualize()} cid=${pl.Reduce('cid').Visualize().slice(0,10)}\n`); } catch {} return; }
+    if (kind === 'save_state') return;
     const p = id.pending.shift(); if (!p) return;
     clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
   };
@@ -57,7 +58,7 @@ const mutate = (id, name, targ) => new Promise((res, rej) => {
 });
 const binv = (id, buf) => id.pw.packet.NewBinaryFromBuffer(Buffer.from(buf));
 const ro = (id, name, targ) => id.pw.packet.ExecuteTransaction(object_to_adapt_value({ name, targ }));
-const getBin = (p, k) => Buffer.from(p.Reduce(k).GetBinary());
+const getBin = (p, k) => { try { return Buffer.from(p.Reduce(k).GetBinary()); } catch { return Buffer.alloc(0); } };
 const hex = (buf) => Buffer.from(buf).toString('hex');
 
 async function main() {
@@ -238,7 +239,7 @@ async function main() {
   const fpA2 = getBin(ro(A, '::actor::qa_mig_bundle_fp', {}), 'fp');
   ok(fpA.length === 32 && hex(fpA) === hex(fpA2), 'e2e_bundle_fp: deterministic 32-byte fingerprint of my e2e bundle');
 
-  console.log('=== mig: offer/ack handshake over the channel (FSM → acknowledged, epoch converges) ===');
+  console.log('=== mig: FULL handshake offer→ack→commit→confirm→ACTIVE (bilateral rotation + pins) ===');
   const I2 = await mkNode('mig-gate-I2', 'I2');
   const R2 = await mkNode('mig-gate-R2', 'R2'); await sleep(1000);
   // establish mutual contact via the invite flow (so the encrypted_channel exists)
@@ -246,27 +247,44 @@ async function main() {
   const invBlob = Buffer.from(inv.Reduce('invite').GetBinary());
   await mutate(R2, '::a2a_messaging::add_contact', { invite: binv(R2, invBlob), name: 'I2' });
   await sleep(6000);   // invite redeem round-trips over the broker
-  // trigger the OFFER from the LOWER cid → direct offer→ack (a higher-cid trigger would solicit)
+  // trigger the OFFER from the LOWER cid → the ack handler proceeds to commit, and the whole
+  // offer→ack→commit→confirm handshake runs automatically over the broker to ACTIVE.
   const [loN, hiN] = I2.cid < R2.cid ? [I2, R2] : [R2, I2];
   await mutate(loN, '::actor::qa_mig_trigger_offer', { peer: hiN.cid });
-  await sleep(5000);   // offer → ack round-trip
+  await sleep(10000);   // 4 legs: offer → ack → commit → confirm
+  { const la=getBin(ro(loN,'::actor::qa_e2e_active',{cid:hiN.cid}),'sid'); const ha=getBin(ro(hiN,'::actor::qa_e2e_active',{cid:loN.cid}),'sid');
+    const ls=ro(loN,'::actor::qa_mig_state',{cid:hiN.cid}); const hs=ro(hiN,'::actor::qa_mig_state',{cid:loN.cid});
+    console.log(`  DIAG lo(init): phase=${ls.Reduce('phase').Visualize()} active=${hex(la).slice(0,12)||'NIL'}`);
+    console.log(`  DIAG hi(resp): phase=${hs.Reduce('phase').Visualize()} active=${hex(ha).slice(0,12)||'NIL'}`); }
   const loSt = ro(loN, '::actor::qa_mig_state', { cid: hiN.cid });
   const hiSt = ro(hiN, '::actor::qa_mig_state', { cid: loN.cid });
-  ok(loSt.Reduce('phase').Visualize() === 'acknowledged', 'offer/ack: initiator (lower cid) reaches acknowledged');
-  ok(hiSt.Reduce('phase').Visualize() === 'acknowledged', 'offer/ack: responder (higher cid) reaches acknowledged');
-  ok(T(loSt.Reduce('initiator').Visualize()) && !T(hiSt.Reduce('initiator').Visualize()), 'offer/ack: election roles correct (lower=initiator, higher=responder)');
+  log('HANDSHAKE PHASES: initiator=' + loSt.Reduce('phase').Visualize() + ' responder=' + hiSt.Reduce('phase').Visualize());
+  ok(loSt.Reduce('phase').Visualize() === 'active', 'handshake: initiator reaches ACTIVE');
+  ok(hiSt.Reduce('phase').Visualize() === 'active', 'handshake: responder reaches ACTIVE');
+  ok(T(loSt.Reduce('initiator').Visualize()) && !T(hiSt.Reduce('initiator').Visualize()), 'handshake: election roles correct (lower=initiator, higher=responder)');
   const loEp = getBin(loSt, 'epoch'), hiEp = getBin(hiSt, 'epoch');
-  ok(loEp.length === 32 && hex(loEp) === hex(hiEp), 'offer/ack: both sides CONVERGE on the same 32-byte epoch');
+  ok(loEp.length === 32 && hex(loEp) === hex(hiEp), 'handshake: both sides on the same 32-byte epoch');
+  // both pins set at active (contact_e2e_epoch + contact_e2e_seen)
+  const loPin = ro(loN, '::actor::qa_mig_pin', { cid: hiN.cid });
+  const hiPin = ro(hiN, '::actor::qa_mig_pin', { cid: loN.cid });
+  ok(T(loPin.Reduce('pinned').Visualize()) && T(hiPin.Reduce('pinned').Visualize()), 'handshake: contact_e2e_epoch pinned BOTH sides');
+  ok(T(loPin.Reduce('seen').Visualize()) && T(hiPin.Reduce('seen').Visualize()), 'handshake: contact_e2e_seen set BOTH sides');
+  ok(hex(getBin(loPin, 'epoch')) === hex(loEp), 'handshake: epoch pin == FSM epoch');
+  // the bilateral rotation: both sides share the SAME fresh active session, == the pinned session
+  const loAct = getBin(ro(loN, '::actor::qa_e2e_active', { cid: hiN.cid }), 'sid');
+  const hiAct = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
+  ok(loAct.length > 0 && hex(loAct) === hex(hiAct), 'handshake: both sides share the SAME active (fresh, rotated) session_id');
+  ok(hex(getBin(loPin, 'session_id')) === hex(loAct), 'handshake: epoch pin session_id == active session_id (the exactly-once rotation)');
 
-  // §5.4-5 idempotency: a REDELIVERED offer (same nonce) must NOT recompute a fresh epoch —
-  // the responder re-sends the stored ack byte-identically; its acknowledged epoch is UNCHANGED.
+  // Exhaustive phase handling: a duplicate offer redelivered when the pair is already ACTIVE
+  // must be an idempotent NO-OP (not restart the FSM), per §5.6 / MigrationReview C.3 watch-item.
   await mutate(loN, '::actor::qa_mig_resend_offer', { peer: hiN.cid });
   await sleep(4000);
   const hiSt2 = ro(hiN, '::actor::qa_mig_state', { cid: loN.cid });
-  ok(hiSt2.Reduce('phase').Visualize() === 'acknowledged', 'offer idempotency: responder still acknowledged after a duplicate offer');
-  ok(hex(getBin(hiSt2, 'epoch')) === hex(hiEp), 'offer idempotency: duplicate offer does NOT change the responder epoch (§5.4-5 retransmit reproducibility)');
-  const loSt2 = ro(loN, '::actor::qa_mig_state', { cid: hiN.cid });
-  ok(hex(getBin(loSt2, 'epoch')) === hex(loEp), 'offer idempotency: initiator epoch unchanged (no divergence)');
+  ok(hiSt2.Reduce('phase').Visualize() === 'active', 'idempotency: duplicate offer at ACTIVE is a no-op (FSM not restarted)');
+  ok(hex(getBin(hiSt2, 'epoch')) === hex(hiEp), 'idempotency: duplicate offer does NOT change the epoch');
+  const hiAct2 = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
+  ok(hex(hiAct2) === hex(hiAct), 'idempotency: duplicate offer does NOT disturb the active session');
 
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
