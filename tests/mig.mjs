@@ -296,6 +296,20 @@ async function main() {
   const flushed = await mutate(loN, '::actor::qa_mig_flush', { cid: hiN.cid });
   ok(flushed.Reduce('flushed').Visualize() === '3' && flushed.Reduce('order').Visualize() === 'w0,w1,w2,', 'flush(§5.6): drained FIFO in order (w0,w1,w2) over e2e');
   ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '0', 'flush(§5.6): mig_deferred empty after flush (queue drained in one pass)');
+  // §5.4 trigger GATE — the criterion-1 boundary (old peers must NEVER get an offer). Tested via
+  // the pure predicate mig_should_trigger (no send). ISOLATED cap advertise on loN (does not touch
+  // the full-suite test_actor). synthetic peer cids.
+  const CAP = 'core.e2e.migrate', synA = 'aa'.repeat(32), synB = 'bb'.repeat(32), synC = 'cc'.repeat(32);
+  const fires = (cid) => T(ro(loN, '::actor::qa_mig_should_trigger', { cid }).Reduce('fire').Visualize());
+  await mutate(loN, '::actor::qa_learn_peer', { cid: synA, pv: 9, caps: [] });
+  ok(!fires(synA), 'trigger(§5.4): NO offer before we advertise cap_e2e_migrate (self-advertise gate, fail-closed)');
+  await mutate(loN, '::actor::qa_init_caps', { advertise: [CAP] });
+  ok(fires(synA), 'trigger(§5.4): 0.9 peer via pv>=9 → offer fires (pv self-heal leg)');
+  await mutate(loN, '::actor::qa_learn_peer', { cid: synB, pv: 8, caps: [CAP] });
+  ok(fires(synB), 'trigger(§5.4): 0.9 peer via advertised caps → offer fires (caps leg)');
+  await mutate(loN, '::actor::qa_learn_peer', { cid: synC, pv: 8, caps: [] });
+  ok(!fires(synC), 'trigger(§5.4): OLD peer (pv<9, no cap) → NO offer (CRITERION 1)');
+  ok(!fires(hiN.cid), 'trigger(§5.4): already-migrated contact → NO offer (fires-once / in-flight gate)');
   // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');

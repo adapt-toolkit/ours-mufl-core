@@ -825,16 +825,44 @@ library a2a_messaging loads libraries
     // don't advertise the cap, or the peer isn't known-0.9, emit nothing — an old peer never gets
     // an offer. Returns [] (NO state write) when the trigger doesn't fire; the CALLER emits
     // _save_state alongside the returned offer (mig_offer_actions persists `offered`).
-    fn mig_trigger_actions (cid: global_id) -> transaction::action::type[]
+    // The trigger GATE (pure predicate — testable in isolation; THIS is the criterion-1 boundary:
+    // an old peer must NEVER satisfy it). TRUE iff: no migration yet ∧ WE advertise cap_e2e_migrate
+    // ∧ the peer is known-0.9 (its caps advertise cap_e2e_migrate, OR its learned pv>=9). Any gate
+    // fails → FALSE (no offer). Fail-closed (§1.5).
+    fn mig_should_trigger (cid: global_id) -> bool
     {
-        if (contact_migration cid) != NIL { return []. }                     // already in-flight / done
-        if (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate) != TRUE { return []. }
+        if (contact_migration cid) != NIL { return FALSE. }                  // already in-flight / done
+        if (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate) != TRUE { return FALSE. }
         peer_capable is bool = FALSE.
         caps = contact_caps cid.
         if caps != NIL { sc caps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_migrate { peer_capable -> TRUE. } } }
         pv = contact_pv cid.
-        if peer_capable != TRUE && (pv == NIL || pv? < 9) { return []. }     // fail-closed: not known-0.9
+        if peer_capable != TRUE && (pv == NIL || pv? < 9) { return FALSE. }  // not known-0.9
+        return TRUE.
+    }
+
+    fn mig_trigger_actions (cid: global_id) -> transaction::action::type[]
+    {
+        if (mig_should_trigger cid) != TRUE { return []. }
         return mig_offer_actions cid.
+    }
+
+    // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
+    // (the daemon sends over the now-active migrated session — core is routing-authority only).
+    // The CALLER MUST have set the epoch pin FIRST (else a re-injected send routes "migrating" and
+    // re-queues). Clears the queue; an empty queue yields no actions; per-contact order preserved.
+    fn flush_mig_deferred_actions (cid: global_id) -> transaction::action::type[]
+    {
+        out is transaction::action::type[] = [].
+        q = mig_deferred cid.
+        if q == NIL || (_count q?|) == 0 { return out. }
+        sc q? -- ( -> m)
+        {
+            out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
+                $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to), $route -> $e2e ).
+        }
+        delete mig_deferred cid.
+        return out.
     }
 
     // ---- core 0.5.0 versioning helpers ---------------------------------------
@@ -2447,6 +2475,36 @@ library a2a_messaging loads libraries
         // we append the FORCED inbound monitoring copy as core code (after the hook,
         // self-gating on monitoring_proxy) so the app cannot suppress it.
         actions is transaction::action::type[] = [].
+        // §5.5 must-fix-C IMPLICIT CONFIRM (initiator responder-active window). If I am still
+        // `committed` for this sender and my STAGED session IS the committed rotation, an inbound
+        // app message here is cryptographic proof the responder installed that session and went
+        // active (it only sends ordinary traffic on the NEW session post-promotion; the wrapper
+        // decode-seam decrypted this on my staged slot). Promote NOW, in strict order
+        // [promote -> flush -> process]. MUST-FIX C: this transition rides the SAME tx as the app
+        // hook below — if the hook ABORTS, commit_rotation + pins + flush roll back together and
+        // the FSM stays `committed` (the explicit confirm / sweep retry then completes). The
+        // explicit confirm handler is a no-op once this ran (phase already active).
+        did_ic is bool = FALSE.
+        icst = contact_migration sender_id.
+        if icst != NIL && ((icst?) $phase) == "committed" && ((icst?) $initiator) == TRUE
+        {
+            ic_sid = e2e::staged_session_id sender_id.
+            if ic_sid != NIL && ((icst?) $session_id) != NIL && ic_sid == ((icst?) $session_id)
+            {
+                e2e::commit_rotation sender_id.
+                ic_fin = e2e::active_session_id sender_id.
+                ic_ep = ((icst?) $epoch)?.
+                contact_e2e_epoch sender_id -> ( $epoch -> ic_ep, $session_id -> (ic_fin?) ).
+                contact_e2e_seen sender_id -> TRUE.
+                ic_now = (current_transaction_info::get_transaction_time())?.
+                contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
+                    $local_nonce -> ((icst?) $local_nonce), $peer_nonce -> ((icst?) $peer_nonce), $epoch -> ic_ep, $session_id -> (ic_fin?),
+                    $local_bundle -> ((icst?) $local_bundle), $local_fp -> ((icst?) $local_fp), $attempts -> ((icst?) $attempts), $updated -> ic_now ).
+                actions (_count actions|) -> _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator).
+                sc flush_mig_deferred_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }   // flush BEFORE process
+                did_ic -> TRUE.
+            }
+        }
         sc on_message_received (
             $sender_id   -> sender_id,
             $sender_name -> sender_name,
@@ -2481,6 +2539,9 @@ library a2a_messaging loads libraries
             sc trig -- ( -> a) { actions (_count actions|) -> a. }
             actions (_count actions|) -> _save_state NIL.
         }
+        // Persist the implicit-confirm promotion (mutually exclusive with the trigger: did_ic
+        // needs `committed`, the trigger needs no migration — never both).
+        if did_ic { actions (_count actions|) -> _save_state NIL. }
         return transaction::success actions.
     }
 
@@ -2760,24 +2821,6 @@ library a2a_messaging loads libraries
             _save_state NIL ].
     }
     trn e2e_migrate_ack args: any { return handle_e2e_migrate_ack args. }
-
-    // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
-    // (the daemon sends over the now-active migrated session — core is routing-authority only).
-    // The CALLER MUST have set the epoch pin FIRST (else a re-injected send routes "migrating" and
-    // re-queues). Clears the queue; an empty queue yields no actions; per-contact order preserved.
-    fn flush_mig_deferred_actions (cid: global_id) -> transaction::action::type[]
-    {
-        out is transaction::action::type[] = [].
-        q = mig_deferred cid.
-        if q == NIL || (_count q?|) == 0 { return out. }
-        sc q? -- ( -> m)
-        {
-            out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
-                $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to), $route -> $e2e ).
-        }
-        delete mig_deferred cid.
-        return out.
-    }
 
     // A redelivered migration COMMIT after we already promoted to active (§5.5 lost-confirm: the
     // initiator's sweep re-sends its commit because our confirm was lost). Evidence rule: re-send

@@ -171,6 +171,26 @@ application actor loads libraries
     // Phase D §5.6 — the app-data route verdict for a cid (5-state).
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
+    // §5.4 trigger-GATE test helpers (criterion-1 boundary). ISOLATED: advertising cap_e2e_migrate
+    // here does NOT touch the full suite's test_actor. qa_mig_should_trigger reads the PURE gate
+    // (no send) so we exercise fail-closed WITHOUT needing a registered peer.
+    trn qa_init_caps _:($advertise -> adv: str[])
+    {
+        a2a_capabilities::init (
+            $describe -> fn (_: any) -> a2a_capabilities::app_manifest_t
+            { return ($version -> 1, $app_id -> "mig.actor", $name -> "actor", $description -> "", $monitoring_status -> "off", $capabilities -> (,)). },
+            $supported -> [], $handlers -> (,),
+            $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
+            $authorizer -> NIL, $advertise -> adv ).
+        return transaction::success [ _return_data ($set -> TRUE) ].
+    }
+    trn qa_learn_peer _:($cid -> cid: global_id, $pv -> pv: int, $caps -> caps: str[])
+    {
+        a2a_messaging::learn_contact_version cid pv caps.
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+    trn readonly qa_mig_should_trigger _:($cid -> cid: global_id) { return ($fire -> (a2a_messaging::mig_should_trigger cid)). }
+
     // Phase D §5.6 flush test helpers. Inject a 3-message mig_deferred queue for `cid` (via the
     // import path — REPLACE-if-present, leaves the active pin untouched), read the queued wire_ids
     // in order, and invoke the real flush (drain FIFO + clear via a2a_messaging::flush_mig_deferred_actions).
