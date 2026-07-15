@@ -38,15 +38,34 @@ application actor loads libraries
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
         encrypted_channel::init ($_read_or_abort -> _read_or_abort).
+        // Increment-B app-e2e delivery observability: the storage hooks RECORD the last delivered
+        // message/file into these mutables so the driver can prove handle_receive_e2e_message
+        // actually decrypted + delivered the plaintext to the app hook (not just decoded it). The
+        // togglable qa_recv_abort makes the message hook ABORT — used to prove must-fix-C rollback
+        // (the do_ic promotion + pins + flush roll back with the tx when delivery aborts).
+        qa_recv_text is str = "".
+        qa_recv_wire is str = "".
+        qa_recv_file is str = "".
+        qa_recv_flen is int = 0.
+        qa_recv_count is int = 0.
+        qa_recv_abort is bool = FALSE.
         // a2a_messaging needs its own _read_or_abort + storage hooks (the migration
-        // handlers deserialize snapshots via it). Minimal no-op hooks — mig_actor
-        // exercises the FSM, not message delivery.
+        // handlers deserialize snapshots via it). The message/file hooks RECORD delivery.
         a2a_messaging::init (
             $_read_or_abort      -> _read_or_abort,
-            $on_message_received -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_message_received -> fn (a: any) -> transaction::action::type[] {
+                abort "qa_recv_abort: app hook rejected the message (must-fix-C rollback probe)" WHEN qa_recv_abort.
+                qa_recv_text -> ((a $text) safe str).
+                if (a $wire_id) != NIL { qa_recv_wire -> ((a $wire_id) safe str). }
+                qa_recv_count -> (qa_recv_count + 1).
+                return []. },
             $on_message_sent     -> fn (_: any) -> transaction::action::type[] { return []. },
             $on_contact_removed  -> fn (_: any) -> transaction::action::type[] { return []. },
-            $on_file_received    -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_file_received    -> fn (a: any) -> transaction::action::type[] {
+                qa_recv_file -> ((a $filename) safe str).
+                qa_recv_flen -> (_binlen ((a $data) safe bin)).
+                qa_recv_count -> (qa_recv_count + 1).
+                return []. },
             $on_file_sent        -> fn (_: any) -> transaction::action::type[] { return []. },
             $on_receipt_received -> fn (_: any) -> transaction::action::type[] { return []. }
         ).
@@ -170,6 +189,31 @@ application actor loads libraries
 
     // Phase D §5.6 — the app-data route verdict for a cid (5-state).
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
+
+    // ── Increment-B app-e2e delivery observability. qa_recv_last surfaces the last plaintext the
+    // on_message_received hook stored (proof handle_receive_e2e_message decrypted + delivered it);
+    // qa_recv_reset clears it between assertions; qa_recv_set_abort toggles the must-fix-C rollback
+    // probe (the app hook aborts → the do_ic promotion rolls back with the tx).
+    trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
+    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
+    trn qa_recv_set_abort _:($abort -> ab: bool) { qa_recv_abort -> ab.  return transaction::success [ _return_data ($abort -> qa_recv_abort) ]. }
+
+    // Force a LEGACY plaintext box (receive_message_tx) to a contact, BYPASSING e2e_route — lets the
+    // driver deliver a legacy inbound at a receiver regardless of the sender's route, to prove the
+    // §5.7 receive-side downgrade gate: refused at an EPOCH-pinned receiver, delivered at a
+    // seen-not-epoch one. Mirrors send_message's legacy box branch.
+    trn qa_send_legacy _:($contact -> cref: str, $text -> text: str)
+    {
+        target_id = a2a_messaging::resolve_contact cref.
+        wid = _str (_new_id "qa legacy").
+        // Direct send_encrypted_tx (no execute_transaction wrapper — the migration commit/confirm
+        // handlers relay this way too; the wrapper's generic would blow the unit's meta fuel).
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx target_id (
+                $name -> "::a2a_messaging::receive_message",
+                $targ -> ($text -> text, $wire_id -> wid, $pv -> a2a_versions::wire_version) ),
+            _return_data ($sent_to -> target_id, $wire_id -> wid) ].
+    }
 
     // §5.4 trigger-GATE test helpers (criterion-1 boundary). ISOLATED: advertising cap_e2e_migrate
     // here does NOT touch the full suite's test_actor. qa_mig_should_trigger reads the PURE gate

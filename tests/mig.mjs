@@ -287,6 +287,31 @@ async function main() {
   ok(hex(getBin(appEnv, 'session_id')) === hex(loAct), 'app-data(§5.6/A): initiator app send rides the MIGRATED (pinned) session_id (not a stale/old session)');
   const appRec = await mutate(hiN, '::actor::qa_e2e_recv', { from: loN.cid, ik: binv(hiN, loIk), olm_type: +appEnv.Reduce('olm_type').Visualize(), ciphertext: binv(hiN, getBin(appEnv, 'ciphertext')) });
   ok(T(appRec.Reduce('ok').Visualize()) && hex(getBin(appRec, 'plaintext')) === hex(appPt), 'app-data(§5.6/A): responder decrypts the app message on the migrated session (double-ratchet delivers app data e2e)');
+
+  // ═══ INCREMENT B — the REAL app-e2e RECEIVE path end-to-end (send_message → e2e box →
+  // handle_receive_e2e_message → on_message_received), over the MIGRATED (epoch-pinned) session. ═══
+  await mutate(hiN, '::actor::qa_recv_reset', {});
+  const bMsg = 'increment-B: app text delivered over the migrated e2e session, REAL handlers';
+  const bSend = await mutate(loN, '::a2a_messaging::send_message', { contact: hiN.name, text: bMsg });
+  ok(bSend.Reduce('route').Visualize() === 'e2e', 'app-e2e(B) send: send_message routed "e2e" (cored over the migrated session as receive_e2e_message_tx, not boxed legacy)');
+  await sleep(4000);   // the e2e box relays over the broker
+  ok(ro(hiN, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === bMsg, 'app-e2e(B) recv: handle_receive_e2e_message decrypted + DELIVERED the plaintext to on_message_received');
+  const hiActX = getBin(ro(hiN, '::a2a_messaging::e2e_active_session', { cid: loN.cid }), 'session_id');
+  ok(hex(hiActX) === hex(hiAct) && hex(hiActX) === hex(loAct), 'app-e2e(B) recv: e2e_active_session(loN) == the migrated session on BOTH sides (non-circular #1867 cross-check trn)');
+  // File analogue: send_file → receive_e2e_file → on_file_received.
+  await mutate(hiN, '::actor::qa_recv_reset', {});
+  const bFile = Buffer.from('increment-B file bytes riding the migrated e2e session');
+  const bfSend = await mutate(loN, '::a2a_messaging::send_file', { contact: hiN.name, filename: 'b.bin', mime: 'application/octet-stream', data: binv(loN, bFile) });
+  ok(bfSend.Reduce('route').Visualize() === 'e2e', 'app-e2e(B) send_file: routed "e2e" (cored over the migrated session as receive_e2e_file_tx)');
+  await sleep(4000);
+  { const fr = ro(hiN, '::actor::qa_recv_last', {});
+    ok(fr.Reduce('filename').Visualize() === 'b.bin' && +fr.Reduce('flen').Visualize() === bFile.length, 'app-e2e(B) recv_file: handle_receive_e2e_file decrypted + delivered the file to on_file_received'); }
+  // §5.7 RECEIVE-SIDE DOWNGRADE REFUSAL over the epoch-pinned pair: a LEGACY plaintext from loN is
+  // DROPPED by hiN (never delivered) — the receive-direction confidentiality property.
+  await mutate(hiN, '::actor::qa_recv_reset', {});
+  await mutate(loN, '::actor::qa_send_legacy', { contact: hiN.name, text: 'DOWNGRADE ATTEMPT: legacy plaintext to a migrated peer' });
+  await sleep(4000);
+  ok(ro(hiN, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '', 'downgrade-refusal(§5.7): legacy plaintext from an EPOCH-pinned contact is DROPPED (not delivered, no receipt)');
   // Phase D §5.6 flush-on-active: app sends queued during the initiator's commit window (route
   // "migrating" → mig_deferred) flush FIFO on active, preserving per-contact order, queue ends
   // empty. loN is epoch-pinned to hiN (active), so pins-before-flush holds; inject a 3-msg queue
@@ -339,6 +364,33 @@ async function main() {
   ok(hex(getBin(hiSt2, 'epoch')) === hex(hiEp), 'idempotency: duplicate offer does NOT change the epoch');
   const hiAct2 = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
   ok(hex(hiAct2) === hex(hiAct), 'idempotency: duplicate offer does NOT disturb the active session');
+
+  // ═══ INCREMENT B — SEEN-not-epoch send/receive CONSISTENCY (already-E2E pre-migration pair). ═══
+  // The SEND gate boxes app as receive_e2e_message_tx for EVERY e2e-capable (seen) contact, not only
+  // epoch-pinned/migrated ones. So the RECEIVE accept-gate must accept seen-not-epoch peers too (else
+  // an already-E2E pair's app is silently DROPPED). And §5.7 downgrade-refusal stays EPOCH-only: a
+  // seen-not-epoch peer's LEGACY plaintext is STILL accepted (seen is advertisement-strength).
+  console.log('=== mig: INCREMENT B — seen-not-epoch already-E2E pair (send/receive consistency) ===');
+  const E3 = await mkNode('mig-gate-E3', 'E3');
+  const E4 = await mkNode('mig-gate-E4', 'E4'); await sleep(1000);
+  const einv = await mutate(E3, '::a2a_messaging::generate_invite', { name: 'E4' });
+  await mutate(E4, '::a2a_messaging::add_contact', { invite: binv(E4, Buffer.from(einv.Reduce('invite').GetBinary())), name: 'E3' });
+  await sleep(6000);   // invite redeem round-trips (establishes contacts + peer_ads incl. e2e bundle)
+  // Mark BOTH directions e2e-SEEN (cap_e2e) WITHOUT migrating — an already-E2E, non-epoch pair.
+  await mutate(E3, '::actor::qa_learn_peer', { cid: E4.cid, pv: 9, caps: ['core.e2e'] });
+  await mutate(E4, '::actor::qa_learn_peer', { cid: E3.cid, pv: 9, caps: ['core.e2e'] });
+  ok(ro(E3, '::actor::qa_e2e_route', { cid: E4.cid }).Reduce('route').Visualize() === 'e2e', 'seen-not-epoch: app-data route == "e2e" for a seen (no-epoch) contact');
+  await mutate(E4, '::actor::qa_recv_reset', {});
+  const sMsg = 'seen-not-epoch: app over an already-E2E session, no migration in play';
+  const sSend = await mutate(E3, '::a2a_messaging::send_message', { contact: 'E4', text: sMsg });
+  ok(sSend.Reduce('route').Visualize() === 'e2e', 'seen-not-epoch: send_message boxed as receive_e2e_message_tx (send-side consistency)');
+  await sleep(4000);
+  ok(ro(E4, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === sMsg, 'seen-not-epoch: receive ACCEPTS + decrypts + delivers (accept-gate = e2e_pinned/seen, closes the latent drop)');
+  // Legacy plaintext from the SAME seen-not-epoch peer is STILL delivered (downgrade-refusal is epoch-only).
+  await mutate(E4, '::actor::qa_recv_reset', {});
+  await mutate(E3, '::actor::qa_send_legacy', { contact: 'E4', text: 'seen-not-epoch legacy — still delivered' });
+  await sleep(4000);
+  ok(ro(E4, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'seen-not-epoch legacy — still delivered', 'seen-not-epoch: LEGACY plaintext STILL accepted (downgrade-refusal is EPOCH-only, not seen)');
 
   // decode_migration_envelope guard matrix — the point-1 divergence guard (recv_authenticated's
   // S1/S2 is REAL) + decode_migration_envelope binding gates + the forgery-abort vs replay-reject
