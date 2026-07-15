@@ -38,6 +38,18 @@ application actor loads libraries
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
         encrypted_channel::init ($_read_or_abort -> _read_or_abort).
+        // a2a_messaging needs its own _read_or_abort + storage hooks (the migration
+        // handlers deserialize snapshots via it). Minimal no-op hooks — mig_actor
+        // exercises the FSM, not message delivery.
+        a2a_messaging::init (
+            $_read_or_abort      -> _read_or_abort,
+            $on_message_received -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_message_sent     -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_contact_removed  -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_file_received    -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_file_sent        -> fn (_: any) -> transaction::action::type[] { return []. },
+            $on_receipt_received -> fn (_: any) -> transaction::action::type[] { return []. }
+        ).
         // Phase-B decode-seam test hook: a togglable "migration pending" flag the installed
         // e2e hook reads, so the driver can exercise decrypt_and_commit's stage-vs-replace
         // decision (in the real inbound path) without wiring the full core FSM.
@@ -214,6 +226,27 @@ application actor loads libraries
     { return ($epoch -> (a2a_messaging::mig_epoch lo hi nlo nhi flo fhi)). }
     trn readonly qa_mig_bundle_fp _
     { return ($fp -> (a2a_messaging::e2e_bundle_fp (address_document::produce_my_address_document()))). }
+
+    // Trigger an OFFER to a contact (invokes mig_offer_actions: persists offered + sends).
+    trn qa_mig_trigger_offer _:($peer -> peer: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        actions is transaction::action::type[] = a2a_messaging::mig_offer_actions peer.
+        actions (_count actions|) -> (transaction::action::return_data ($kind -> $data, $payload -> ($triggered -> TRUE))).
+        actions (_count actions|) -> (transaction::action::return_data ($kind -> $save_state)).
+        return transaction::success actions.
+    }
+    // Read the FSM entry for a contact (phase / epoch / initiator).
+    trn readonly qa_mig_state _:($cid -> cid: global_id)
+    {
+        st = a2a_messaging::contact_migration cid.
+        return (
+            $present   -> (st != NIL),
+            $phase     -> ((st == NIL ?? "" ; ((st?) $phase))),
+            $epoch     -> ((st == NIL ?? NIL ; ((st?) $epoch))),
+            $initiator -> ((st == NIL ?? FALSE ; ((st?) $initiator)))
+        ).
+    }
 
     // Read both libraries' state for `cid` AFTER the aborted tx: both must be absent.
     trn readonly qa_atomicity_check _:($cid -> cid: global_id)

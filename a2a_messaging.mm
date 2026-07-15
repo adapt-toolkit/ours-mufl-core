@@ -761,6 +761,35 @@ library a2a_messaging loads libraries
         return ($ad -> address_document::produce_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
     }
 
+    // Build + persist + send an OFFER (spec §5.4). Snapshot the fresh public bundle
+    // into the FSM entry FIRST, then build the wire targ FROM the snapshot (decoded),
+    // so first-send and every retransmit share ONE construction path and are
+    // byte-identical (the epoch depends on the snapshot's fp under a fixed nonce).
+    // INV-4: only public signed material (AD/cert/root_profile/cp_binding) is snapshotted,
+    // never a session pickle. Caller emits _save_state alongside these actions (atomic
+    // persist-with-send). Rides the legacy encrypted_channel (peer must be an established
+    // contact); the migration-control carve-out (phase D) keeps this send legal even when
+    // app-data route is refused.
+    fn mig_offer_actions (peer: global_id) -> transaction::action::type[]
+    {
+        b  = my_identity_bundle_fields_fresh NIL.
+        lb = _write ( $ad -> (b $ad), $cert -> (b $cert),
+                      $root_profile -> (b $root_profile), $cp_binding -> (b $cp_binding) ).
+        fp = e2e_bundle_fp (b $ad).
+        n  = _hash_code_to_binary (_value_id (_new_id "ours e2e migration")).
+        now = (current_transaction_info::get_transaction_time())?.
+        contact_migration peer -> ( $phase -> "offered", $initiator -> (mig_initiator peer),
+            $local_nonce -> n, $peer_nonce -> NIL, $epoch -> NIL, $session_id -> NIL,
+            $local_bundle -> lb, $local_fp -> fp, $attempts -> 1, $updated -> now ).
+        s = _read_or_abort lb.
+        return [ encrypted_channel::send_encrypted_tx peer (
+            $name -> e2e_migrate_offer_tx,
+            $targ -> ( $ad -> (s $ad), $cert -> (s $cert), $root_profile -> (s $root_profile),
+                       $cp_binding -> (s $cp_binding), $nonce -> n, $peer_nonce -> NIL,
+                       $pv -> a2a_versions::wire_version,
+                       $caps -> (a2a_capabilities::self_cap_ids NIL) ) ) ].
+    }
+
     // ---- core 0.5.0 versioning helpers ---------------------------------------
     // Passive version learning (SPEC §3): record the peer's wire dialect (and
     // its advertised capability ids, when it piggybacked any) off an inbound
@@ -2478,6 +2507,113 @@ library a2a_messaging loads libraries
     {
         return handle_receive_receipt args.
     }
+
+    // ---- core 0.9.0 E2E-migration handlers (spec §5.4) -----------------------
+    // STRICT GATE LADDER, error-as-data: narrow -> verify_identity_bundle (forgery
+    // ABORTS by design) -> bundle-presence -> election-collapse/solicitation ->
+    // nonce/epoch -> WRITES LAST. No abort is reachable from a well-formed-but-wrong
+    // payload; only cryptographic/identity forgery aborts (verify_identity_bundle).
+    // Both legs ride the legacy encrypted_channel (origin::external + check_encrypted).
+    fn handle_e2e_migrate_offer (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        // GATE 1 — narrow (error-as-data).
+        nr = a2a_versions::try_narrow_mgb args.
+        if (nr $ok) != TRUE
+        { return transaction::success [ _notify_agent ($event -> $protocol_error, $context -> $e2e_migrate_offer, $message -> (((nr $err)?) $message), $error -> (nr $err)?, $peer_cid -> sender_id) ]. }
+        p = (nr $payload)?.
+        // GATE 2 — verify identity bundle (cid-bind + PoP + optional chain). FORGERY
+        // ABORTS here (by design); also refreshes peer_ads via process_address_document.
+        vb = verify_identity_bundle (p as any) sender_id.
+        // GATE 3 — bundle presence: the peer claims migration, so its verified AD MUST
+        // carry an $e2e_bundle; otherwise a typed refusal (error-as-data, no state write).
+        if (((vb $ad) as any) $identity $e2e_bundle) == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $peer_offered_without_e2e_bundle) ]. }
+        // This offer/ack exchange IS the missing caps/AD refresh — learn the piggyback.
+        pv_seen = a2a_versions::peer_pv args.
+        learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) (((p $caps) == NIL ?? [] ; (p $caps)?)).
+        // GATE 4 — election collapse / solicitation. If the offer came from the HIGHER
+        // cid (mig_initiator sender_id TRUE => I am the elected LOWER-cid initiator), it
+        // is a SOLICITATION: keep the AD/caps refresh above, supersede any of my own
+        // offered state, and (re)emit MY authoritative offer — do NOT ack.
+        if (mig_initiator sender_id) == TRUE
+        {
+            solicit is transaction::action::type[] = mig_offer_actions sender_id.
+            solicit (_count solicit|) -> _save_state NIL.
+            return transaction::success solicit.
+        }
+        // Otherwise the offer came from the LOWER (elected) cid: proceed to ACK,
+        // abandoning any competing proposal of mine (deterministic collapse).
+        // GATE 5 — nonce/epoch. Snapshot my fresh bundle, compute the shared epoch.
+        offer_nonce = (p $nonce) safe bin.
+        b  = my_identity_bundle_fields_fresh NIL.
+        lb = _write ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile), $cp_binding -> (b $cp_binding) ).
+        my_fp   = e2e_bundle_fp (b $ad).
+        peer_fp = e2e_bundle_fp (vb $ad).
+        my_n = _hash_code_to_binary (_value_id (_new_id "ours e2e migration")).
+        now  = (current_transaction_info::get_transaction_time())?.
+        // cid-ordered: sender (elected initiator) is the LOWER cid; I am the HIGHER.
+        epoch = mig_epoch sender_id (_get_container_id()) offer_nonce my_n peer_fp my_fp.
+        // WRITES LAST — persist acknowledged WITH my snapshot, in the SAME tx as the ack send.
+        contact_migration sender_id -> ( $phase -> "acknowledged", $initiator -> FALSE,
+            $local_nonce -> my_n, $peer_nonce -> offer_nonce, $epoch -> epoch, $session_id -> NIL,
+            $local_bundle -> lb, $local_fp -> my_fp, $attempts -> 1, $updated -> now ).
+        s = _read_or_abort lb.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx sender_id (
+                $name -> e2e_migrate_ack_tx,
+                $targ -> ( $ad -> (s $ad), $cert -> (s $cert), $root_profile -> (s $root_profile),
+                           $cp_binding -> (s $cp_binding), $nonce -> my_n, $peer_nonce -> offer_nonce,
+                           $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL) ) ),
+            _notify_agent ($event -> $migration_started, $cid -> sender_id, $role -> $responder),
+            _save_state NIL ].
+    }
+    trn e2e_migrate_offer args: any { return handle_e2e_migrate_offer args. }
+
+    // ACK handler (initiator). Gates: narrow -> FSM phase==offered ∧ ack echoes my nonce
+    // -> verify bundle (forgery aborts) -> bundle-presence -> compute the SAME epoch ->
+    // WRITES LAST. NOTE: the §5.5 COMMIT continuation (stage_outbound_rotation + send
+    // commit, same tx) is the NEXT increment; this cut reaches `acknowledged` with a
+    // converged epoch on both sides.
+    fn handle_e2e_migrate_ack (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        // GATE 1 — narrow.
+        nr = a2a_versions::try_narrow_mgb args.
+        if (nr $ok) != TRUE
+        { return transaction::success [ _notify_agent ($event -> $protocol_error, $context -> $e2e_migrate_ack, $message -> (((nr $err)?) $message), $error -> (nr $err)?, $peer_cid -> sender_id) ]. }
+        p = (nr $payload)?.
+        // GATE 2 — FSM phase==offered ∧ the ack echoes MY offer nonce (else stale/foreign, drop as data).
+        st = contact_migration sender_id.
+        if st == NIL || ((st?) $phase) != "offered" { return transaction::success []. }
+        my_local_nonce = (st?) $local_nonce.
+        ack_peer_nonce = (p $peer_nonce).
+        if ack_peer_nonce == NIL || ack_peer_nonce != my_local_nonce { return transaction::success []. }
+        // GATE 3 — verify bundle (forgery aborts; peer_ads refresh) + bundle presence.
+        vb = verify_identity_bundle (p as any) sender_id.
+        if (((vb $ad) as any) $identity $e2e_bundle) == NIL
+        { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $peer_acked_without_e2e_bundle) ]. }
+        pv_seen = a2a_versions::peer_pv args.
+        learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) (((p $caps) == NIL ?? [] ; (p $caps)?)).
+        // GATE 4 — compute the SAME epoch (I am the elected initiator = LOWER cid).
+        ack_nonce = (p $nonce) safe bin.
+        my_fp   = ((st?) $local_fp)?.       // my offer snapshot fp (same bundle -> same fp)
+        peer_fp = e2e_bundle_fp (vb $ad).
+        now = (current_transaction_info::get_transaction_time())?.
+        epoch = mig_epoch (_get_container_id()) sender_id my_local_nonce ack_nonce my_fp peer_fp.
+        // WRITES LAST — persist acknowledged (keep my snapshot). §5.5 commit is next.
+        contact_migration sender_id -> ( $phase -> "acknowledged", $initiator -> TRUE,
+            $local_nonce -> my_local_nonce, $peer_nonce -> ack_nonce, $epoch -> epoch, $session_id -> NIL,
+            $local_bundle -> ((st?) $local_bundle), $local_fp -> my_fp, $attempts -> ((st?) $attempts), $updated -> now ).
+        return transaction::success [
+            _notify_agent ($event -> $migration_started, $cid -> sender_id, $role -> $initiator),
+            _save_state NIL ].
+    }
+    trn e2e_migrate_ack args: any { return handle_e2e_migrate_ack args. }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state trn composes these

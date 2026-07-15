@@ -238,6 +238,26 @@ async function main() {
   const fpA2 = getBin(ro(A, '::actor::qa_mig_bundle_fp', {}), 'fp');
   ok(fpA.length === 32 && hex(fpA) === hex(fpA2), 'e2e_bundle_fp: deterministic 32-byte fingerprint of my e2e bundle');
 
+  console.log('=== mig: offer/ack handshake over the channel (FSM → acknowledged, epoch converges) ===');
+  const I2 = await mkNode('mig-gate-I2', 'I2');
+  const R2 = await mkNode('mig-gate-R2', 'R2'); await sleep(1000);
+  // establish mutual contact via the invite flow (so the encrypted_channel exists)
+  const inv = await mutate(I2, '::a2a_messaging::generate_invite', { name: 'R2' });
+  const invBlob = Buffer.from(inv.Reduce('invite').GetBinary());
+  await mutate(R2, '::a2a_messaging::add_contact', { invite: binv(R2, invBlob), name: 'I2' });
+  await sleep(6000);   // invite redeem round-trips over the broker
+  // trigger the OFFER from the LOWER cid → direct offer→ack (a higher-cid trigger would solicit)
+  const [loN, hiN] = I2.cid < R2.cid ? [I2, R2] : [R2, I2];
+  await mutate(loN, '::actor::qa_mig_trigger_offer', { peer: hiN.cid });
+  await sleep(5000);   // offer → ack round-trip
+  const loSt = ro(loN, '::actor::qa_mig_state', { cid: hiN.cid });
+  const hiSt = ro(hiN, '::actor::qa_mig_state', { cid: loN.cid });
+  ok(loSt.Reduce('phase').Visualize() === 'acknowledged', 'offer/ack: initiator (lower cid) reaches acknowledged');
+  ok(hiSt.Reduce('phase').Visualize() === 'acknowledged', 'offer/ack: responder (higher cid) reaches acknowledged');
+  ok(T(loSt.Reduce('initiator').Visualize()) && !T(hiSt.Reduce('initiator').Visualize()), 'offer/ack: election roles correct (lower=initiator, higher=responder)');
+  const loEp = getBin(loSt, 'epoch'), hiEp = getBin(hiSt, 'epoch');
+  ok(loEp.length === 32 && hex(loEp) === hex(hiEp), 'offer/ack: both sides CONVERGE on the same 32-byte epoch');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
