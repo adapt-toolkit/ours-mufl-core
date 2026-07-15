@@ -817,6 +817,26 @@ library a2a_messaging loads libraries
                        $caps -> (a2a_capabilities::self_cap_ids NIL) ) ) ].
     }
 
+    // §5.4 TRIGGER (liveness): on inbound stamped traffic from a peer we now know is 0.9-capable
+    // (its caps advertise cap_e2e_migrate, OR its learned pv>=9) and for which NO migration exists
+    // yet, emit OUR offer. ANY side offers on first evidence — NOT conditioned on mig_initiator
+    // (election is resolved in the handlers; a higher-cid offer functions as a solicitation that
+    // makes the elected lower-cid side emit the authoritative offer). Fail-closed (§1.5): if we
+    // don't advertise the cap, or the peer isn't known-0.9, emit nothing — an old peer never gets
+    // an offer. Returns [] (NO state write) when the trigger doesn't fire; the CALLER emits
+    // _save_state alongside the returned offer (mig_offer_actions persists `offered`).
+    fn mig_trigger_actions (cid: global_id) -> transaction::action::type[]
+    {
+        if (contact_migration cid) != NIL { return []. }                     // already in-flight / done
+        if (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate) != TRUE { return []. }
+        peer_capable is bool = FALSE.
+        caps = contact_caps cid.
+        if caps != NIL { sc caps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_migrate { peer_capable -> TRUE. } } }
+        pv = contact_pv cid.
+        if peer_capable != TRUE && (pv == NIL || pv? < 9) { return []. }     // fail-closed: not known-0.9
+        return mig_offer_actions cid.
+    }
+
     // ---- core 0.5.0 versioning helpers ---------------------------------------
     // Passive version learning (SPEC §3): record the peer's wire dialect (and
     // its advertised capability ids, when it piggybacked any) off an inbound
@@ -2452,6 +2472,14 @@ library a2a_messaging loads libraries
             {
                 actions (_count actions|) -> a.
             }
+        }
+        // §5.4 trigger: liveness offer on first 0.9 evidence from this peer (fires once — then
+        // contact_migration is set and mig_trigger_actions returns []). _save_state persists it.
+        trig is transaction::action::type[] = mig_trigger_actions sender_id.
+        if (_count trig|) > 0
+        {
+            sc trig -- ( -> a) { actions (_count actions|) -> a. }
+            actions (_count actions|) -> _save_state NIL.
         }
         return transaction::success actions.
     }
