@@ -38,6 +38,10 @@ application actor loads libraries
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
         encrypted_channel::init ($_read_or_abort -> _read_or_abort).
+        // Phase-B decode-seam test hook: a togglable "migration pending" flag the installed
+        // e2e hook reads, so the driver can exercise decrypt_and_commit's stage-vs-replace
+        // decision (in the real inbound path) without wiring the full core FSM.
+        qa_mig_pending is bool = FALSE.
     }
 
     // Phase-A compile/headroom probe + export/import round-trip for the three new
@@ -151,4 +155,17 @@ application actor loads libraries
 
     trn readonly qa_e2e_active _:($cid -> cid: global_id) { return ($sid -> (e2e::active_session_id cid)). }
     trn readonly qa_e2e_staged _:($cid -> cid: global_id) { return ($sid -> (e2e::staged_session_id cid)). }
+
+    // Decode-seam test controls: install a mig-pending hook that reads the togglable flag,
+    // then flip the flag to steer decrypt_and_commit's stage-vs-replace decision.
+    trn qa_e2e_install_mig_hook _
+    {
+        e2e::set_mig_pending_hook (fn (_: global_id) -> bool { return qa_mig_pending. }).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+    trn qa_e2e_set_mig_pending _:($pending -> p: bool)
+    {
+        qa_mig_pending -> p.
+        return transaction::success [ _return_data ($pending -> qa_mig_pending) ].
+    }
 }

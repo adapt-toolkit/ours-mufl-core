@@ -142,6 +142,45 @@ async function main() {
     olm_type: +env5.Reduce('olm_type').Visualize(), ciphertext: binv(B, getBin(env5, 'ciphertext')) });
   ok(T(rec5.Reduce('ok').Visualize()) && getBin(rec5, 'plaintext').equals(pt5), 'post-rotation: A->B works on the NEW session (bidirectional)');
 
+  console.log('=== mig: decode-seam (REAL decrypt_and_commit: install vs stage vs self-heal) ===');
+  const C = await mkNode('mig-gate-C', 'C');
+  const D = await mkNode('mig-gate-D', 'D'); await sleep(800);
+  const cCid = C.cid, dCid = D.cid;
+  const dBundle = getBin(ro(D, '::actor::qa_e2e_bundle', {}), 'bundle');
+  const cIk = getBin(ro(C, '::actor::qa_e2e_ik', {}), 'ik');
+  await mutate(D, '::actor::qa_e2e_install_mig_hook', {});   // hook reads the togglable flag (default FALSE)
+
+  // (i) FIRST-CONTACT through the seam: no live session -> installs directly (0.8.0 preserved)
+  const dp1 = Buffer.from('seam-first-contact');
+  const denv1 = await mutate(C, '::actor::qa_e2e_first_send', { cid: dCid, pt: binv(C, dp1), peer: binv(C, dBundle) });
+  const drec1 = await mutate(D, '::actor::qa_e2e_recv', { from: cCid, ik: binv(D, cIk),
+    olm_type: +denv1.Reduce('olm_type').Visualize(), ciphertext: binv(D, getBin(denv1, 'ciphertext')) });
+  ok(T(drec1.Reduce('ok').Visualize()) && getBin(drec1, 'plaintext').equals(dp1), 'seam: first-contact PRE_KEY installs + decrypts (no live session)');
+  const dLive1 = getBin(ro(D, '::actor::qa_e2e_active', { cid: cCid }), 'sid');
+  ok(dLive1.length > 0, 'seam: first-contact installed the live session');
+
+  // (ii) LIVE SESSION + PRE_KEY + migration PENDING -> STAGE (m_sessions untouched)
+  await mutate(D, '::actor::qa_e2e_set_mig_pending', { pending: true });
+  const stagedC = getBin(await mutate(C, '::actor::qa_e2e_stage_out', { cid: dCid, peer: binv(C, dBundle) }), 'sid');
+  const cenvS = await mutate(C, '::actor::qa_e2e_enc_staged', { cid: dCid, pt: binv(C, Buffer.from('seam-migration-prekey')) });
+  const drecS = await mutate(D, '::actor::qa_e2e_recv', { from: cCid, ik: binv(D, cIk),
+    olm_type: +cenvS.Reduce('olm_type').Visualize(), ciphertext: binv(D, getBin(cenvS, 'ciphertext')) });
+  ok(T(drecS.Reduce('ok').Visualize()), 'seam: migration PRE_KEY on a live session decrypts (staged path)');
+  const dLive2 = getBin(ro(D, '::actor::qa_e2e_active', { cid: cCid }), 'sid');
+  ok(hex(dLive2) === hex(dLive1), 'seam: STAGE — the real decrypt_and_commit did NOT replace the live session');
+  const dStaged2 = getBin(ro(D, '::actor::qa_e2e_staged', { cid: cCid }), 'sid');
+  ok(hex(dStaged2) === hex(stagedC), 'seam: STAGE — fresh session parked in the staged slot (== sender staged id)');
+
+  // (iii) LIVE SESSION + PRE_KEY + NO migration -> SELF-HEAL (replace, 0.8.0 preserved)
+  await mutate(D, '::actor::qa_e2e_set_mig_pending', { pending: false });
+  const stagedC2 = getBin(await mutate(C, '::actor::qa_e2e_stage_out', { cid: dCid, peer: binv(C, dBundle) }), 'sid');
+  const cenvH = await mutate(C, '::actor::qa_e2e_enc_staged', { cid: dCid, pt: binv(C, Buffer.from('seam-self-heal')) });
+  const drecH = await mutate(D, '::actor::qa_e2e_recv', { from: cCid, ik: binv(D, cIk),
+    olm_type: +cenvH.Reduce('olm_type').Visualize(), ciphertext: binv(D, getBin(cenvH, 'ciphertext')) });
+  ok(T(drecH.Reduce('ok').Visualize()), 'seam: self-heal PRE_KEY on a live session decrypts');
+  const dLive3 = getBin(ro(D, '::actor::qa_e2e_active', { cid: cCid }), 'sid');
+  ok(hex(dLive3) === hex(stagedC2) && hex(dLive3) !== hex(dLive1), 'seam: SELF-HEAL — live session REPLACED (no migration pending → 0.8.0 behavior)');
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
