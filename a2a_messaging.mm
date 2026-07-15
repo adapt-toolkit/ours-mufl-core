@@ -1235,14 +1235,16 @@ library a2a_messaging loads libraries
             epb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
             einner = _write ( $text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
             eenv = e2e::encrypt_to target_id einner epb.
-            esid = e2e::active_session_id target_id.
             eacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_message_tx,
                     $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
             sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
             sc monitor_copy_actions "out" target_id sent_date text -- ( -> a) { eacts (_count eacts|) -> a. }
-            eacts (_count eacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> (esid?), $olm_type -> ((eenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
+            // §4 observability: source $session_id from the ACTUAL envelope (NOT a re-read of
+            // active_session_id — that would make the #1867 "session_id==pin" assertion CIRCULAR;
+            // the real envelope id proves the app traversed the migrated session).
+            eacts (_count eacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
             eacts (_count eacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
             eacts (_count eacts|) -> _save_state NIL.
             return transaction::success eacts.
@@ -1311,14 +1313,13 @@ library a2a_messaging loads libraries
             fepb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
             finner = _write ( $filename -> filename, $mime -> mime_s, $data -> data, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
             fenv = e2e::encrypt_to target_id finner fepb.
-            fsid = e2e::active_session_id target_id.
             feacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_file_tx,
                     $targ -> ( $e2e_envelope -> (fenv $e2e_envelope), $emsignature -> (fenv $emsignature) ) ) ].
             sc on_file_sent ($target_id -> target_id, $filename -> filename, $mime -> mime_s, $data -> data, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { feacts (_count feacts|) -> a. }
             sc monitor_copy_actions "out" target_id sent_date (file_monitor_summary filename mime_s data) -- ( -> a) { feacts (_count feacts|) -> a. }
-            feacts (_count feacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> (fsid?), $olm_type -> ((fenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
+            feacts (_count feacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((fenv $e2e_envelope) $session_id), $olm_type -> ((fenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
             feacts (_count feacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
             feacts (_count feacts|) -> _save_state NIL.
             return transaction::success feacts.
