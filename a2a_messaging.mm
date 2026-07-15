@@ -2733,6 +2733,24 @@ library a2a_messaging loads libraries
     }
     trn e2e_migrate_ack args: any { return handle_e2e_migrate_ack args. }
 
+    // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
+    // (the daemon sends over the now-active migrated session — core is routing-authority only).
+    // The CALLER MUST have set the epoch pin FIRST (else a re-injected send routes "migrating" and
+    // re-queues). Clears the queue; an empty queue yields no actions; per-contact order preserved.
+    fn flush_mig_deferred_actions (cid: global_id) -> transaction::action::type[]
+    {
+        out is transaction::action::type[] = [].
+        q = mig_deferred cid.
+        if q == NIL || (_count q?|) == 0 { return out. }
+        sc q? -- ( -> m)
+        {
+            out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
+                $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to), $route -> $e2e ).
+        }
+        delete mig_deferred cid.
+        return out.
+    }
+
     // A redelivered migration COMMIT after we already promoted to active (§5.5 lost-confirm: the
     // initiator's sweep re-sends its commit because our confirm was lost). Evidence rule: re-send
     // the confirm ONLY when we are genuinely active for this cid on the PINNED session (the epoch
@@ -2890,11 +2908,32 @@ library a2a_messaging loads libraries
         contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
             $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> stored_epoch, $session_id -> (final_sid?),
             $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp), $attempts -> ((st?) $attempts), $updated -> now ).
-        return transaction::success [
-            _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator),
-            _save_state NIL ].
+        // §5.6 FLUSH-ON-ACTIVE — PINS-BEFORE-FLUSH: the epoch pin above is now set, so a re-injected
+        // app send routes "e2e" (not "migrating") and won't re-queue. Drain mig_deferred[cid] FIFO
+        // over e2e (the daemon delivers on the migrated session) — preserves per-contact order.
+        acts is transaction::action::type[] = [ _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator) ].
+        sc flush_mig_deferred_actions sender_id -- ( -> a) { acts (_count acts|) -> a. }
+        acts (_count acts|) -> _save_state NIL.
+        return transaction::success acts.
     }
     trn e2e_migrate_confirm args: any { return handle_e2e_migrate_confirm args. }
+
+    // Host-fired flush (boot/GC cadence + on the $migration_active notify): drain a contact's
+    // mig_deferred over e2e. Idempotent; a contact NOT yet epoch-pinned (still migrating) is a
+    // no-op ($not_active) — never flush before the pin (would re-queue).
+    trn flush_mig_deferred _:($contact -> contact_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        target_id = resolve_contact contact_ref.
+        q = mig_deferred target_id.
+        if q == NIL || (_count q?|) == 0 { return transaction::success [ _return_data ($flushed -> 0) ]. }
+        if (contact_e2e_epoch target_id) == NIL { return transaction::success [ _return_data ($flushed -> 0, $not_active -> TRUE) ]. }
+        n = _count q?|.
+        acts is transaction::action::type[] = flush_mig_deferred_actions target_id.
+        acts (_count acts|) -> _return_data ($flushed -> n, $route -> $e2e).
+        acts (_count acts|) -> _save_state NIL.
+        return transaction::success acts.
+    }
 
     // ---- upgrade: state export / import helpers ------------------------------
     // NOT transactions: each app's export_state/import_state trn composes these

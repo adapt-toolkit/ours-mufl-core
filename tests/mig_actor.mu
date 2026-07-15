@@ -171,6 +171,35 @@ application actor loads libraries
     // Phase D §5.6 — the app-data route verdict for a cid (5-state).
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
+    // Phase D §5.6 flush test helpers. Inject a 3-message mig_deferred queue for `cid` (via the
+    // import path — REPLACE-if-present, leaves the active pin untouched), read the queued wire_ids
+    // in order, and invoke the real flush (drain FIFO + clear via a2a_messaging::flush_mig_deferred_actions).
+    trn qa_mig_inject_deferred _:($cid -> cid: global_id)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        q is a2a_messaging::deferred_msg_t[] = [
+            ($text -> "m0", $wire_id -> "w0", $reply_to -> NIL, $date -> now),
+            ($text -> "m1", $wire_id -> "w1", $reply_to -> NIL, $date -> now),
+            ($text -> "m2", $wire_id -> "w2", $reply_to -> NIL, $date -> now) ].
+        a2a_messaging::mig_deferred cid -> q.
+        return transaction::success [ _return_data ($injected -> 3) ].
+    }
+    trn readonly qa_mig_deferred_ids _:($cid -> cid: global_id)
+    {
+        ids is str[] = [].
+        q = a2a_messaging::mig_deferred cid.
+        if q != NIL { sc q? -- ( -> m) { ids (_count ids|) -> (m $wire_id). } }
+        return ($ids -> ids, $count -> (_count ids|)).
+    }
+    trn qa_mig_flush _:($cid -> cid: global_id)
+    {
+        order is str = "".
+        q = a2a_messaging::mig_deferred cid.
+        if q != NIL { sc q? -- ( -> m) { order -> order + (m $wire_id) + ",". } }
+        acts is transaction::action::type[] = a2a_messaging::flush_mig_deferred_actions cid.
+        return transaction::success [ _return_data ($flushed -> (_count acts|), $order -> order) ].
+    }
+
     // ---- decode_migration_envelope GUARD matrix (point-1 divergence + binding + forgery/replay) ----
     // This packet's OWN address document (e2e bundle + sign keys), so a receiver can authenticate a
     // migration envelope as coming from this cid (the sender AD decode_migration_envelope binds to).

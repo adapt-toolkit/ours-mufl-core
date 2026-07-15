@@ -287,6 +287,15 @@ async function main() {
   ok(hex(getBin(appEnv, 'session_id')) === hex(loAct), 'app-data(§5.6/A): initiator app send rides the MIGRATED (pinned) session_id (not a stale/old session)');
   const appRec = await mutate(hiN, '::actor::qa_e2e_recv', { from: loN.cid, ik: binv(hiN, loIk), olm_type: +appEnv.Reduce('olm_type').Visualize(), ciphertext: binv(hiN, getBin(appEnv, 'ciphertext')) });
   ok(T(appRec.Reduce('ok').Visualize()) && hex(getBin(appRec, 'plaintext')) === hex(appPt), 'app-data(§5.6/A): responder decrypts the app message on the migrated session (double-ratchet delivers app data e2e)');
+  // Phase D §5.6 flush-on-active: app sends queued during the initiator's commit window (route
+  // "migrating" → mig_deferred) flush FIFO on active, preserving per-contact order, queue ends
+  // empty. loN is epoch-pinned to hiN (active), so pins-before-flush holds; inject a 3-msg queue
+  // then drive the flush (the real drain over flush_mig_deferred_actions).
+  await mutate(loN, '::actor::qa_mig_inject_deferred', { cid: hiN.cid });
+  ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '3', 'flush(§5.6): mig_deferred filled (3 queued app sends)');
+  const flushed = await mutate(loN, '::actor::qa_mig_flush', { cid: hiN.cid });
+  ok(flushed.Reduce('flushed').Visualize() === '3' && flushed.Reduce('order').Visualize() === 'w0,w1,w2,', 'flush(§5.6): drained FIFO in order (w0,w1,w2) over e2e');
+  ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '0', 'flush(§5.6): mig_deferred empty after flush (queue drained in one pass)');
   // Phase D §5.6: at active (epoch pinned + peer bundle present) the app-data route is E2E-only
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');
