@@ -98,6 +98,7 @@ async function main() {
   ok(!T(g('e2e.wpv.ok')) && g('e2e.wpv.code') === 'payload_shape_unrecognized', 'e2e mistyped $pv (str): malformed discriminator -> shape error-as-data, no cast abort (M1)');
   ok(T(g('e2e.uns.ok')) && g('e2e.uns.v') === '8' && g('e2e.uns.ot') === '0', 'e2e unstamped (no $pv): tolerated absent-discriminator, defaults to v8, ok (M1)');
   ok(T(g('e2e.fut.ok')) && g('e2e.fut.ot') === '1', 'e2e $pv=99 (future): narrows as v1 (single registered version), ok');
+  ok(T(g('e2e.bin.ok')) && g('e2e.bin.ot') === '1', 'e2e BINARY $session_id (the shipped adapt wire): dual-accept, narrows ok (§5.9-1)');
 
   console.log('=== corpus: registry mgb (offer/ack + floor + shape + unstamped + future) ===');
   ok(T(g('mgb.off.ok')) && g('mgb.off.v') === '9' && T(g('mgb.off.pn_absent')), 'mgb offer: ok, dispatched v9, $peer_nonce absent (offer form)');

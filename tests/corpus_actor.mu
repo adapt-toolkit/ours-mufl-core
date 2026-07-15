@@ -108,6 +108,10 @@ application actor loads libraries
         e_uns  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 0, $ciphertext -> ct), $emsignature -> sig).
         // Future dialect (inner $pv=99): single registered version -> narrows as v1 (class-A forward compat).
         e_fut  = ($e2e_envelope -> ($session_id -> sid, $olm_type -> 1, $ciphertext -> ct, $pv -> 99), $emsignature -> sig).
+        // §5.9-1 dual-accept: the SHIPPED adapt wire carries a BINARY $session_id (session_id()
+        // bytes), NOT a hex string. The core registry must classify it as OK (was is_str-only).
+        bsid   = _hex_string_to_binary "cafebabecafebabecafebabecafebabe".
+        e_bin  = ($e2e_envelope -> ($session_id -> bsid, $olm_type -> 1, $ciphertext -> ct, $pv -> 8), $emsignature -> sig).
 
         ep = a2a_versions::try_narrow_e2e (e_pre as any).
         en = a2a_versions::try_narrow_e2e (e_nrm as any).
@@ -120,6 +124,7 @@ application actor loads libraries
         ewp = a2a_versions::try_narrow_e2e (e_wpv as any).
         eu = a2a_versions::try_narrow_e2e (e_uns as any).
         ef = a2a_versions::try_narrow_e2e (e_fut as any).
+        ebin = a2a_versions::try_narrow_e2e (e_bin as any).
 
         // registry "mgb" — e2e-migration offer/ack bundle (wire 9, single version).
         // sir-shape identity bundle ($ad any) + agreement fields: the offer omits
@@ -201,7 +206,8 @@ application actor loads libraries
                 $wct -> ($ok -> (ewc $ok), $code -> (((ewc $err)?) $code)),
                 $wpv -> ($ok -> (ewp $ok), $code -> (((ewp $err)?) $code)),
                 $uns -> ($ok -> (eu $ok), $v -> (a2a_versions::e2e_version_of (e_uns as any)), $ot -> (((eu $payload)?) $e2e_envelope $olm_type)),
-                $fut -> ($ok -> (ef $ok), $ot -> (((ef $payload)?) $e2e_envelope $olm_type))
+                $fut -> ($ok -> (ef $ok), $ot -> (((ef $payload)?) $e2e_envelope $olm_type)),
+                $bin -> ($ok -> (ebin $ok), $ot -> (((ebin $payload)?) $e2e_envelope $olm_type))
             ),
             $mgb -> (
                 $off -> ($ok -> (gmo $ok), $v -> (a2a_versions::mgb_version_of (mgb_off as any)), $pn_absent -> ((((gmo $payload)?) as any) $peer_nonce == NIL)),

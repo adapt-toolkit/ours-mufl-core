@@ -509,7 +509,11 @@ library a2a_versions
     // The INNER opaque body (contract `t_e2e_envelope`). $pv rides HERE — it is
     // the version discriminator for the whole signed message.
     metadef e2e_env_v1_t: (
-        $session_id -> global_id,   // adapt-derived session id (hex string at runtime)
+        $session_id -> any,         // adapt-derived session id: BINARY on the SHIPPED wire
+                                    // (session_id() bytes, e2e.mm); a hex string is also accepted
+                                    // (§5.9-1 dual-accept). `any` here + the flat cast target below
+                                    // (e2e_signed_message keeps $e2e_envelope `any`) mean NO frozen
+                                    // type mutates; e2e_env_shape_ok validates the domain.
         $olm_type   -> int,         // 0 = PRE_KEY (establishment inside $ciphertext), 1 = normal ratchet
         $ciphertext -> bin,         // opaque Olm blob
         $pv         -> int+         // wire dialect stamp (= wire_version at send); nullable in the cast so an
@@ -542,18 +546,24 @@ library a2a_versions
     }
 
     // Abort-free INNER-envelope probe (M1): every NON-nullable field checked
-    // against its runtime domain before the cast. Accepted residual (as `sir`):
-    // `safe global_id` additionally hex-validates, so a valid-STRING-but-non-hex
-    // $session_id passes here then aborts in the cast — the tamper class, where a
-    // hard abort is correct (:64-69).
+    // against its runtime domain before the cast. The cast target keeps
+    // $e2e_envelope `any` (flat pass-through), so this probe is the ONLY domain
+    // gate — no residual `safe global_id` hex-validation happens on $session_id.
     fn e2e_env_shape_ok (env: any) -> bool
     {
-        ct = env $ciphertext.
-        pv = env $pv.
+        ct  = env $ciphertext.
+        pv  = env $pv.
+        sid = env $session_id.
+        // $session_id DUAL-ACCEPT (§5.9-1): the SHIPPED adapt wire is BINARY
+        // (session_id() bytes); the historically-documented form was a hex STRING.
+        // Accept BOTH — an additive relaxation that rejects strictly less (a present-
+        // but-mistyped session_id, e.g. an int, still fails -> shape_error). All 0.9
+        // stores/payloads carry canonical BINARY and compare bytewise.
+        sid_ok = is_str sid || (sid != NIL && (_typeof sid) == "BINARY").
         // $pv: absent is tolerated (defaults to 8 in e2e_version_of); present MUST be an int.
         // Every 0.8.0+ e2e sender stamps a real int $pv, so a present-non-int is malformed ->
         // shape_error (error-as-data), which also keeps the `$pv -> int+` cast abort-free.
-        return is_str (env $session_id) && is_int (env $olm_type)
+        return sid_ok && is_int (env $olm_type)
             && ct != NIL && (_typeof ct) == "BINARY"
             && (pv == NIL || is_int pv).
     }
