@@ -9,12 +9,13 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 CORE_DIR=$(cd "$HERE/.." && pwd)
 AT=${ADAPT_TOOLKIT:-/home/shakhvit/work/adapt/adapt-toolkit}
+STDLIB=${MUFL_STDLIB_OVERRIDE:-$AT/mufl_stdlib}   # Phase-B: point at the adapt worktree stdlib to pick up e2e.mm staged API
 SDK_NM=${OURS_SDK_NODE_MODULES:-/home/shakhvit/work/adapt/ours/ours-mcp/node_modules}
 DEV_BROKER=${DEV_BROKER:-/home/shakhvit/work/adapt/ours/ours-mcp/scripts/dev-broker.mjs}
 PORT=${PORT:-9798}
 COMPILE="$AT/build.linux.release/mufl-compile"
 
-for p in "$COMPILE" "$AT/mufl_stdlib" "$SDK_NM/@adapt-toolkit" "$DEV_BROKER"; do
+for p in "$COMPILE" "$STDLIB" "$SDK_NM/@adapt-toolkit" "$DEV_BROKER"; do
   [ -e "$p" ] || { echo "MISSING: $p (set ADAPT_TOOLKIT / OURS_SDK_NODE_MODULES / DEV_BROKER)"; exit 2; }
 done
 
@@ -39,7 +40,7 @@ CFG
 
 cd "$BUILD"
 echo "compiling notif test actor against $CORE_DIR core…"
-MUFL_STDLIB_PATH="$AT/mufl_stdlib" "$COMPILE" -mp "$AT/meta" -mp "$AT/transactions" notif_actor.mu 2>&1 \
+MUFL_STDLIB_PATH="$STDLIB" "$COMPILE" -mp "$AT/meta" -mp "$AT/transactions" notif_actor.mu 2>&1 \
   | grep -vE "Unused symbol|browser_attestation|identity_proof_document_impl" | tail -4
 ls ./*.muflo >/dev/null 2>&1 || { echo "COMPILE FAILED"; exit 1; }
 

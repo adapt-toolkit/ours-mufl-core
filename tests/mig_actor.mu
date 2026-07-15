@@ -17,6 +17,7 @@ application actor loads libraries
     address_document_types,
     key_utils,
     key_storage,
+    e2e,
     continuation,
     encrypted_channel,
     a2a_versions,
@@ -31,6 +32,12 @@ application actor loads libraries
     hidden
     {
         fn _return_data (payload: any) = (transaction::action::return_data ($kind -> $data, $payload -> payload)).
+        // Host wiring the crypto facade needs at runtime (Phase-B e2e qa trns):
+        // _read_or_abort deserializes blobs; key_storage derives the e2e pickle key
+        // from the identity signing secret; encrypted_channel is a2a_messaging's dep.
+        _read_or_abort = grab( _read_or_abort ).
+        key_storage::init ($_read_or_abort -> _read_or_abort).
+        encrypted_channel::init ($_read_or_abort -> _read_or_abort).
     }
 
     // Phase-A compile/headroom probe + export/import round-trip for the three new
@@ -84,4 +91,64 @@ application actor loads libraries
             $deferred_absent  -> (((exp $mig_deferred) as any) probe == NIL)
         ) ].
     }
+
+    // ---- Phase-B staged-rotation exercise (adapt e2e §5.5) ----------------
+    // Thin qa wrappers over the adapt e2e facade so a two-node driver can drive
+    // establish -> stage -> commit and assert the rotate-once property. The driver
+    // shuttles the opaque envelope fields + the sender's e2e identity key between
+    // two packets (there is no core FSM here — this is the crypto-layer property).
+    trn readonly qa_e2e_bundle _ { return ($bundle -> (_write (e2e::my_public_bundle()))). }
+    trn readonly qa_e2e_ik _ { return ($ik -> ((e2e::my_public_bundle()) $ik_curve)). }
+
+    // Establish the LIVE session (encrypt_to lazily creates it) and emit the pre-key envelope.
+    trn qa_e2e_first_send _:($cid -> cid: global_id, $pt -> pt: bin, $peer -> peer_blob: bin)
+    {
+        peer = (_read_or_abort peer_blob) safe address_document_types::t_e2e_bundle.
+        env = e2e::encrypt_to cid pt peer.
+        e = env $e2e_envelope.
+        return transaction::success [ _return_data ($session_id -> (e $session_id), $olm_type -> (e $olm_type), $ciphertext -> (e $ciphertext)) ].
+    }
+
+    // Receive on the LIVE session (decode-seam: establishes/decrypts + commits m_sessions).
+    trn qa_e2e_recv _:($from -> from_cid: global_id, $ik -> ik: bin, $olm_type -> ot: int, $ciphertext -> ct: bin)
+    {
+        r = e2e::decrypt_and_commit from_cid ik ot ct.
+        pt is bin+ = NIL.  if r $ok { pt -> (r $plaintext) as bin. }
+        return transaction::success [ _return_data ( $ok -> (r $ok), $plaintext -> pt,
+            $code -> ((r $ok) ?? "" ; ((r $error)?) $code) ) ].
+    }
+
+    // Stage a FRESH outbound rotation (live session untouched); returns the staged session id.
+    trn qa_e2e_stage_out _:($cid -> cid: global_id, $peer -> peer_blob: bin)
+    {
+        peer = (_read_or_abort peer_blob) safe address_document_types::t_e2e_bundle.
+        return transaction::success [ _return_data ($sid -> (e2e::stage_outbound_rotation cid peer)) ].
+    }
+
+    // Encrypt on the STAGED session (pre-key on the fresh session).
+    trn qa_e2e_enc_staged _:($cid -> cid: global_id, $pt -> pt: bin)
+    {
+        env = e2e::encrypt_staged cid pt.
+        e = env $e2e_envelope.
+        return transaction::success [ _return_data ($session_id -> (e $session_id), $olm_type -> (e $olm_type), $ciphertext -> (e $ciphertext)) ].
+    }
+
+    // Stage an INBOUND rotation from the peer's pre-key (m_sessions untouched).
+    trn qa_e2e_stage_in _:($from -> from_cid: global_id, $ik -> ik: bin, $ciphertext -> ct: bin)
+    {
+        r = e2e::stage_inbound_rotation from_cid ik ct.
+        pt is bin+ = NIL.  if r $ok { pt -> (r $plaintext) as bin. }
+        return transaction::success [ _return_data ( $ok -> (r $ok), $plaintext -> pt,
+            $code -> ((r $ok) ?? "" ; ((r $error)?) $code) ) ].
+    }
+
+    // Promote staged -> active (idempotent; NIL if nothing staged).
+    trn qa_e2e_commit _:($cid -> cid: global_id)
+    {
+        sid = e2e::commit_rotation cid.
+        return transaction::success [ _return_data ($sid -> sid, $committed -> (sid != NIL)) ].
+    }
+
+    trn readonly qa_e2e_active _:($cid -> cid: global_id) { return ($sid -> (e2e::active_session_id cid)). }
+    trn readonly qa_e2e_staged _:($cid -> cid: global_id) { return ($sid -> (e2e::staged_session_id cid)). }
 }
