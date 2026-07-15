@@ -53,5 +53,17 @@ check t11_three_version.mufl \
   "v0.3 way: name=Bob" \
   "v0.5 way: name=Carol pv=5"
 
+# string '<' is a STRICT TOTAL ORDER — the invariant the 0.9.0 migration election
+# (str_lt / mig_initiator) depends on; a regression here would split-brain the election.
+check t_str_order.mufl \
+  "irreflexive: F" \
+  "lt: T" \
+  "antisym: F" \
+  "prefix1: T" \
+  "prefix2: T" \
+  "hexlt: T" \
+  "hexeq: F" \
+  "hexgt: F"
+
 [ $fail -eq 0 ] && echo "SEMANTICS PINS: ALL GREEN" || echo "SEMANTICS PINS: FAILURES"
 exit $fail
