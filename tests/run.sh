@@ -29,7 +29,8 @@ BUILD=$(mktemp -d)
 trap 'rm -rf "$BUILD"' EXIT
 mkdir -p "$BUILD/core"
 cp "$CORE_DIR"/*.mm "$CORE_DIR"/config.mufl "$BUILD/core/"
-cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$HERE/protocol_container.mm" "$BUILD/"
+# test.mjs imports ./test_common.mjs, so copy it alongside into the build dir.
+cp "$HERE/test_actor.mu" "$HERE/test.mjs" "$HERE/test_common.mjs" "$HERE/protocol_container.mm" "$BUILD/"
 ln -sfn "$SDK_NM" "$BUILD/node_modules"
 # Top-level compile config: merge the stdlib with this repo's core (the core/ subdir),
 # plus the local protocol_container stub the ADAPT wrapper needs at packet boot
