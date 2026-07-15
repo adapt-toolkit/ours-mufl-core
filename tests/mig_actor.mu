@@ -215,6 +215,17 @@ application actor loads libraries
             _return_data ($sent_to -> target_id, $wire_id -> wid) ].
     }
 
+    // Synthesize a box-only COMMITTED-INITIATOR FSM entry over an already-staged rotation (the
+    // guard-matrix implicit-confirm setup, without a live broker handshake). $session_id is read
+    // from the current staged slot so committed_match holds. $seen=TRUE makes it PRODUCTION-LIKE (a
+    // real migrating pair advertises cap_e2e ⇒ contact_e2e_seen is set by `committed`), which is
+    // exactly the state where do_ic must STILL fire (MigrationReview #3 do_ic-decoupling bug).
+    // NOTE: forgery-through-the-handler (bad-pv/tampered-emsig/wrong-$to/relay-rebox → ABORT) is NOT
+    // re-tested at the handler level — the mig_actor unit is at the meta-fuel ceiling (encrypt_to +
+    // send_encrypted_tx in one trn blows it), and the handler calls the SAME audited
+    // e2e::decode_migration_envelope the existing decode-GUARD section already exercises for all four
+    // forgeries; the happy round-trip proves the handler invokes it end-to-end and gates on $ok.
+
     // §5.4 trigger-GATE test helpers (criterion-1 boundary). ISOLATED: advertising cap_e2e_migrate
     // here does NOT touch the full suite's test_actor. qa_mig_should_trigger reads the PURE gate
     // (no send) so we exercise fail-closed WITHOUT needing a registered peer.

@@ -392,6 +392,23 @@ async function main() {
   await sleep(4000);
   ok(ro(E4, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'seen-not-epoch legacy — still delivered', 'seen-not-epoch: LEGACY plaintext STILL accepted (downgrade-refusal is EPOCH-only, not seen)');
 
+  // ═══ INCREMENT C — ACCEPT-GATE REJECT: an e2e box from a peer THIS side has not seen (and is not
+  // a committed initiator for) is REJECTED before decode — no delivery, no session mutation. ═══
+  console.log('=== mig: INCREMENT C — accept-gate reject (non-e2e peer → dropped, never decoded) ===');
+  const E5 = await mkNode('mig-gate-E5', 'E5');
+  const E6 = await mkNode('mig-gate-E6', 'E6'); await sleep(1000);
+  const e5inv = await mutate(E5, '::a2a_messaging::generate_invite', { name: 'E6' });
+  await mutate(E6, '::a2a_messaging::add_contact', { invite: binv(E6, Buffer.from(e5inv.Reduce('invite').GetBinary())), name: 'E5' });
+  await sleep(6000);
+  // ONLY the sender marks the peer seen (so it routes e2e); the RECEIVER does NOT → accept-gate FALSE.
+  await mutate(E5, '::actor::qa_learn_peer', { cid: E6.cid, pv: 9, caps: ['core.e2e'] });
+  ok(ro(E5, '::actor::qa_e2e_route', { cid: E6.cid }).Reduce('route').Visualize() === 'e2e', 'accept-reject: sender routes e2e (it has seen the peer)');
+  await mutate(E6, '::actor::qa_recv_reset', {});
+  const rSend = await mutate(E5, '::a2a_messaging::send_message', { contact: 'E6', text: 'must be rejected — receiver has not seen this peer' });
+  ok(rSend.Reduce('route').Visualize() === 'e2e', 'accept-reject: sender boxed the app as receive_e2e_message_tx');
+  await sleep(4000);
+  ok(ro(E6, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '', 'accept-reject: receiver DROPS the e2e box (not e2e_pinned, not committed → reject BEFORE decode, no delivery/session mutation)');
+
   // decode_migration_envelope guard matrix — the point-1 divergence guard (recv_authenticated's
   // S1/S2 is REAL) + decode_migration_envelope binding gates + the forgery-abort vs replay-reject
   // split. P (sender) stages a rotation to M (receiver) and encrypts a known plaintext; M then

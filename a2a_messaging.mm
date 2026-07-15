@@ -2666,33 +2666,34 @@ library a2a_messaging loads libraries
 
         // GATE 1 — ACCEPT gate. The SEND side boxes app as receive_e2e_message_tx whenever the
         // route is "e2e" AND the peer is (seen || epoch-pinned) — i.e. for EVERY e2e-capable pair,
-        // not just migrated ones (an already-E2E pre-migration pair rides the e2e box too). So
-        // ACCEPT from (a) any e2e_pinned/seen contact (covers epoch-pinned, since epoch sets seen at
-        // active) or (b) a committed INITIATOR whose STAGED rotation is the committed session (the
-        // responder's post-active app arriving BEFORE our explicit confirm = §5.5 implicit-confirm
-        // proof). Any other state: this cid has no business sending e2e app data — reject as data,
-        // NEVER decode (no session mutation from a non-e2e peer). NOTE: this is BROADER than the
-        // §5.7 downgrade-refusal (epoch-only): seen is advertisement-strength, epoch is
-        // cryptographic — a seen-not-epoch peer's LEGACY plaintext is still accepted (not refused).
+        // not just migrated ones (an already-E2E pre-migration pair rides the e2e box too). ACCEPT
+        // from (a) any e2e_pinned/seen contact or (b) a committed INITIATOR whose STAGED rotation is
+        // the committed session (the responder's post-active app arriving BEFORE our explicit
+        // confirm). Any other state → reject as data, NEVER decode (no session mutation from a
+        // non-e2e peer). BROADER than the §5.7 downgrade-refusal (epoch-only): a seen-not-epoch
+        // peer's LEGACY plaintext is still accepted.
+        // §5.5 must-fix-C IMPLICIT CONFIRM gate — computed on its OWN merits, DECOUPLED from the
+        // accept branch. A REAL migrating pair advertises cap_e2e, so contact_e2e_seen (== e2e_pinned)
+        // is already TRUE by the `committed` phase; gating do_ic on !e2e_pinned would make implicit-
+        // confirm UNREACHABLE in production. Fire it for a BOX-ONLY committed initiator: staged IS
+        // the committed rotation, NO pre-migration live session (active_session_id == NIL), NOT yet
+        // epoch-pinned — so the responder's inbound e2e app decrypted on the staged slot and is the
+        // promotion proof. An already-E2E committed pair (live session present) delivers but does NOT
+        // promote here — its explicit confirm does.
         st  = contact_migration sender_id.
-        accept is bool = FALSE.
-        do_ic  is bool = FALSE.
-        if e2e_pinned sender_id { accept -> TRUE. }
-        else
+        committed_match is bool = FALSE.
+        do_ic is bool = FALSE.
+        if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
         {
-            if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
+            staged_sid = e2e::staged_session_id sender_id.
+            if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
             {
-                staged_sid = e2e::staged_session_id sender_id.
-                if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
-                {   // BOX-ONLY committed (no pre-migration live session) ⇒ this app rode the staged
-                    // slot ⇒ implicit-confirm. An ALREADY-E2E committed pair (live session present)
-                    // is delivered too but promotion waits for the explicit confirm (do_ic FALSE) —
-                    // and such a pair is already `seen`, so it takes the e2e_pinned branch above.
-                    accept -> TRUE.
-                    do_ic  -> (e2e::active_session_id sender_id) == NIL.
-                }
+                committed_match -> TRUE.
+                if (e2e::active_session_id sender_id) == NIL && (contact_e2e_epoch sender_id) == NIL { do_ic -> TRUE. }
             }
         }
+        accept is bool = FALSE.
+        if committed_match || (e2e_pinned sender_id) { accept -> TRUE. }
         if accept != TRUE
         { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
 
@@ -2784,24 +2785,22 @@ library a2a_messaging loads libraries
         { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $ok -> FALSE, $wire_id -> "") ]. }
         env_sid = (env? $session_id).
 
-        // GATE 1 — ACCEPT gate (identical to the message handler: e2e_pinned/seen OR committed
-        // box-only initiator; broader than the epoch-only §5.7 downgrade-refusal).
+        // GATE 1 — ACCEPT gate + do_ic (identical to the message handler; do_ic DECOUPLED from the
+        // accept branch so it stays reachable for a box-only committed initiator even when seen).
         st  = contact_migration sender_id.
-        accept is bool = FALSE.
-        do_ic  is bool = FALSE.
-        if e2e_pinned sender_id { accept -> TRUE. }
-        else
+        committed_match is bool = FALSE.
+        do_ic is bool = FALSE.
+        if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
         {
-            if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
+            staged_sid = e2e::staged_session_id sender_id.
+            if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
             {
-                staged_sid = e2e::staged_session_id sender_id.
-                if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
-                {
-                    accept -> TRUE.
-                    do_ic  -> (e2e::active_session_id sender_id) == NIL.
-                }
+                committed_match -> TRUE.
+                if (e2e::active_session_id sender_id) == NIL && (contact_e2e_epoch sender_id) == NIL { do_ic -> TRUE. }
             }
         }
+        accept is bool = FALSE.
+        if committed_match || (e2e_pinned sender_id) { accept -> TRUE. }
         if accept != TRUE
         { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
 
