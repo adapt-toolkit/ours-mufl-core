@@ -257,6 +257,33 @@ async function main() {
     const rpin = ro(R, '::actor::qa_mig_pin', { cid: I.cid });
     ok(T(rpin.Reduce('pinned').Visualize()) && hex(getBin(rpin, 'session_id')) === hex(getBin(c, 'sid')), 'positive control: epoch pin set to the committed session'); }
 
+  // ── §5.8 restart, SAME-packet (staged SURVIVES) → sweep resumes the SAME epoch. A same-packet
+  // restart persists m_staged (packet-state reloaded), so the committed initiator's staged rotation
+  // is intact. The sweep re-drives byte-identically on that surviving session — it does NOT mint a
+  // fresh epoch. Resume-same-epoch: the responder's session_matches collapses the duplicate commit.
+  console.log('=== migapp: §5.8 restart same-packet (staged survives) → sweep resumes the SAME epoch ===');
+  { const { I, R, sid } = await synthCommitted('rsr');
+    const staged0 = getBin(ro(I, '::actor::qa_e2e_staged', { cid: R.cid }), 'sid');
+    ok(staged0.length > 0 && hex(staged0) === hex(sid), 'setup: committed initiator with a SURVIVING staged session (same-packet restart preserves m_staged)');
+    const sw = await mutate(I, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(+sw.Reduce('redriven').Visualize() === 1 && +sw.Reduce('superseded').Visualize() === 0, '★ restart-resume: the sweep RE-DRIVES the committed entry (staged survives → byte-identical re-send, NOT a supersede)');
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'committed', 'restart-resume: FSM stays committed (same migration, not restarted from scratch)');
+    ok(hex(getBin(ro(I, '::actor::qa_e2e_staged', { cid: R.cid }), 'sid')) === hex(sid), '★ restart-resume: the re-drive resumes the SAME staged rotation (session_id unchanged → same epoch, no fresh rotation)'); }
+
+  // ── §5.8 restart, UNIT-SWAP (staged session LOST) → supersede. A unit-swap (new packet code)
+  // drops the in-memory m_staged (packet-state, never exported per INV-4). A committed initiator whose
+  // staged session is gone is UNRESUMABLE — the sweep abandons + supersedes with a fresh offer/epoch,
+  // never re-sends a commit it can no longer produce, and never strands a half-migrated pin.
+  console.log('=== migapp: §5.8 restart unit-swap (staged session LOST) → supersede ===');
+  { const { I, R } = await connect('rsl');
+    await mutate(I, '::actor::qa_mig_set_committed', { cid: R.cid, session_id: binv(I, Buffer.from('lost-staging-session-32-bytes!!!')), seen: false });
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'committed', 'setup: committed initiator');
+    ok(getBin(ro(I, '::actor::qa_e2e_staged', { cid: R.cid }), 'sid').length === 0, 'setup: staged session GONE (unit-swap dropped m_staged — never exported, INV-4)');
+    const sw = await mutate(I, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(+sw.Reduce('superseded').Visualize() === 1 && +sw.Reduce('redriven').Visualize() === 0, '★ staged-lost: the sweep SUPERSEDES (unresumable committed — staged gone → fresh offer/epoch, never a stale commit)');
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'offered', 'staged-lost: FSM reset to offered (a fresh migration with a new nonce/epoch)');
+    ok(!T(ro(I, '::actor::qa_mig_pin', { cid: R.cid }).Reduce('pinned').Visualize()), 'staged-lost: no epoch pin left behind (clean supersede — nothing was ever completed)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
