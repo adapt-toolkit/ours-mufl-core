@@ -190,6 +190,15 @@ application actor loads libraries
             _return_data ($sid -> sid) ].
     }
 
+    // Drop ALL peer address documents — the spec's "degraded contact" state (a breaking-change
+    // migration / restart lost peer_ads). Drives the §5.6 recovery composition: a pinned-but-degraded
+    // contact must RESTORE first (re-fetch the AD) before the migration route can deliver.
+    trn qa_strip_peer_ads _
+    {
+        a2a_messaging::peer_ads -> (,).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
     // Synthesize an epoch PIN for a cid (imported-migration state). With NO peer bundle in peer_ads,

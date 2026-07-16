@@ -284,6 +284,22 @@ async function main() {
     ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'offered', 'staged-lost: FSM reset to offered (a fresh migration with a new nonce/epoch)');
     ok(!T(ro(I, '::actor::qa_mig_pin', { cid: R.cid }).Reduce('pinned').Visualize()), 'staged-lost: no epoch pin left behind (clean supersede — nothing was ever completed)'); }
 
+  // ── §5.8 recovery composition (br1): pin + peer_ads ABSENT → RESTORE first, then migrate. When a
+  // contact is epoch-pinned (migrated) but its peer AD was lost (a breaking-change migration/restart
+  // dropped peer_ads = degraded), send_message's DEGRADED branch (peer_ads==NIL) precedes the
+  // migration route: the message is queued to the RESTORE queue + a restore request is (re)issued —
+  // NOT boxed, NOT queued to mig_deferred, NOT a downgrade refusal. Restore composes BEFORE migrate;
+  // once the AD is re-established the SAME epoch pin routes e2e (proven by the setup + route tests).
+  console.log('=== migapp: §5.8 recovery composition — pin + peer_ads ABSENT → restore FIRST, then migrate ===');
+  { const { I, R } = await connect('rec');
+    await mutate(I, '::actor::qa_set_epoch_pin', { cid: R.cid, session_id: binv(I, Buffer.from('migrated-but-degraded-session!!!')) });
+    ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'e2e', 'setup: with peer_ads present + epoch pin, the contact is MIGRATE-READY (route e2e)');
+    await mutate(I, '::actor::qa_strip_peer_ads', {});
+    ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'downgrade_refused', 'route-level view: pin present but peer bundle GONE → downgrade_refused (never box a migrated peer)');
+    const s = await mutate(I, '::a2a_messaging::send_message', { contact: R.name, text: 'sent while pinned + degraded' });
+    ok(T(s.Reduce('deferred').Visualize()), '★ restore-first: the send is DEFERRED to the restore queue + a restore is (re)issued — the peer_ads-absent branch precedes the migration route');
+    ok(!T(s.Reduce('migrating').Visualize()) && !T(s.Reduce('downgrade_refused').Visualize()), '★ restore-first: NOT the migration paths (mig_deferred / downgrade_refused) — restore composes BEFORE migrate (§5.6 br1)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
