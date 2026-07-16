@@ -185,6 +185,35 @@ async function main() {
     await sleep(4000);
     ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'active' && hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'dup-confirm(§5.8): a REDELIVERED confirm at active is a NO-OP (idempotent — no second promotion, session unchanged)'); }
 
+  // ── §5.8 dup-COMMIT re-confirm (responder) + lost-confirm recovery (initiator promotes).
+  // The responder's confirm was lost, so the initiator is stuck at "committed". Its sweep re-sends
+  // the commit; the responder is already active, so handle_e2e_migrate_commit routes to
+  // mig_handle_replayed_commit — a NO-decode, NO-state-change idempotent re-confirm on the pinned
+  // active session. That re-confirm reaches the initiator, which finally promotes. Proves BOTH
+  // §5.8 rows: "dup-commit → re-confirm (idempotent)" and "lost-confirm + redelivered-commit → re-confirm".
+  console.log('=== migapp: §5.8 dup-commit re-confirm (responder) + lost-confirm recovery (initiator promotes) ===');
+  { const { I, R, sid } = await synthCommitted('dupc');
+    // R is crypto-promoted over the shared rotation; make it an ACTIVE responder in the FSM, pinned
+    // to that live session, carrying the initiator's committed epoch (== sid).
+    const setA = await mutate(R, '::actor::qa_mig_set_active', { cid: I.cid, epoch: binv(R, sid), initiator: false });
+    ok(hex(getBin(setA, 'asid')) === hex(sid), 'setup: responder active session == the shared rotation (both peers pin the SAME session_id — #1867 invariant)');
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'active', 'setup: responder is ACTIVE (already promoted + sent its now-lost confirm)');
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'committed', 'setup: initiator is still COMMITTED (its responder confirm was lost)');
+    ok(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid').length === 0, 'setup: initiator has no active session yet (box-only committed, staged rotation survives)');
+    // Production lost-confirm recovery: the committed initiator's sweep re-encrypts the commit on its
+    // surviving staged session and re-sends it. (Deterministic — no wall-clock; single host-fired sweep.)
+    const sw = await mutate(I, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(+sw.Reduce('redriven').Visualize() >= 1, 'sweep: the committed initiator re-drives its commit (redriven ≥ 1) — a redelivered commit is now in flight to the active responder');
+    await sleep(4000);
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'active', '★ lost-confirm recovery: redelivered commit → active responder re-confirmed → initiator PROMOTED to active');
+    ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'recovery: initiator active session == the migrated rotation (same session both peers)');
+    const ipin = ro(I, '::actor::qa_mig_pin', { cid: R.cid });
+    ok(T(ipin.Reduce('pinned').Visualize()) && hex(getBin(ipin, 'session_id')) === hex(sid), 'recovery: initiator epoch pin == the migrated session');
+    // The responder never mutated on the replay: mig_handle_replayed_commit writes NOTHING (re-confirm only).
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'active' &&
+       hex(getBin(ro(R, '::actor::qa_e2e_active', { cid: I.cid }), 'sid')) === hex(sid),
+       '★ dup-commit: responder UNCHANGED by the replayed commit (idempotent re-confirm — no decode, no state mutation)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

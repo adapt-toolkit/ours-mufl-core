@@ -137,6 +137,24 @@ application actor loads libraries
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
 
+    // Synthesize an ACTIVE responder over an already-PROMOTED rotation (post-commit state): FSM
+    // phase=active + the epoch pin bound to the LIVE active session (so mig_handle_replayed_commit's
+    // "pin.$session_id == active_session_id" evidence rule holds). $epoch is the shared migration
+    // epoch (== the initiator's committed epoch) so the re-confirm this responder emits on a
+    // redelivered commit carries the epoch the initiator gates on. Drives the §5.8 lost-confirm
+    // recovery: the initiator's sweep re-sends its commit → this active responder re-confirms.
+    trn qa_mig_set_active _:($cid -> cid: global_id, $epoch -> ep: bin, $initiator -> ini: bool)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        asid = (e2e::active_session_id cid)?.
+        a2a_messaging::contact_migration cid -> ( $phase -> "active", $initiator -> ini,
+            $local_nonce -> ep, $peer_nonce -> ep, $epoch -> ep, $session_id -> asid,
+            $local_bundle -> ep, $local_fp -> ep, $attempts -> 0, $updated -> now ).
+        a2a_messaging::contact_e2e_epoch cid -> ( $epoch -> ep, $session_id -> asid ).
+        a2a_messaging::contact_e2e_seen cid -> TRUE.
+        return transaction::success [ _return_data ($ok -> TRUE, $asid -> asid) ].
+    }
+
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
     // Synthesize an epoch PIN for a cid (imported-migration state). With NO peer bundle in peer_ads,
