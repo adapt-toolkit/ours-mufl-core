@@ -510,6 +510,40 @@ async function main() {
     const ha = getBin(ro(hi, '::actor::qa_e2e_active', { cid: lo.cid }), 'sid');
     ok(la.length > 0 && hex(la) === hex(ha), 'solicitation: both share ONE migrated session'); }
 
+  // ═══ §5.8 already-E2E pair → FULL-FSM handshake rotates ONCE (finding b) ═══
+  // The C.3 handshake proves box-only pairs (no prior session). This proves a pair that ALREADY has a
+  // LIVE e2e session runs the WHOLE migration FSM (offer→ack→commit→confirm) through the REAL handlers
+  // and rotates EXACTLY ONCE onto a fresh migrated session that REPLACES the live one — the live
+  // session is preserved (staged-not-installed) until commit_rotation promotes the rotation.
+  console.log('=== mig: §5.8 already-E2E pair → FULL-FSM handshake rotates once (finding b) ===');
+  const AE1 = await mkNode('mig-gate-AE1', 'AE1');
+  const AE2 = await mkNode('mig-gate-AE2', 'AE2'); await sleep(1000);
+  { const invA = await mutate(AE1, '::a2a_messaging::generate_invite', { name: 'AE2' });
+    await mutate(AE2, '::a2a_messaging::add_contact', { invite: binv(AE2, Buffer.from(invA.Reduce('invite').GetBinary())), name: 'AE1' });
+    await sleep(6000);
+    const [lo, hi] = AE1.cid < AE2.cid ? [AE1, AE2] : [AE2, AE1];
+    // Establish a PRE-MIGRATION live e2e session lo→hi (the "already-E2E" precondition).
+    const hiBundle = getBin(ro(hi, '::actor::qa_e2e_bundle', {}), 'bundle');
+    const loIk = getBin(ro(lo, '::actor::qa_e2e_ik', {}), 'ik');
+    const lenv = await mutate(lo, '::actor::qa_e2e_first_send', { cid: hi.cid, pt: binv(lo, Buffer.from('pre-migration live traffic')), peer: binv(lo, hiBundle) });
+    await mutate(hi, '::actor::qa_e2e_recv', { from: lo.cid, ik: binv(hi, loIk), olm_type: +lenv.Reduce('olm_type').Visualize(), ciphertext: binv(hi, getBin(lenv, 'ciphertext')) });
+    const liveLo = getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid');
+    const liveHi = getBin(ro(hi, '::actor::qa_e2e_active', { cid: lo.cid }), 'sid');
+    ok(liveLo.length > 0 && hex(liveLo) === hex(liveHi), 'already-E2E setup: both peers share a LIVE pre-migration session');
+    // Now run the FULL migration FSM through the real handlers.
+    await mutate(lo, '::actor::qa_mig_trigger_offer', { peer: hi.cid });
+    await sleep(12000);   // offer → ack → commit → confirm
+    const ls = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
+    const hs = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
+    console.log(`  DIAG already-E2E: lo phase=${ls.Reduce('phase').Visualize()} / hi phase=${hs.Reduce('phase').Visualize()}`);
+    ok(ls.Reduce('phase').Visualize() === 'active' && hs.Reduce('phase').Visualize() === 'active', '★ already-E2E: the full FSM reaches active on an ALREADY-live pair (offer→ack→commit→confirm through real handlers)');
+    const migLo = getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid');
+    const migHi = getBin(ro(hi, '::actor::qa_e2e_active', { cid: lo.cid }), 'sid');
+    ok(migLo.length > 0 && hex(migLo) === hex(migHi), 'already-E2E: both converge on ONE fresh migrated session');
+    ok(hex(migLo) !== hex(liveLo), '★ already-E2E: rotated ONCE — the migrated session REPLACED the pre-migration live session (distinct session_id, both peers)');
+    const lp = ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), hp = ro(hi, '::actor::qa_mig_pin', { cid: lo.cid });
+    ok(T(lp.Reduce('pinned').Visualize()) && T(hp.Reduce('pinned').Visualize()) && hex(getBin(lp, 'session_id')) === hex(migLo), 'already-E2E: both epoch-pinned to the migrated (not the old live) session'); }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
