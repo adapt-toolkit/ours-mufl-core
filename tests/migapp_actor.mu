@@ -155,6 +155,41 @@ application actor loads libraries
         return transaction::success [ _return_data ($ok -> TRUE, $asid -> asid) ].
     }
 
+    // Synthesize an ACKNOWLEDGED responder with a stored migration epoch — the pre-commit FSM state
+    // (mig_pending TRUE ⇒ an inbound commit STAGES a fresh session). No epoch pin yet. Drives the
+    // §5.8 forged-commit-at-real-handler row: a crypto-valid commit whose INNER epoch/session is
+    // forged reaches handle_e2e_migrate_commit GATE 3 and is rejected (discard_rotation, stay acknowledged).
+    trn qa_mig_set_acknowledged _:($cid -> cid: global_id, $epoch -> ep: bin)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        a2a_messaging::contact_migration cid -> ( $phase -> "acknowledged", $initiator -> FALSE,
+            $local_nonce -> ep, $peer_nonce -> ep, $epoch -> ep, $session_id -> ep,
+            $local_bundle -> ep, $local_fp -> ep, $attempts -> 0, $updated -> now ).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
+    // Send a REAL migration COMMIT (initiator → responder): stage a fresh outbound rotation, encrypt
+    // the commit body (name + {epoch, session_id, pv}) as a PRE_KEY message on the staged session, box
+    // it as e2e_migrate_commit exactly as the initiator's commit leg does. The inner $session_id is
+    // ALWAYS the real staged session (so it matches the responder's carrier), leaving $epoch as the
+    // one caller-controlled gating field: pass the responder's stored epoch for a valid commit, or a
+    // different value to forge it. The crypto stays valid (S1/S2 + decrypt succeed), so a forged epoch
+    // is rejected at handle_e2e_migrate_commit GATE 3 — not at the decode seam. Returns the staged sid.
+    trn qa_send_commit _:($contact -> cref: str, $peer -> peer_blob: bin, $epoch -> ep: bin)
+    {
+        target_id = a2a_messaging::resolve_contact cref.
+        peer = (_read_or_abort peer_blob) safe address_document_types::t_e2e_bundle.
+        sid = e2e::stage_outbound_rotation target_id peer.
+        commit_body = _write ( $name -> "::a2a_messaging::e2e_migrate_commit",
+                               $targ -> ( $epoch -> ep, $session_id -> sid, $pv -> a2a_versions::wire_version ) ).
+        env = e2e::encrypt_staged target_id commit_body.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx target_id (
+                $name -> "::a2a_messaging::e2e_migrate_commit",
+                $targ -> ( $e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature) ) ),
+            _return_data ($sid -> sid) ].
+    }
+
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
     // Synthesize an epoch PIN for a cid (imported-migration state). With NO peer bundle in peer_ads,

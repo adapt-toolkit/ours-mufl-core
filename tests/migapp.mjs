@@ -60,7 +60,9 @@ const seq = (() => { let n = 0; return () => n++; })();
 // Build a box-only (or with-live-session, when opts.live) COMMITTED-INITIATOR I over a real staged
 // rotation shared with responder R. Returns { I, R, sid, ic1Ik } where R has PROMOTED the rotation
 // (its m_sessions == the shared session) and I is committed+seen (production-like). No live handshake.
-async function synthCommitted(tag, opts = {}) {
+// Bring up two fresh nodes I,R and connect them (invite → add_contact → both learn each other's
+// AD, so peer_ads is populated BOTH ways). Returns the nodes + their e2e bundles + I's ik.
+async function connect(tag) {
   const n = seq();
   const I = await mkNode(`migapp-${tag}-I${n}`, `I_${tag}`);
   const R = await mkNode(`migapp-${tag}-R${n}`, `R_${tag}`); await sleep(1000);
@@ -70,6 +72,11 @@ async function synthCommitted(tag, opts = {}) {
   const iBundle = getBin(ro(I, '::actor::qa_e2e_bundle', {}), 'bundle');
   const rBundle = getBin(ro(R, '::actor::qa_e2e_bundle', {}), 'bundle');
   const iIk = getBin(ro(I, '::actor::qa_e2e_ik', {}), 'ik');
+  return { I, R, iBundle, rBundle, iIk };
+}
+
+async function synthCommitted(tag, opts = {}) {
+  const { I, R, iBundle, rBundle, iIk } = await connect(tag);
   // Optional pre-migration LIVE session (the already-E2E negative case).
   if (opts.live) {
     const lenv = await mutate(I, '::actor::qa_e2e_first_send', { cid: R.cid, pt: binv(I, Buffer.from('pre-migration-live')), peer: binv(I, rBundle) });
@@ -213,6 +220,42 @@ async function main() {
     ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'active' &&
        hex(getBin(ro(R, '::actor::qa_e2e_active', { cid: I.cid }), 'sid')) === hex(sid),
        '★ dup-commit: responder UNCHANGED by the replayed commit (idempotent re-confirm — no decode, no state mutation)'); }
+
+  // ── §5.8 forged commit at the REAL handler → GATE 3 reject. A crypto-VALID commit (S1/S2 + decrypt
+  // succeed) whose INNER epoch is forged (≠ the responder's stored epoch) must be discarded by
+  // handle_e2e_migrate_commit's inner epoch/session gate: discard_rotation, stay acknowledged, no
+  // promotion. A positive control on a fresh pair (correct epoch) promotes — proving the ONLY reason
+  // for the reject is the forged epoch, not a broken crypto path.
+  console.log('=== migapp: §5.8 forged commit (wrong inner epoch) at REAL handle_e2e_migrate_commit → GATE3 reject ===');
+  { const { I, R, rBundle } = await connect('fce');
+    const epoch = Buffer.from('acknowledged-epoch-32-bytes-xx!!');
+    await mutate(R, '::actor::qa_mig_set_acknowledged', { cid: I.cid, epoch: binv(R, epoch) });
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'acknowledged', 'setup: responder is acknowledged with a stored epoch');
+    // Crypto-valid commit whose inner epoch is FORGED (session_id is correct — the ONLY bad field is epoch).
+    await mutate(I, '::actor::qa_send_commit', { contact: R.name, peer: binv(I, rBundle), epoch: binv(I, Buffer.from('FORGED-wrong-epoch-32-bytes-xx!!')) });
+    await sleep(4000);
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'acknowledged', '★ forged commit (wrong epoch): responder STAYS acknowledged (GATE3 reject — the decode succeeded, the inner epoch gate did not)');
+    ok(!T(ro(R, '::actor::qa_mig_pin', { cid: I.cid }).Reduce('pinned').Visualize()), '★ forged commit: NO epoch pin (the epoch pin is the SOLE migration authority — a forgery can never set it)');
+    ok(getBin(ro(R, '::actor::qa_e2e_staged', { cid: I.cid }), 'sid').length === 0, 'forged commit: staged slot cleared (discard_rotation ran on the GATE3 reject)');
+    // A box-only (no prior session) rejected commit MAY leave a TRANSIENT UNPINNED session in
+    // m_sessions: the decode of a first-contact PRE_KEY establishes it directly (there is no live
+    // session to rotate FROM, so it does not go through the staged slot), and discard_rotation only
+    // clears m_staged. This is a KNOWN, REVIEWED, ACCEPTED artifact (Impl3 finding (d)) — it is
+    // UNPINNED, so it is NOT authoritative (route/FSM ignore it; the epoch pin governs) and it
+    // self-corrects on the next valid rotation. The security invariant that matters — no pin, no
+    // promotion, phase unchanged — holds above. }
+  }
+  // Positive control: the SAME path with the CORRECT epoch promotes the responder to active.
+  console.log('=== migapp: §5.8 forged-commit positive control (correct epoch → responder promotes) ===');
+  { const { I, R, rBundle } = await connect('fcp');
+    const epoch = Buffer.from('acknowledged-epoch-32-bytes-xx!!');
+    await mutate(R, '::actor::qa_mig_set_acknowledged', { cid: I.cid, epoch: binv(R, epoch) });
+    const c = await mutate(I, '::actor::qa_send_commit', { contact: R.name, peer: binv(I, rBundle), epoch: binv(I, epoch) });
+    await sleep(4000);
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'active', '★ positive control: a CORRECT-epoch commit at the same handler PROMOTES to active (the reject above is epoch-specific, not a broken crypto path)');
+    ok(hex(getBin(ro(R, '::actor::qa_e2e_active', { cid: I.cid }), 'sid')) === hex(getBin(c, 'sid')), 'positive control: active session == the committed rotation (both peers pin the same session_id)');
+    const rpin = ro(R, '::actor::qa_mig_pin', { cid: I.cid });
+    ok(T(rpin.Reduce('pinned').Visualize()) && hex(getBin(rpin, 'session_id')) === hex(getBin(c, 'sid')), 'positive control: epoch pin set to the committed session'); }
 
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
