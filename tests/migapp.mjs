@@ -109,7 +109,19 @@ async function main() {
     ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'active', '★ implicit-confirm PROMOTED to active DESPITE seen==TRUE (do_ic decoupled — the fix works)');
     const pin = ro(I, '::actor::qa_mig_pin', { cid: R.cid });
     ok(T(pin.Reduce('pinned').Visualize()) && hex(getBin(pin, 'session_id')) === hex(sid), 'implicit-confirm: epoch pin set to the promoted (migrated) session');
-    ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'implicit-confirm: active session == the promoted rotation'); }
+    ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'implicit-confirm: active session == the promoted rotation');
+    // §5.8 mixed-contact independence: this node is epoch-pinned to R (routes e2e) while an
+    // unrelated non-e2e contact routes "legacy" — per-contact routing is independent.
+    ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'e2e', 'mixed-contact(§5.8): the migrated peer routes e2e');
+    ok(ro(I, '::actor::qa_e2e_route', { cid: 'ab'.repeat(32) }).Reduce('route').Visualize() === 'legacy', 'mixed-contact(§5.8): an unrelated non-e2e contact routes legacy — routes are per-contact independent'); }
+
+  // ── §5.8 ROUTE-LEVEL rows (single node, store-synthesized): imported pin + no bundle → fail closed.
+  console.log('=== migapp: §5.8 route-level (import-pin-no-session → downgrade_refused; fresh → legacy) ===');
+  { const A = await mkNode('migapp-route-A', 'A'); await sleep(800);
+    const pinnedCid = 'cd'.repeat(32), freshCid = 'ef'.repeat(32);
+    await mutate(A, '::actor::qa_set_epoch_pin', { cid: pinnedCid, session_id: binv(A, Buffer.from('imported-session-id-32-bytes-xx!')) });
+    ok(ro(A, '::actor::qa_e2e_route', { cid: pinnedCid }).Reduce('route').Visualize() === 'downgrade_refused', 'route(§5.6/§5.8): imported epoch pin + NO peer bundle → downgrade_refused (fail closed — never box a migrated peer; recovery re-rotates over the carve-out)');
+    ok(ro(A, '::actor::qa_e2e_route', { cid: freshCid }).Reduce('route').Visualize() === 'legacy', 'route(§5.8): a fresh non-e2e contact → legacy (independent of the pinned one on the same node)'); }
 
   // ── (2) MUST-FIX-C ROLLBACK: app hook aborts → promotion+pins+flush all roll back, stays committed.
   console.log('=== migapp: must-fix-C ROLLBACK (app-hook abort → full rollback, FSM stays committed) ===');

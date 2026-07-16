@@ -139,6 +139,15 @@ application actor loads libraries
 
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
+    // Synthesize an epoch PIN for a cid (imported-migration state). With NO peer bundle in peer_ads,
+    // e2e_route returns "downgrade_refused" (§5.6: pinned but no v2 bundle → fail closed).
+    trn qa_set_epoch_pin _:($cid -> cid: global_id, $session_id -> sid: bin)
+    {
+        a2a_messaging::contact_e2e_epoch cid -> ( $epoch -> sid, $session_id -> sid ).
+        a2a_messaging::contact_e2e_seen cid -> TRUE.
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
     // Send a REAL explicit migration CONFIRM (responder → initiator) — encrypt the confirm body on
     // my active (rotation) session and box it as e2e_migrate_confirm, exactly as handle_e2e_migrate_
     // commit does. Lets the interleave test drive {confirm-then-app} / {app-then-confirm} and assert

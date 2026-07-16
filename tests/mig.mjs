@@ -354,6 +354,12 @@ async function main() {
   // on BOTH sides — box is now unreachable for this cid's app data (barrier post-commit).
   ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): initiator app-data route == "e2e" at active (box unreachable)');
   ok(ro(hiN, '::actor::qa_e2e_route', { cid: loN.cid }).Reduce('route').Visualize() === 'e2e', 'route(§5.6): responder app-data route == "e2e" at active (box unreachable)');
+  // §5.8 downgrade-attempt-after-active: the epoch pin is authoritative over caps — a peer whose
+  // caps are stripped (a downgrade attempt) STILL routes e2e; the pins are untouched.
+  await mutate(loN, '::actor::qa_learn_peer', { cid: hiN.cid, pv: 9, caps: [] });
+  ok(ro(loN, '::actor::qa_e2e_route', { cid: hiN.cid }).Reduce('route').Visualize() === 'e2e', 'downgrade-after-active(§5.8): route STAYS e2e after a caps-strip (epoch pin is authoritative, not caps)');
+  { const dp = ro(loN, '::actor::qa_mig_pin', { cid: hiN.cid });
+    ok(T(dp.Reduce('pinned').Visualize()) && hex(getBin(dp, 'session_id')) === hex(loAct), 'downgrade-after-active(§5.8): epoch pin UNTOUCHED by the downgrade attempt (same session_id)'); }
 
   // Exhaustive phase handling: a duplicate offer redelivered when the pair is already ACTIVE
   // must be an idempotent NO-OP (not restart the FSM), per §5.6 / MigrationReview C.3 watch-item.
