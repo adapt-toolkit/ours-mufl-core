@@ -210,6 +210,26 @@ application actor loads libraries
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
 
+    // Downgrade a peer's address document to v1 IN PLACE: keep the AD PRESENT in peer_ads but drop its
+    // $e2e_bundle (typed any+, so NIL is valid). This is the "v1-presenting / self-downgraded" peer —
+    // distinct from qa_strip_peer_ads (which removes the AD entirely = degraded). Drives §5.6 recovery
+    // br2: a pinned peer whose CURRENT AD carries no e2e bundle must fail closed (downgrade_refused),
+    // NOT enter the peer_ads==NIL restore-first branch (which would restore-loop on an AD that is present).
+    trn qa_downgrade_peer_ad _:($cid -> cid: global_id)
+    {
+        ad = a2a_messaging::peer_ads cid.
+        if ad == NIL { return transaction::success [ _return_data ($ok -> FALSE) ]. }
+        a = ad?.
+        a2a_messaging::peer_ads cid -> (
+            $version -> (a $version),
+            $identity -> ( $key_list -> (a $identity $key_list),
+                           $default_keys -> (a $identity $default_keys),
+                           $container_id -> (a $identity $container_id),
+                           $e2e_bundle -> NIL ),
+            $authorizations -> (a $authorizations) ).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
     trn readonly qa_e2e_route _:($cid -> cid: global_id) { return ($route -> (a2a_messaging::e2e_route cid)). }
 
     // Synthesize an epoch PIN for a cid (imported-migration state). With NO peer bundle in peer_ads,

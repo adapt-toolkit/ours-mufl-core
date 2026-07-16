@@ -347,6 +347,23 @@ async function main() {
     ok(+sw.Reduce('superseded').Visualize() === 1 && +sw.Reduce('stalled').Visualize() === 0, '★ backstop: a committed entry at the attempts cap SUPERSEDES (never a permanent $migration_stalled — the mig_deferred barrier is released)');
     ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'offered', 'backstop: FSM re-offered (fresh nonce/epoch) → re-attempts migration onto the peer bundle; no permanent strand'); }
 
+  // ── §5.6 recovery br2 (MR2 gate): pin + peer_ads PRESENT-but-v1 → downgrade_refused, NOT restore.
+  // The route verdict downgrade_refused for pin+!peer_has_e2e_bundle is covered; the untested COMPOSITION
+  // is the send-path branch: a v1-presenting (self-downgraded) peer whose AD is PRESENT but carries no
+  // e2e_bundle must fail CLOSED (typed downgrade_refused, never boxed), and must NOT enter the
+  // peer_ads==NIL restore-first branch (row #9) — else it would restore-loop on an AD that is actually
+  // present and never resolve. The degraded check is peer_ads==NIL ONLY, so a present-but-v1 AD skips it.
+  console.log('=== migapp: §5.6 br2 — pin + peer_ads PRESENT-but-v1 → downgrade_refused (NOT restore-loop) ===');
+  { const { I, R } = await connect('v1nb');
+    await mutate(I, '::actor::qa_set_epoch_pin', { cid: R.cid, session_id: binv(I, Buffer.from('migrated-pin-session-32-bytes!!!')) });
+    ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'e2e', 'setup: pinned + a v2 peer bundle → route e2e (migrate-ready)');
+    const dg = await mutate(I, '::actor::qa_downgrade_peer_ad', { cid: R.cid });
+    ok(T(dg.Reduce('ok').Visualize()), 'setup: peer AD downgraded to v1 IN PLACE (present in peer_ads, but no e2e_bundle)');
+    ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'downgrade_refused', '★ v1-no-bundle: pinned + peer_ads PRESENT-but-v1 → route downgrade_refused (fail closed — pin governs, no v2 bundle to ride)');
+    const s = await mutate(I, '::a2a_messaging::send_message', { contact: R.name, text: 'to a v1-downgraded pinned peer' });
+    ok(T(s.Reduce('downgrade_refused').Visualize()) && s.Reduce('code').Visualize() === 'e2e_downgrade_refused', '★ v1-no-bundle: send → typed downgrade_refused ($code e2e_downgrade_refused) — the anti-downgrade barrier holds (never boxed to plaintext)');
+    ok(!T(s.Reduce('deferred').Visualize()), '★ v1-no-bundle: NOT deferred to restore — peer_ads is PRESENT (v1), so it does not restore-loop on an AD that is actually there (the degraded/restore branch is peer_ads==NIL only)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
