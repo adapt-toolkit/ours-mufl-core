@@ -121,7 +121,11 @@ async function main() {
     const pinnedCid = 'cd'.repeat(32), freshCid = 'ef'.repeat(32);
     await mutate(A, '::actor::qa_set_epoch_pin', { cid: pinnedCid, session_id: binv(A, Buffer.from('imported-session-id-32-bytes-xx!')) });
     ok(ro(A, '::actor::qa_e2e_route', { cid: pinnedCid }).Reduce('route').Visualize() === 'downgrade_refused', 'route(§5.6/§5.8): imported epoch pin + NO peer bundle → downgrade_refused (fail closed — never box a migrated peer; recovery re-rotates over the carve-out)');
-    ok(ro(A, '::actor::qa_e2e_route', { cid: freshCid }).Reduce('route').Visualize() === 'legacy', 'route(§5.8): a fresh non-e2e contact → legacy (independent of the pinned one on the same node)'); }
+    ok(ro(A, '::actor::qa_e2e_route', { cid: freshCid }).Reduce('route').Visualize() === 'legacy', 'route(§5.8): a fresh non-e2e contact → legacy (independent of the pinned one on the same node)');
+    // Complete the 5-state route matrix on one node: a committed-INITIATOR (commit window) → "migrating".
+    const migratingCid = '01'.repeat(32);
+    await mutate(A, '::actor::qa_mig_set_committed', { cid: migratingCid, session_id: binv(A, Buffer.from('committed-window-session-32byte!')), seen: false });
+    ok(ro(A, '::actor::qa_e2e_route', { cid: migratingCid }).Reduce('route').Visualize() === 'migrating', 'route(§5.8): a committed-initiator (commit window) → "migrating" (app-data queues to mig_deferred, flushes on active) — 5-state matrix complete'); }
 
   // ── (2) MUST-FIX-C ROLLBACK: app hook aborts → promotion+pins+flush all roll back, stays committed.
   console.log('=== migapp: must-fix-C ROLLBACK (app-hook abort → full rollback, FSM stays committed) ===');
