@@ -364,6 +364,62 @@ async function main() {
     ok(T(s.Reduce('downgrade_refused').Visualize()) && s.Reduce('code').Visualize() === 'e2e_downgrade_refused', '★ v1-no-bundle: send → typed downgrade_refused ($code e2e_downgrade_refused) — the anti-downgrade barrier holds (never boxed to plaintext)');
     ok(!T(s.Reduce('deferred').Visualize()), '★ v1-no-bundle: NOT deferred to restore — peer_ads is PRESENT (v1), so it does not restore-loop on an AD that is actually there (the degraded/restore branch is peer_ads==NIL only)'); }
 
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════════
+  // ★ (D) NATURAL trigger via INBOUND E2E traffic — the exact production bug: an already-e2e-pinned pair
+  // routes app data e2e → handle_receive_e2e_message/_file, which had NO trigger, so it never migrated.
+  // mig_trigger_actions is now mirrored into BOTH e2e delivery tails. Driven over the REAL send_*→receive
+  // path (NOT qa_mig_trigger_offer), using the live-session harness (fresh meta-fuel + the recv hooks).
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════════
+  console.log('=== migapp: ★ NATURAL trigger (D-message) — inbound e2e app message auto-triggers migration → ACTIVE ===');
+  { const { I, R } = await connect('dmsg');
+    const [RCV, SND] = I.cid < R.cid ? [I, R] : [R, I];   // receiver = lower cid = elected initiator when it offers
+    const rcvIk = getBin(ro(RCV, '::actor::qa_e2e_ik', {}), 'ik');
+    const sndBundle = getBin(ro(SND, '::actor::qa_e2e_bundle', {}), 'bundle');
+    // A live PRE-migration e2e session (the ALREADY-E2E pair that used to never migrate). RCV initiates it
+    // so SND — the app sender — replies with a fully-ratcheted (olm_type 1) message RCV decodes cleanly.
+    const lenv = await mutate(RCV, '::actor::qa_e2e_first_send', { cid: SND.cid, pt: binv(RCV, Buffer.from('pre-migration-live')), peer: binv(RCV, sndBundle) });
+    await mutate(SND, '::actor::qa_e2e_recv', { from: RCV.cid, ik: binv(SND, rcvIk), olm_type: +lenv.Reduce('olm_type').Visualize(), ciphertext: binv(SND, getBin(lenv, 'ciphertext')) });
+    // RCV advertises cap_e2e_migrate via qa_init_caps (NO proactive offer — isolates the INBOUND trigger from B)
+    // and learns SND as 0.9 + seen (accepts the e2e app AND mig_should_trigger fires on receipt via pv>=9).
+    await mutate(RCV, '::actor::qa_init_caps', { advertise: ['core.e2e.migrate'] });
+    await mutate(RCV, '::actor::qa_learn_peer', { cid: SND.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(SND, '::actor::qa_learn_peer', { cid: RCV.cid, pv: 9, caps: ['core.e2e'] });   // SND routes e2e to RCV
+    ok(!T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), 'D-msg setup: no migration on the receiver before inbound e2e (the gap — the e2e receive handler never triggered)');
+    await mutate(RCV, '::actor::qa_recv_reset', {});
+    const appPt = 'inbound e2e app message on an already-e2e pair';
+    const s = await mutate(SND, '::a2a_messaging::send_message', { contact: RCV.name, text: appPt });
+    ok(s.Reduce('route').Visualize() === 'e2e', 'D-msg: sender routes the app e2e (receive_e2e_message_tx) — the already-e2e path that had no trigger');
+    await sleep(10000);   // delivery + offer → ack → commit → confirm
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === appPt, 'D-msg: the inbound e2e app message was DELIVERED to the app hook (delivery + trigger are same-tx)');
+    const rSt = ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }), sSt = ro(SND, '::actor::qa_mig_state', { cid: RCV.cid });
+    console.log(`  DIAG D-msg rcv=${rSt.Reduce('phase').Visualize()} snd=${sSt.Reduce('phase').Visualize()}`);
+    ok(rSt.Reduce('phase').Visualize() === 'active', '★ D-msg: inbound e2e message AUTO-TRIGGERED the migration → receiver ACTIVE (the PRIMARY production case now migrates)');
+    ok(sSt.Reduce('phase').Visualize() === 'active', '★ D-msg: peer reached ACTIVE (real inbound-e2e → trigger → handshake, no qa_mig_trigger_offer)');
+    // IDEMPOTENCY: a second inbound e2e message does NOT re-trigger (contact_migration!=NIL / epoch-pin gate).
+    const epoch0 = hex(getBin(rSt, 'epoch'));
+    await mutate(SND, '::a2a_messaging::send_message', { contact: RCV.name, text: 'second message post-migration' });
+    await sleep(4000);
+    const rSt2 = ro(RCV, '::actor::qa_mig_state', { cid: SND.cid });
+    ok(rSt2.Reduce('phase').Visualize() === 'active' && hex(getBin(rSt2, 'epoch')) === epoch0, '★ D-msg IDEMPOTENCY: a second inbound e2e message does NOT re-offer (phase + epoch unchanged — no double-fire)'); }
+
+  console.log('=== migapp: ★ NATURAL trigger (D-file) — inbound e2e FILE auto-triggers migration (the _file tail fires the trigger too) ===');
+  { const { I, R } = await connect('dfile');
+    const [RCV, SND] = I.cid < R.cid ? [I, R] : [R, I];
+    const rcvIk = getBin(ro(RCV, '::actor::qa_e2e_ik', {}), 'ik');
+    const sndBundle = getBin(ro(SND, '::actor::qa_e2e_bundle', {}), 'bundle');
+    const lenv = await mutate(RCV, '::actor::qa_e2e_first_send', { cid: SND.cid, pt: binv(RCV, Buffer.from('pre-migration-live-file')), peer: binv(RCV, sndBundle) });
+    await mutate(SND, '::actor::qa_e2e_recv', { from: RCV.cid, ik: binv(SND, rcvIk), olm_type: +lenv.Reduce('olm_type').Visualize(), ciphertext: binv(SND, getBin(lenv, 'ciphertext')) });
+    await mutate(RCV, '::actor::qa_init_caps', { advertise: ['core.e2e.migrate'] });
+    await mutate(RCV, '::actor::qa_learn_peer', { cid: SND.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(SND, '::actor::qa_learn_peer', { cid: RCV.cid, pv: 9, caps: ['core.e2e'] });
+    ok(!T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), 'D-file setup: no migration on the receiver before inbound e2e file');
+    await mutate(RCV, '::actor::qa_recv_reset', {});
+    const s = await mutate(SND, '::a2a_messaging::send_file', { contact: RCV.name, filename: 'photo.bin', mime: 'application/octet-stream', data: binv(SND, Buffer.from('e2e-file-payload')) });
+    ok(s.Reduce('route').Visualize() === 'e2e', 'D-file: sender routes the file e2e (receive_e2e_file_tx)');
+    await sleep(5000);
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'photo.bin', 'D-file: the inbound e2e file was DELIVERED to on_file_received');
+    ok(T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), '★ D-file: inbound e2e FILE auto-triggered the migration (mig_trigger_actions mirrored into the _file delivery tail too)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

@@ -568,6 +568,75 @@ async function main() {
     ok(hex(getBin(ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), 'session_id')) === hex(pin0) && pin0.length > 0, 'solicitation-guard: epoch pin unchanged (contact_migration and the pin stay consistent)');
     ok(hex(getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid')) === hex(act0), 'solicitation-guard: active session unchanged (no rotation restarted by the stale offer)'); }
 
+  // ═══ advertise_migrate — mid-session cap-add: enables migration WITHOUT a restart (production tx) ═══
+  // A restart to add the migrate cap re-keys the Olm ratchet (loses the pre-migration e2e session, so the
+  // migration can't rotate it). This tx appends cap_e2e_migrate to self_caps in place — the next outbound
+  // message's self_cap_ids piggyback carries it, the peer re-learns, and mig_should_trigger fires, with
+  // the live session intact. It's what the OWNER-TEST-GUIDE staged flow uses to turn migration on for the
+  // rotation baseline, and a genuine production capability (enable migration mid-session).
+  console.log('=== mig: advertise_migrate — mid-session cap-add enables migration (no restart) ===');
+  const AM = await mkNode('mig-gate-AM', 'AM'); await sleep(500);
+  { const r1 = await mutate(AM, '::a2a_messaging::advertise_migrate', {});
+    ok(!T(r1.Reduce('was_advertising').Visualize()) && T(r1.Reduce('advertising').Visualize()), '★ advertise_migrate: was NOT advertising cap_e2e_migrate → now IS (mid-session self_caps append; the next msg re-learns on the peer → migration can trigger, live session preserved)');
+    const r2 = await mutate(AM, '::a2a_messaging::advertise_migrate', {});
+    ok(T(r2.Reduce('was_advertising').Visualize()) && T(r2.Reduce('advertising').Visualize()), 'advertise_migrate: idempotent (already advertising → no duplicate self_caps entry)'); }
+
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════════
+  // ★ THE PRODUCTION-GAP FIX: an already-e2e-pinned pair auto-migrates via the REAL paths (NOT the manual
+  // qa_mig_trigger_offer). mig_trigger_actions used to have ONE call site — the PLAINTEXT receive handler —
+  // so a seen-pinned pair (caps learned at invite, zero plaintext app traffic) NEVER auto-triggered. These
+  // rows exercise the four additive trigger paths end-to-end over the broker: B (advertise_migrate), C (the
+  // sweep as the idle reconciler); D (inbound e2e) lives in migapp.mjs (needs the live-session harness).
+  // ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+  // ── (B) NATURAL trigger via advertise_migrate → proactive offer to the eligible e2e contact → ACTIVE.
+  console.log('=== mig: ★ NATURAL trigger (B) — advertise_migrate proactively offers an eligible e2e contact → ACTIVE ===');
+  { const NI = await mkNode('mig-gate-NI', 'NI');
+    const NR = await mkNode('mig-gate-NR', 'NR'); await sleep(1000);
+    const inv = await mutate(NI, '::a2a_messaging::generate_invite', { name: 'NR' });
+    await mutate(NR, '::a2a_messaging::add_contact', { invite: binv(NR, Buffer.from(inv.Reduce('invite').GetBinary())), name: 'NI' });
+    await sleep(6000);
+    const [lo, hi] = NI.cid < NR.cid ? [NI, NR] : [NR, NI];   // lower cid = elected initiator (deterministic)
+    // The already-e2e pair: the peer is KNOWN-0.9 to the initiator (its caps advertise cap_e2e_migrate),
+    // but NO plaintext app traffic ever flows — so the legacy plaintext trigger can never fire.
+    await mutate(lo, '::actor::qa_learn_peer', { cid: hi.cid, pv: 9, caps: [CAP] });
+    ok(!T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), 'B-path setup: no migration exists before advertise_migrate (the gap: this pair never auto-triggered)');
+    const amr = await mutate(lo, '::a2a_messaging::advertise_migrate', {});   // THE natural trigger (real production tx)
+    ok(T(amr.Reduce('advertising').Visualize()) && amr.Reduce('offers_initiated').Visualize() === '1', '★ B-path: advertise_migrate enabled the cap AND proactively offered the 1 eligible e2e contact (mig_offer_eligible_actions)');
+    await sleep(10000);   // offer → ack → commit → confirm over the broker
+    const lSt = ro(lo, '::actor::qa_mig_state', { cid: hi.cid }), hSt = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
+    console.log(`  DIAG B init=${lSt.Reduce('phase').Visualize()} resp=${hSt.Reduce('phase').Visualize()}`);
+    ok(lSt.Reduce('phase').Visualize() === 'active', '★ B-path: advertise_migrate proactive offer drove the initiator to ACTIVE (already-e2e pair, no manual trigger)');
+    ok(hSt.Reduce('phase').Visualize() === 'active', '★ B-path: responder reached ACTIVE (real advertise/receive handshake, not qa_mig_trigger_offer)');
+    ok(T(ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }).Reduce('pinned').Visualize()) && T(ro(hi, '::actor::qa_mig_pin', { cid: lo.cid }).Reduce('pinned').Visualize()), 'B-path: contact_e2e_epoch pinned BOTH sides (the rotation landed)'); }
+
+  // ── (C) NATURAL trigger via the SWEEP as the idle reconciler: default-cap boot + a pre-existing eligible
+  //    e2e contact + NO inbound traffic → the sweep INITIATES the migration (MR2 ruling). + dormancy + idempotency.
+  console.log('=== mig: ★ NATURAL trigger (C) — sweep_e2e_migrations INITIATES for an idle eligible contact → ACTIVE ===');
+  { const CS = await mkNode('mig-gate-CS', 'CS');
+    const CR = await mkNode('mig-gate-CR', 'CR'); await sleep(1000);
+    const inv = await mutate(CS, '::a2a_messaging::generate_invite', { name: 'CR' });
+    await mutate(CR, '::a2a_messaging::add_contact', { invite: binv(CR, Buffer.from(inv.Reduce('invite').GetBinary())), name: 'CS' });
+    await sleep(6000);
+    const [lo, hi] = CS.cid < CR.cid ? [CS, CR] : [CR, CS];
+    await mutate(lo, '::actor::qa_learn_peer', { cid: hi.cid, pv: 9, caps: [CAP] });
+    // DORMANCY: before the cap is advertised, the sweep INITIATES NOTHING (self-advertise fail-closed gate).
+    const sweep0 = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(sweep0.Reduce('initiated').Visualize() === '0' && !T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), 'C-path DORMANCY: sweep initiates nothing before cap_e2e_migrate is advertised (pre-Phase-F it is inert) — no migration created');
+    await mutate(lo, '::actor::qa_init_caps', { advertise: [CAP] });   // default-cap boot state (no restart-offer)
+    const sweep1 = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});   // THE natural trigger
+    ok(sweep1.Reduce('initiated').Visualize() === '1', '★ C-path: sweep INITIATED 1 migration for the idle eligible pre-existing e2e contact (proactive offer — the default-cap-boot reconciler)');
+    await sleep(10000);
+    const lSt = ro(lo, '::actor::qa_mig_state', { cid: hi.cid }), hSt = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
+    console.log(`  DIAG C init=${lSt.Reduce('phase').Visualize()} resp=${hSt.Reduce('phase').Visualize()}`);
+    ok(lSt.Reduce('phase').Visualize() === 'active', '★ C-path: sweep-initiated migration drove the initiator to ACTIVE (idle pre-existing e2e pair, NO inbound traffic)');
+    ok(hSt.Reduce('phase').Visualize() === 'active', '★ C-path: responder reached ACTIVE (sweep is the eventually-consistent every-eligible-pair reconciler)');
+    // IDEMPOTENCY: a second sweep does NOT re-offer an already-migrated (active) contact (contact_migration!=NIL gate).
+    const epoch0 = hex(getBin(lSt, 'epoch'));
+    const sweep2 = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});
+    const lSt2 = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
+    ok(sweep2.Reduce('initiated').Visualize() === '0' && lSt2.Reduce('phase').Visualize() === 'active' && hex(getBin(lSt2, 'epoch')) === epoch0, '★ C-path IDEMPOTENCY: a second sweep does NOT re-offer the ACTIVE contact (phase + epoch unchanged; the never-cleared contact_migration gate)'); }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

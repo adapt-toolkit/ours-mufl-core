@@ -837,6 +837,7 @@ library a2a_messaging loads libraries
     fn mig_should_trigger (cid: global_id) -> bool
     {
         if (contact_migration cid) != NIL { return FALSE. }                  // already in-flight / done
+        if (contact_e2e_epoch cid) != NIL { return FALSE. }                  // already epoch-pinned (migrated) — never re-offer; defense-in-depth vs any future contact_migration-clearing path (MR2)
         if (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate) != TRUE { return FALSE. }
         peer_capable is bool = FALSE.
         caps = contact_caps cid.
@@ -850,6 +851,22 @@ library a2a_messaging loads libraries
     {
         if (mig_should_trigger cid) != TRUE { return []. }
         return mig_offer_actions cid.
+    }
+
+    // §5.4 PROACTIVE reconciler — the receive-INDEPENDENT counterpart of mig_trigger_actions: offer to
+    // EVERY contact that passes mig_should_trigger (already-known e2e peers with no migration yet). This
+    // is the core of the missing-trigger-path fix: an already-e2e-pinned pair (caps learned at invite,
+    // ZERO plaintext app traffic) never hits the plaintext receive trigger, so it must be offered
+    // proactively. Reused by advertise_migrate (runtime cap-enable) and sweep_e2e_migrations (the
+    // default-cap-boot / GC reconciler). Fail-closed + idempotent BY CONSTRUCTION — mig_should_trigger
+    // gates on self-advertise ∧ peer-known-0.9 ∧ contact_migration==NIL ∧ contact_e2e_epoch==NIL, so it
+    // is inert pre-cap and never re-offers an in-flight/migrated pair. The CALLER emits _save_state
+    // (mig_offer_actions persists each `offered` snapshot). One send action per newly-offered contact.
+    fn mig_offer_eligible_actions (_) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        sc contacts -- (cid -> c) ?? (mig_should_trigger cid) { sc mig_offer_actions cid -- ( -> a) { acts (_count acts|) -> a. } }
+        return acts.
     }
 
     // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
@@ -2782,6 +2799,17 @@ library a2a_messaging loads libraries
         ) -- ( -> a) { actions (_count actions|) -> a. }
         sc monitor_copy_actions "in" sender_id msg_date text -- ( -> a) { actions (_count actions|) -> a. }
         sc mig_e2e_deliver_tail sender_id wire_id env_sid -- ( -> a) { actions (_count actions|) -> a. }
+        // §5.4 trigger (the PRODUCTION-GAP fix): an already-e2e pair receives app data HERE (it never
+        // plaintext-receives), so mirror the plaintext-handler liveness offer. Fires once — then
+        // contact_migration!=NIL (+ the epoch pin) gate it. Reads STORED contact_caps/pv (no re-learn).
+        // do_ic (committed) and the trigger are mutually exclusive (do_ic ⇒ contact_migration!=NIL ⇒
+        // mig_should_trigger FALSE), so this never interacts with the implicit-confirm promotion above.
+        trig is transaction::action::type[] = mig_trigger_actions sender_id.
+        if (_count trig|) > 0
+        {
+            sc trig -- ( -> a) { actions (_count actions|) -> a. }
+            actions (_count actions|) -> _save_state NIL.
+        }
         return transaction::success actions.
     }
 
@@ -2845,6 +2873,15 @@ library a2a_messaging loads libraries
         ) -- ( -> a) { actions (_count actions|) -> a. }
         sc monitor_copy_actions "in" sender_id file_date (file_monitor_summary filename mime data) -- ( -> a) { actions (_count actions|) -> a. }
         sc mig_e2e_deliver_tail sender_id wire_id env_sid -- ( -> a) { actions (_count actions|) -> a. }
+        // §5.4 trigger (the PRODUCTION-GAP fix, _file analogue of the message handler): an already-e2e
+        // pair receiving a FILE over e2e must also auto-offer. Fires once; contact_migration!=NIL (+ epoch
+        // pin) gate it; do_ic and the trigger stay mutually exclusive (see handle_receive_e2e_message).
+        trig is transaction::action::type[] = mig_trigger_actions sender_id.
+        if (_count trig|) > 0
+        {
+            sc trig -- ( -> a) { actions (_count actions|) -> a. }
+            actions (_count actions|) -> _save_state NIL.
+        }
         return transaction::success actions.
     }
 
@@ -3252,6 +3289,32 @@ library a2a_messaging loads libraries
         return transaction::success acts.
     }
 
+    // Enable the migration capability at RUNTIME (mid-session), no restart. Appends cap_e2e_migrate to
+    // self_caps; the next outbound message's self_cap_ids piggyback carries it, the peer re-learns, and
+    // its mig_should_trigger fires — so an ALREADY-established e2e session is preserved and the migration
+    // ROTATES that live session (a restart would re-key the Olm ratchet and lose the pre-migration
+    // session — see the OWNER-TEST-GUIDE staged flow). A genuine production capability (turn on migration
+    // without a restart), not only a test hook. cap_e2e_migrate is $advertise-class (no control-verb
+    // handler), so add_self_cap is safe here (init's declared-implies-implemented guard is for $supported).
+    trn advertise_migrate _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        was is bool = a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate.
+        a2a_capabilities::add_self_cap a2a_capabilities::cap_e2e_migrate.
+        // Now that the cap is LIVE, proactively offer to every already-known eligible e2e contact — a
+        // runtime cap-enable must start the SAME migrations a default-cap boot would, else an already-e2e
+        // pair with no inbound traffic would never migrate (mig_should_trigger keeps it fail-closed +
+        // idempotent). This is what turns the OWNER-TEST-GUIDE staged-advertise flow into a real trigger.
+        elig is transaction::action::type[] = mig_offer_eligible_actions NIL.
+        acts is transaction::action::type[] = [ _return_data (
+            $was_advertising  -> was,
+            $advertising      -> (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate),
+            $offers_initiated -> (_count elig|) ) ].
+        sc elig -- ( -> a) { acts (_count acts|) -> a. }
+        acts (_count acts|) -> _save_state NIL.
+        return transaction::success acts.
+    }
+
     // ---- §5.6 recovery sweep (host boot/GC cadence, mirrors restore_degraded_contacts) --------
     // Re-drive a stalled migration by RETRANSMITTING the persisted phase's leg. offer/ack rebuild
     // BYTE-IDENTICALLY from the $local_bundle snapshot (§5.4-5 — same nonce, so the peer's already-
@@ -3357,8 +3420,18 @@ library a2a_messaging loads libraries
                 }
             }
         }
-        actions (_count actions|) -> _return_data ($redriven -> redriven, $stalled -> stalled, $superseded -> superseded).
-        if (redriven + superseded) > 0 { actions (_count actions|) -> _save_state NIL. }
+        // §5.4 INITIATE (MR2-ruled): beyond re-driving in-flight migrations, the sweep is the
+        // eventually-consistent reconciler — it proactively OFFERS to every eligible contact with no
+        // migration yet (mig_should_trigger: contact_migration==NIL ∧ epoch==NIL ∧ self-advertises ∧
+        // peer-known-0.9). This is the ONLY path that covers the post-version-bump default-cap boot with
+        // pre-existing e2e contacts and NO inbound traffic (advertise_migrate isn't called at boot, and
+        // the receive triggers need inbound traffic). Inert pre-cap (self-advertise gate); an already-
+        // migrated pair is never re-offered (never-cleared contact_migration + the epoch-pin guard).
+        elig is transaction::action::type[] = mig_offer_eligible_actions NIL.
+        initiated is int = (_count elig|).
+        sc elig -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _return_data ($redriven -> redriven, $stalled -> stalled, $superseded -> superseded, $initiated -> initiated).
+        if (redriven + superseded + initiated) > 0 { actions (_count actions|) -> _save_state NIL. }
         return transaction::success actions.
     }
 

@@ -254,6 +254,17 @@ library a2a_capabilities loads libraries
         return self_caps.
     }
 
+    // Append a PROTOCOL-surface ($advertise-class) capability id to the live self_caps at RUNTIME —
+    // e.g. enable migration mid-session (cap_e2e_migrate) WITHOUT a restart, so the existing e2e
+    // session is preserved (a restart re-keys the Olm ratchet). Idempotent (no duplicate). The next
+    // outbound message's self_cap_ids piggyback carries it, so the peer re-learns and its
+    // mig_should_trigger fires. Intended for $advertise-class ids (traffic-shaping, no control verb) —
+    // NOT $supported ids (those require a wired handler, still enforced at init).
+    fn add_self_cap (cap: str) -> nil
+    {
+        if (self_advertises cap) != TRUE { self_caps (_count self_caps|) -> cap. }
+    }
+
     // ---- manifest helpers -------------------------------------------------
     fn has_capability (_:($manifest -> m: app_manifest_t, $cap -> cap: str)) -> bool
     {

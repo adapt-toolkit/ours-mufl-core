@@ -122,6 +122,19 @@ application actor loads libraries
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
 
+    // Advertise a self-cap (e.g. cap_e2e_migrate) WITHOUT the proactive-offer side effect of the real
+    // advertise_migrate tx — so the D-path test can isolate the inbound-e2e trigger from the B-path.
+    trn qa_init_caps _:($advertise -> adv: str[])
+    {
+        a2a_capabilities::init (
+            $describe -> fn (_: any) -> a2a_capabilities::app_manifest_t
+            { return ($version -> 1, $app_id -> "migapp.actor", $name -> "actor", $description -> "", $monitoring_status -> "off", $capabilities -> (,)). },
+            $supported -> [], $handlers -> (,),
+            $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
+            $authorizer -> NIL, $advertise -> adv ).
+        return transaction::success [ _return_data ($set -> TRUE) ].
+    }
+
     // Synthesize a box-only COMMITTED-INITIATOR FSM entry over an already-staged rotation (the
     // implicit-confirm setup — no live broker handshake). $session_id must equal the staged slot's
     // id so committed_match holds. $seen=TRUE makes it PRODUCTION-LIKE (a real migrating pair
