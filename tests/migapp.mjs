@@ -300,6 +300,40 @@ async function main() {
     ok(T(s.Reduce('deferred').Visualize()), '★ restore-first: the send is DEFERRED to the restore queue + a restore is (re)issued — the peer_ads-absent branch precedes the migration route');
     ok(!T(s.Reduce('migrating').Visualize()) && !T(s.Reduce('downgrade_refused').Visualize()), '★ restore-first: NOT the migration paths (mig_deferred / downgrade_refused) — restore composes BEFORE migrate (§5.6 br1)'); }
 
+  // ── §5.8 peer re-keys between ack and commit → supersede-or-complete (NO downgrade either way).
+  // The epoch is FROZEN at ack time (from both bundle fps). A bundle change after ack is therefore
+  // irrelevant to the epoch. Two outcomes, both safe:
+  //   (a) the acked bundle is still installable (v1 uses a REUSABLE fallback key — a routine rekey does
+  //       NOT consume it) → the commit decodes on the frozen bundle and COMPLETES on the frozen epoch.
+  //   (b) the acked bundle is gone (a full account regen) → the responder cannot Olm-establish the
+  //       commit's PRE_KEY → it is rejected at decode, the responder does NOT promote, NO epoch pin is
+  //       set, and NOTHING is delivered as plaintext (NO downgrade). The migration simply does not
+  //       complete on the stale identity; a fresh offer (new epoch on the new bundle) is the recovery.
+  console.log('=== migapp: §5.8 peer-rekey (a) — commit on the acked bundle COMPLETES on the FROZEN epoch ===');
+  { const { I, R, rBundle } = await connect('prkA');
+    const epoch = Buffer.from('acknowledged-epoch-32-bytes-xx!!');
+    await mutate(R, '::actor::qa_mig_set_acknowledged', { cid: I.cid, epoch: binv(R, epoch) });
+    const c = await mutate(I, '::actor::qa_send_commit', { contact: R.name, peer: binv(I, rBundle), epoch: binv(I, epoch) });
+    await sleep(4000);
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'active', '★ peer-rekey (a): the commit on the acked bundle COMPLETES on the FROZEN epoch (a post-ack rekey is irrelevant — the epoch froze at ack)');
+    const rpin = ro(R, '::actor::qa_mig_pin', { cid: I.cid });
+    ok(T(rpin.Reduce('pinned').Visualize()) && hex(getBin(rpin, 'session_id')) === hex(getBin(c, 'sid')), 'peer-rekey (a): epoch-pinned to the committed session (e2e — no downgrade)'); }
+
+  console.log('=== migapp: §5.8 peer-rekey (b) — acked bundle GONE → commit un-decryptable → safe reject, NO downgrade ===');
+  { const { I, R } = await connect('prkB');
+    const X = await mkNode('migapp-prkB-X', 'X'); await sleep(600);
+    const xBundle = getBin(ro(X, '::actor::qa_e2e_bundle', {}), 'bundle');
+    const epoch = Buffer.from('acknowledged-epoch-32-bytes-xx!!');
+    await mutate(R, '::actor::qa_mig_set_acknowledged', { cid: I.cid, epoch: binv(R, epoch) });
+    // Stage the commit to a DIFFERENT bundle (throwaway X) so R's account cannot Olm-establish it —
+    // exactly what a rotated-away (regenerated) responder fallback yields at the decode seam.
+    await mutate(I, '::actor::qa_send_commit', { contact: R.name, peer: binv(I, xBundle), epoch: binv(I, epoch) });
+    await sleep(4000);
+    ok(ro(R, '::actor::qa_mig_state', { cid: I.cid }).Reduce('phase').Visualize() === 'acknowledged', '★ peer-rekey (b): an un-decryptable commit is REJECTED — responder STAYS acknowledged (never promotes on a stale identity)');
+    ok(!T(ro(R, '::actor::qa_mig_pin', { cid: I.cid }).Reduce('pinned').Visualize()), '★ peer-rekey (b): NO epoch pin — the failed migration NEVER downgrades a session (no pin = no e2e authority claimed)');
+    ok(getBin(ro(R, '::actor::qa_e2e_active', { cid: I.cid }), 'sid').length === 0, 'peer-rekey (b): no active session (nothing staged or consumed)');
+    ok(ro(R, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '', 'peer-rekey (b): nothing delivered as plaintext (no downgrade — the commit is rejected as data, not delivered)'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
