@@ -334,6 +334,19 @@ async function main() {
     ok(getBin(ro(R, '::actor::qa_e2e_active', { cid: I.cid }), 'sid').length === 0, 'peer-rekey (b): no active session (nothing staged or consumed)');
     ok(ro(R, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '', 'peer-rekey (b): nothing delivered as plaintext (no downgrade — the commit is rejected as data, not delivered)'); }
 
+  // ── §5.8 committed liveness backstop (MR2, closes #8): a committed initiator must never PERMANENTLY
+  // stall (that would strand its mig_deferred app data forever — the responder-full-regen case, where
+  // the staged commit can never decode on the peer's rotated identity). At the attempts cap a committed
+  // entry SUPERSEDES (fresh offer/epoch) instead of only notifying $migration_stalled — releasing the
+  // barrier and re-attempting migration onto the peer's current bundle. It was never epoch-pinned, so
+  // re-offering (legacy flows at `offered`) is NOT a downgrade.
+  console.log('=== migapp: §5.8 committed liveness backstop — attempts cap → SUPERSEDE, never permanent stall ===');
+  { const { I, R } = await synthCommitted('bkstp');
+    await mutate(I, '::actor::qa_mig_set_attempts', { cid: R.cid, n: 30 });   // mig_max_attempts
+    const sw = await mutate(I, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(+sw.Reduce('superseded').Visualize() === 1 && +sw.Reduce('stalled').Visualize() === 0, '★ backstop: a committed entry at the attempts cap SUPERSEDES (never a permanent $migration_stalled — the mig_deferred barrier is released)');
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'offered', 'backstop: FSM re-offered (fresh nonce/epoch) → re-attempts migration onto the peer bundle; no permanent strand'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

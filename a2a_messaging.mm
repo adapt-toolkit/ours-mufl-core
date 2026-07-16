@@ -3305,14 +3305,21 @@ library a2a_messaging loads libraries
         sc contact_migration -- (cid -> st) ?? (((st) $phase) == "offered" || ((st) $phase) == "acknowledged" || ((st) $phase) == "committed")
         {
             att is int = (st $attempts).
-            if att >= mig_max_attempts
+            ph = (st $phase).
+            // §5.6 LIVENESS BACKSTOP: a COMMITTED initiator must never PERMANENTLY stall (that would
+            // strand its mig_deferred app data forever — the peer-rekey / responder-full-regen case,
+            // where our staged commit can never decode on the peer's rotated identity). At the attempts
+            // cap it SUPERSEDES (fresh offer/epoch) instead of only notifying, releasing the barrier and
+            // re-attempting onto the peer's current bundle (the fresh ack re-freezes the epoch on it). It
+            // was NEVER epoch-pinned, so re-offering — legacy flows at `offered` — is NOT a downgrade.
+            // offered/acknowledged still terminate at $migration_stalled (legacy already flows there).
+            if att >= mig_max_attempts && ph != "committed"
             {
-                actions (_count actions|) -> _notify_agent ($event -> $migration_stalled, $cid -> cid, $phase -> (st $phase), $attempts -> att).
+                actions (_count actions|) -> _notify_agent ($event -> $migration_stalled, $cid -> cid, $phase -> ph, $attempts -> att).
                 stalled -> stalled + 1.
             }
             else
             {
-                ph = (st $phase).
                 do_supersede is bool = FALSE.
                 leg is transaction::action::type[] = [].
                 if ph == "offered"
@@ -3328,8 +3335,11 @@ library a2a_messaging loads libraries
                 elif ph == "acknowledged" { leg -> mig_resend_ack_actions cid st. }
                 else
                 {
+                    // committed: staged session lost (rc==NIL, unresumable) OR the attempts-cap liveness
+                    // backstop above → SUPERSEDE (fresh offer/epoch); otherwise re-encrypt on the
+                    // surviving staged session and re-send (the responder's session_matches collapses it).
                     rc = mig_resend_commit_actions cid st.
-                    if rc == NIL { do_supersede -> TRUE. } else { leg -> rc?. }
+                    if rc == NIL || att >= mig_max_attempts { do_supersede -> TRUE. } else { leg -> rc?. }
                 }
                 if do_supersede
                 {

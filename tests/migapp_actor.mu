@@ -190,6 +190,17 @@ application actor loads libraries
             _return_data ($sid -> sid) ].
     }
 
+    // Set a migration entry's $attempts (drive the sweep to its cap without 30 real re-drives).
+    trn qa_mig_set_attempts _:($cid -> cid: global_id, $n -> n: int)
+    {
+        st = a2a_messaging::contact_migration cid.
+        a2a_messaging::contact_migration cid -> ( $phase -> ((st?) $phase), $initiator -> ((st?) $initiator),
+            $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> ((st?) $epoch),
+            $session_id -> ((st?) $session_id), $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp),
+            $attempts -> n, $updated -> ((st?) $updated) ).
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
     // Drop ALL peer address documents — the spec's "degraded contact" state (a breaking-change
     // migration / restart lost peer_ads). Drives the §5.6 recovery composition: a pinned-but-degraded
     // contact must RESTORE first (re-fetch the AD) before the migration route can deliver.
