@@ -2936,6 +2936,14 @@ library a2a_messaging loads libraries
         // offered state, and (re)emit MY authoritative offer — do NOT ack.
         if (mig_initiator sender_id) == TRUE
         {
+            // EXHAUSTIVE-PHASE NO-OP (MigrationReview): a stale/late higher-cid solicitation must NOT
+            // restart a migration that already progressed past negotiation. At committed I hold the
+            // agreed epoch; at active the epoch PIN is set. Re-emitting `offered` here would diverge
+            // contact_migration from the pin. Mirror the ACK-path's committed/active early-return
+            // (only a genuinely new nonce/epoch AFTER active drives §5.6 re-rotation, handled elsewhere).
+            sol_prev = contact_migration sender_id.
+            if sol_prev != NIL && (((sol_prev?) $phase) == "committed" || ((sol_prev?) $phase) == "active")
+            { return transaction::success []. }
             solicit is transaction::action::type[] = mig_offer_actions sender_id.
             solicit (_count solicit|) -> _save_state NIL.
             return transaction::success solicit.

@@ -544,6 +544,30 @@ async function main() {
     const lp = ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), hp = ro(hi, '::actor::qa_mig_pin', { cid: lo.cid });
     ok(T(lp.Reduce('pinned').Visualize()) && T(hp.Reduce('pinned').Visualize()) && hex(getBin(lp, 'session_id')) === hex(migLo), 'already-E2E: both epoch-pinned to the migrated (not the old live) session'); }
 
+  // ═══ §5.8 late/replayed HIGHER-cid offer at an ACTIVE lower node → NO-OP (solicitation phase-guard) ═══
+  // A completed migration must not be restarted by a stale higher-cid offer. Before the guard, the
+  // GATE4 solicitation path re-emitted `offered` unconditionally — diverging contact_migration from the
+  // still-set epoch pin. The guard NO-OPs a higher-cid solicitation once the lower node is committed/
+  // active (MigrationReview: exhaustive-phase invariant; only a genuinely new nonce/epoch drives §5.6).
+  console.log('=== mig: §5.8 late higher-cid offer at an ACTIVE lower node → NO-OP (solicitation phase-guard) ===');
+  const LG1 = await mkNode('mig-gate-LG1', 'LG1');
+  const LG2 = await mkNode('mig-gate-LG2', 'LG2'); await sleep(1000);
+  { const invL = await mutate(LG1, '::a2a_messaging::generate_invite', { name: 'LG2' });
+    await mutate(LG2, '::a2a_messaging::add_contact', { invite: binv(LG2, Buffer.from(invL.Reduce('invite').GetBinary())), name: 'LG1' });
+    await sleep(6000);
+    const [lo, hi] = LG1.cid < LG2.cid ? [LG1, LG2] : [LG2, LG1];
+    await mutate(lo, '::actor::qa_mig_trigger_offer', { peer: hi.cid });
+    await sleep(12000);   // offer → ack → commit → confirm → active
+    ok(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('phase').Visualize() === 'active', 'setup: the lower node migrated to active');
+    const pin0 = getBin(ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), 'session_id');
+    const act0 = getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid');
+    // Inject a LATE / stale HIGHER-cid offer at the now-active lower node.
+    await mutate(hi, '::actor::qa_mig_trigger_offer', { peer: lo.cid });
+    await sleep(5000);
+    ok(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('phase').Visualize() === 'active', '★ solicitation-guard: the active lower node NO-OPs the late higher-cid offer (stays active — NOT reset to offered)');
+    ok(hex(getBin(ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), 'session_id')) === hex(pin0) && pin0.length > 0, 'solicitation-guard: epoch pin unchanged (contact_migration and the pin stay consistent)');
+    ok(hex(getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid')) === hex(act0), 'solicitation-guard: active session unchanged (no rotation restarted by the stale offer)'); }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
