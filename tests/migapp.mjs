@@ -174,7 +174,12 @@ async function main() {
     await mutate(R, '::a2a_messaging::send_message', { contact: I.name, text: 'app after confirm' });
     await sleep(4000);
     ok(ro(I, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'app after confirm', 'interleave B: app DELIVERED on the migrated session');
-    ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), '★ interleave B: session unchanged by the app → EXACTLY ONE promotion (the confirm)'); }
+    ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), '★ interleave B: session unchanged by the app → EXACTLY ONE promotion (the confirm)');
+    // §5.8 broker-redelivery: a REDELIVERED confirm after promotion is an idempotent NO-OP (phase
+    // already active → handle_e2e_migrate_confirm returns []; no re-promotion, session untouched).
+    await mutate(R, '::actor::qa_send_confirm', { contact: I.name, peer: binv(R, getBin(ro(I, '::actor::qa_e2e_bundle', {}), 'bundle')), epoch: binv(R, sid) });
+    await sleep(4000);
+    ok(ro(I, '::actor::qa_mig_state', { cid: R.cid }).Reduce('phase').Visualize() === 'active' && hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'dup-confirm(§5.8): a REDELIVERED confirm at active is a NO-OP (idempotent — no second promotion, session unchanged)'); }
 
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');

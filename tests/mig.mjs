@@ -335,6 +335,12 @@ async function main() {
   await mutate(loN, '::actor::qa_learn_peer', { cid: synC, pv: 8, caps: [] });
   ok(!fires(synC), 'trigger(§5.4): OLD peer (pv<9, no cap) → NO offer (CRITERION 1)');
   ok(!fires(hiN.cid), 'trigger(§5.4): already-migrated contact → NO offer (fires-once / in-flight gate)');
+  // §5.8 old/old → ZERO migration traffic: the trigger is fail-closed on BOTH ends. hiN never
+  // advertised cap_e2e_migrate (old self), so it stays dormant even toward a 0.9-capable peer;
+  // combined with the old-PEER gate above (synC), a genuinely old/old pair generates no offers.
+  const firesHi = (cid) => T(ro(hiN, '::actor::qa_mig_should_trigger', { cid }).Reduce('fire').Visualize());
+  await mutate(hiN, '::actor::qa_learn_peer', { cid: synA, pv: 9, caps: [CAP] });
+  ok(!firesHi(synA), 'trigger(§5.8 old/old): a self that never advertised cap_e2e_migrate stays DORMANT even toward a 0.9 peer (old-self fail-closed) — old/old → zero mig traffic');
   // §5.6 recovery sweep: re-drive a stalled migration + $attempts cap → $migration_stalled. (Runs
   // LAST — qa_mig_force_offered overwrites loN's contact_migration[hiN].) hiN is a registered contact
   // so the re-drive's send does not abort; hiN is active so it no-ops the stray re-offer.
