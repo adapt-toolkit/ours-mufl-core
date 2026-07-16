@@ -452,6 +452,64 @@ async function main() {
   const rep = await dec({});
   ok(!T(rep.Reduce('ok').Visualize()) && rep.Reduce('code').Visualize() === 'replayed_handshake', 'guard: replay (valid emsig, replayed ciphertext) → !ok reject NOT abort (forgery/replay split)');
 
+  // ═══ §5.8 simultaneous upgrades (crossing offers) → deterministic collapse ═══
+  // Both peers trigger an offer at (nearly) the same time. The election (LOWER cid initiates)
+  // collapses the crossing proposals to exactly ONE migration: the HIGHER-cid peer, on receiving the
+  // lower's offer, abandons its own `offered` state and ACKs (GATE 4 collapse); the LOWER-cid peer
+  // treats the higher's offer as a SOLICITATION and re-emits its authoritative offer. They converge —
+  // lower=initiator, higher=responder, one shared epoch + session — regardless of arrival order.
+  // (The offers cross while both are still `offered`, well before any 4-leg handshake completes, so
+  // the lower reaches `active` on the lower's own nonce; a higher-cid peer never becomes initiator.)
+  console.log('=== mig: §5.8 simultaneous upgrades (crossing offers) → deterministic collapse ===');
+  const SU1 = await mkNode('mig-gate-SU1', 'SU1');
+  const SU2 = await mkNode('mig-gate-SU2', 'SU2'); await sleep(1000);
+  { const invS = await mutate(SU1, '::a2a_messaging::generate_invite', { name: 'SU2' });
+    await mutate(SU2, '::a2a_messaging::add_contact', { invite: binv(SU2, Buffer.from(invS.Reduce('invite').GetBinary())), name: 'SU1' });
+    await sleep(6000);
+    const [lo, hi] = SU1.cid < SU2.cid ? [SU1, SU2] : [SU2, SU1];
+    // BOTH trigger, back-to-back (crossing offers in flight before either handshake can complete).
+    await mutate(lo, '::actor::qa_mig_trigger_offer', { peer: hi.cid });
+    await mutate(hi, '::actor::qa_mig_trigger_offer', { peer: lo.cid });
+    await sleep(20000);   // crossing offers + solicitation re-emit + ack → commit → confirm settle
+    const ls = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
+    const hs = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
+    console.log(`  DIAG collapse: lo phase=${ls.Reduce('phase').Visualize()} init=${ls.Reduce('initiator').Visualize()} / hi phase=${hs.Reduce('phase').Visualize()} init=${hs.Reduce('initiator').Visualize()}`);
+    ok(ls.Reduce('phase').Visualize() === 'active' && hs.Reduce('phase').Visualize() === 'active', '★ collapse: BOTH peers converge to active (crossing offers collapsed to ONE migration)');
+    ok(T(ls.Reduce('initiator').Visualize()) && !T(hs.Reduce('initiator').Visualize()), '★ collapse: deterministic roles — the LOWER cid initiated, the HIGHER responded (election, not arrival order)');
+    const le = getBin(ls, 'epoch'), he = getBin(hs, 'epoch');
+    ok(le.length === 32 && hex(le) === hex(he), 'collapse: both settle on ONE shared epoch (no split-brain / no double migration)');
+    const la = getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid');
+    const ha = getBin(ro(hi, '::actor::qa_e2e_active', { cid: lo.cid }), 'sid');
+    ok(la.length > 0 && hex(la) === hex(ha), 'collapse: both share ONE migrated session (exactly-once rotation)');
+    const lp = ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }), hp = ro(hi, '::actor::qa_mig_pin', { cid: lo.cid });
+    ok(T(lp.Reduce('pinned').Visualize()) && T(hp.Reduce('pinned').Visualize()) && hex(getBin(lp, 'session_id')) === hex(la), 'collapse: both epoch-pinned to the shared migrated session'); }
+
+  // ═══ §5.8 higher-cid-only evidence → solicitation → converge (lower initiates) ═══
+  // Only the HIGHER-cid peer sees the 0.9 evidence first and offers. Its offer functions as a
+  // SOLICITATION: the lower-cid peer (the elected initiator) does NOT ack it — it emits its OWN
+  // authoritative offer, which the higher acks. Converges lower=initiator; no unelected (higher)
+  // proposer can win, even as first mover.
+  console.log('=== mig: §5.8 higher-cid-only evidence → solicitation → converge (lower initiates) ===');
+  const HO1 = await mkNode('mig-gate-HO1', 'HO1');
+  const HO2 = await mkNode('mig-gate-HO2', 'HO2'); await sleep(1000);
+  { const invH = await mutate(HO1, '::a2a_messaging::generate_invite', { name: 'HO2' });
+    await mutate(HO2, '::a2a_messaging::add_contact', { invite: binv(HO2, Buffer.from(invH.Reduce('invite').GetBinary())), name: 'HO1' });
+    await sleep(6000);
+    const [lo, hi] = HO1.cid < HO2.cid ? [HO1, HO2] : [HO2, HO1];
+    // ONLY the HIGHER cid triggers (it saw evidence first) — its offer solicits the lower.
+    await mutate(hi, '::actor::qa_mig_trigger_offer', { peer: lo.cid });
+    await sleep(18000);   // solicitation → lower's authoritative offer → ack → commit → confirm
+    const ls = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
+    const hs = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
+    console.log(`  DIAG solicit: lo phase=${ls.Reduce('phase').Visualize()} init=${ls.Reduce('initiator').Visualize()} / hi phase=${hs.Reduce('phase').Visualize()} init=${hs.Reduce('initiator').Visualize()}`);
+    ok(ls.Reduce('phase').Visualize() === 'active' && hs.Reduce('phase').Visualize() === 'active', '★ solicitation: a higher-cid-only offer still drives BOTH to active (the lower emitted the authoritative offer)');
+    ok(T(ls.Reduce('initiator').Visualize()) && !T(hs.Reduce('initiator').Visualize()), '★ solicitation: the LOWER cid initiated despite the HIGHER offering FIRST (election beats first-mover)');
+    const le = getBin(ls, 'epoch'), he = getBin(hs, 'epoch');
+    ok(le.length === 32 && hex(le) === hex(he), 'solicitation: both settle on the same epoch');
+    const la = getBin(ro(lo, '::actor::qa_e2e_active', { cid: hi.cid }), 'sid');
+    const ha = getBin(ro(hi, '::actor::qa_e2e_active', { cid: lo.cid }), 'sid');
+    ok(la.length > 0 && hex(la) === hex(ha), 'solicitation: both share ONE migrated session'); }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
