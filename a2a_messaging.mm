@@ -2634,6 +2634,71 @@ library a2a_messaging loads libraries
         return handle_receive_file args.
     }
 
+    // Shared helpers for the two app-e2e RECEIVE handlers (message + file). FACTORED so the
+    // meta-heavy record literals — the $e2e_app_recv notify, the implicit-confirm contact_migration
+    // write + $migration_active notify — are type-reduced ONCE, not inlined in both handlers: the
+    // full daemon packet compiles the migration surface near the per-unit meta-fuel ceiling, and the
+    // duplicated inlines pushed it over (see the transaction/AD any-typing fixes). Behavior is
+    // byte-identical to the inlined form.
+    // A rejected inbound (no-downgrade GATE0 / accept-gate / decode !ok): $e2e_app_recv $ok=FALSE,
+    // never delivered. $session_id is the inbound envelope's (NIL for a malformed GATE0 envelope).
+    fn mig_e2e_reject (sender_id: global_id, env_sid: bin+) -> transaction::results::type
+    {
+        return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ].
+    }
+    // Shared ACCEPT-gate + do_ic computation for the two app-e2e RECEIVE handlers. Returns
+    // ($accept, $do_ic). accept = e2e_pinned/seen OR committed-initiator-with-staged-match. do_ic
+    // (§5.5 must-fix-C) is DECOUPLED — a box-only committed initiator (staged==committed session, NO
+    // live session, NOT yet epoch-pinned) even when seen, so implicit-confirm stays reachable in
+    // production (a real migrating pair advertises cap_e2e ⇒ seen by `committed`).
+    fn mig_e2e_accept (sender_id: global_id) -> (any)
+    {
+        st = contact_migration sender_id.
+        committed_match is bool = FALSE.
+        do_ic is bool = FALSE.
+        if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
+        {
+            staged_sid = e2e::staged_session_id sender_id.
+            if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
+            {
+                committed_match -> TRUE.
+                if (e2e::active_session_id sender_id) == NIL && (contact_e2e_epoch sender_id) == NIL { do_ic -> TRUE. }
+            }
+        }
+        return ($accept -> (committed_match || (e2e_pinned sender_id)), $do_ic -> do_ic).
+    }
+    // §5.5 must-fix-C IMPLICIT-CONFIRM promotion (box-only committed initiator → active): commit_
+    // rotation (SOLE promotion) + BOTH pins + active + EXTENDED $migration_active + flush, returned
+    // as actions to append BEFORE the deliver hook so the whole thing rides the app hook's tx (an
+    // abort rolls promotion + pins + flush back and the FSM stays `committed`).
+    fn mig_e2e_promote_actions (sender_id: global_id, st: mig_state_t) -> transaction::action::type[]
+    {
+        e2e::commit_rotation sender_id.
+        ic_fin = e2e::active_session_id sender_id.
+        ic_ep = (st $epoch)?.
+        contact_e2e_epoch sender_id -> ( $epoch -> ic_ep, $session_id -> (ic_fin?) ).
+        contact_e2e_seen sender_id -> TRUE.
+        ic_now = (current_transaction_info::get_transaction_time())?.
+        contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
+            $local_nonce -> (st $local_nonce), $peer_nonce -> (st $peer_nonce), $epoch -> ic_ep, $session_id -> (ic_fin?),
+            $local_bundle -> (st $local_bundle), $local_fp -> (st $local_fp), $attempts -> (st $attempts), $updated -> ic_now ).
+        acts is transaction::action::type[] = [ _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator, $epoch -> ic_ep, $session_id -> (ic_fin?)) ].
+        sc flush_mig_deferred_actions sender_id -- ( -> a) { acts (_count acts|) -> a. }
+        return acts.
+    }
+    // Delivery tail shared by both handlers: DELIVERED receipt (gated on a wire_id) + the §4
+    // $e2e_app_recv notify (session_id from the ACTUAL inbound envelope, non-circular #1867 proof) +
+    // _save_state (the e2e decode advanced the ratchet — persist unconditionally on the accept path).
+    fn mig_e2e_deliver_tail (sender_id: global_id, wire_id: str, env_sid: bin+) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        if wire_id != ""
+        { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { acts (_count acts|) -> a. } }
+        acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
+        acts (_count acts|) -> _save_state NIL.
+        return acts.
+    }
+
     // ── core 0.9.0 boxed APP-E2E RECEIVE (Option B, spec §5.6/§4). App data over a MIGRATED
     // session rides a DISTINCT box (receive_e2e_message_tx) carrying the e2e_signed_message as
     // $targ. THIS handler drives the same audited decode the commit/confirm handlers use
@@ -2660,58 +2725,35 @@ library a2a_messaging loads libraries
         // GATE 0 — carrier shape (no-downgrade: fail CLOSED on a missing/garbage envelope).
         env is e2e::t_e2e_envelope+ = (args $e2e_envelope) safe e2e::t_e2e_envelope.
         emsig is crypto_signature+ = (args $emsignature) safe crypto_signature.
-        if env == NIL || emsig == NIL
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $ok -> FALSE, $wire_id -> "") ]. }
+        if env == NIL || emsig == NIL { return mig_e2e_reject sender_id NIL. }
         env_sid = (env? $session_id).
 
-        // GATE 1 — ACCEPT gate. The SEND side boxes app as receive_e2e_message_tx whenever the
-        // route is "e2e" AND the peer is (seen || epoch-pinned) — i.e. for EVERY e2e-capable pair,
-        // not just migrated ones (an already-E2E pre-migration pair rides the e2e box too). ACCEPT
-        // from (a) any e2e_pinned/seen contact or (b) a committed INITIATOR whose STAGED rotation is
-        // the committed session (the responder's post-active app arriving BEFORE our explicit
-        // confirm). Any other state → reject as data, NEVER decode (no session mutation from a
-        // non-e2e peer). BROADER than the §5.7 downgrade-refusal (epoch-only): a seen-not-epoch
-        // peer's LEGACY plaintext is still accepted.
-        // §5.5 must-fix-C IMPLICIT CONFIRM gate — computed on its OWN merits, DECOUPLED from the
-        // accept branch. A REAL migrating pair advertises cap_e2e, so contact_e2e_seen (== e2e_pinned)
-        // is already TRUE by the `committed` phase; gating do_ic on !e2e_pinned would make implicit-
-        // confirm UNREACHABLE in production. Fire it for a BOX-ONLY committed initiator: staged IS
-        // the committed rotation, NO pre-migration live session (active_session_id == NIL), NOT yet
-        // epoch-pinned — so the responder's inbound e2e app decrypted on the staged slot and is the
-        // promotion proof. An already-E2E committed pair (live session present) delivers but does NOT
-        // promote here — its explicit confirm does.
-        st  = contact_migration sender_id.
-        committed_match is bool = FALSE.
-        do_ic is bool = FALSE.
-        if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
-        {
-            staged_sid = e2e::staged_session_id sender_id.
-            if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
-            {
-                committed_match -> TRUE.
-                if (e2e::active_session_id sender_id) == NIL && (contact_e2e_epoch sender_id) == NIL { do_ic -> TRUE. }
-            }
-        }
-        accept is bool = FALSE.
-        if committed_match || (e2e_pinned sender_id) { accept -> TRUE. }
-        if accept != TRUE
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
+        // GATE 1 — ACCEPT gate. The SEND side boxes app as receive_e2e_message_tx whenever the route
+        // is "e2e" AND the peer is (seen || epoch-pinned) — EVERY e2e-capable pair, not just migrated
+        // ones (an already-E2E pre-migration pair rides the e2e box too). ACCEPT from any e2e_pinned/
+        // seen contact OR a committed INITIATOR whose STAGED rotation is the committed session (the
+        // responder's post-active app arriving BEFORE our explicit confirm). Any other state → reject
+        // as data, NEVER decode (no session mutation from a non-e2e peer). BROADER than the §5.7
+        // downgrade-refusal (epoch-only): a seen-not-epoch peer's LEGACY plaintext is still accepted.
+        // do_ic (§5.5 must-fix-C IMPLICIT CONFIRM) is computed on its OWN merits (see mig_e2e_accept),
+        // DECOUPLED from the accept branch — else it would be UNREACHABLE in production (a real
+        // migrating pair is `seen` by `committed`).
+        g = mig_e2e_accept sender_id.
+        if (g $accept) != TRUE { return mig_e2e_reject sender_id env_sid. }
+        do_ic is bool = (g $do_ic).
 
         // GATE 1.5 — the box sender's VERIFIED AD is required to authenticate the envelope.
         pad = peer_ads sender_id.
-        if pad == NIL
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
+        if pad == NIL { return mig_e2e_reject sender_id env_sid. }
 
         // GATE 2 — handler-driven AUTHENTICATED decode (shared audited path). For a pinned/active
         // contact mig_pending is FALSE → decrypt_and_commit advances m_sessions[cid] (the migrated
         // session). For the do_ic box-only committed initiator, the responder's post-active
-        // olm_type=1 rides the STAGED slot (m_sessions still NIL until commit_rotation below).
+        // olm_type=1 rides the STAGED slot (m_sessions still NIL until commit_rotation in the
+        // promote helper). A !ok is OLM-level (tampered/replay) — forged emsig/wire already ABORTED
+        // inside decode_migration_envelope. Reject-as-data, never delivered.
         r = e2e::decode_migration_envelope sender_id (_get_container_id()) (pad?) (env?) (emsig?).
-        if (r $ok) != TRUE
-        {   // OLM-level failure only (tampered ciphertext / replay); forged emsig/wire already
-            // ABORTED inside decode_migration_envelope. Reject-as-data, never delivered.
-            return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ].
-        }
+        if (r $ok) != TRUE { return mig_e2e_reject sender_id env_sid. }
         // Decrypted inner app body (mirrors send_message's einner _write shape).
         iv = key_storage::read_external ((r $plaintext)?).
         text = (iv $text) safe str.
@@ -2721,31 +2763,15 @@ library a2a_messaging loads libraries
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
 
         actions is transaction::action::type[] = [].
-        if do_ic
-        {   // §5.5 must-fix-C IMPLICIT CONFIRM (box-only committed initiator). Promote NOW in
-            // strict order [promote -> flush -> deliver], SAME tx as the app hook. commit_rotation
-            // is the SOLE promotion (staged -> m_sessions); pins + active written atomically. If the
-            // app hook ABORTS below, ALL of this rolls back and the FSM stays `committed` (the
-            // explicit confirm / sweep completes the rotation later).
-            e2e::commit_rotation sender_id.
-            ic_fin = e2e::active_session_id sender_id.
-            ic_ep = ((st?) $epoch)?.
-            contact_e2e_epoch sender_id -> ( $epoch -> ic_ep, $session_id -> (ic_fin?) ).
-            contact_e2e_seen sender_id -> TRUE.
-            ic_now = (current_transaction_info::get_transaction_time())?.
-            contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
-                $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> ic_ep, $session_id -> (ic_fin?),
-                $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp), $attempts -> ((st?) $attempts), $updated -> ic_now ).
-            actions (_count actions|) -> _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator, $epoch -> ic_ep, $session_id -> (ic_fin?)).
-            sc flush_mig_deferred_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }   // flush BEFORE deliver
-        }
+        // do_ic: promote BEFORE deliver, SAME tx (must-fix-C rollback — see mig_e2e_promote_actions).
+        if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { actions (_count actions|) -> a. } }
 
         sender = contacts sender_id.
         sender_name is str+ = NIL.
         if sender != NIL { sender_name -> sender? $name. }
-        // Deliver plaintext through the app hook (the ONLY exit for the decrypted body). It may
-        // ABORT (unknown sender / rejected) — then nothing is delivered, the do_ic promotion rolls
-        // back, and no receipt/notify is emitted (the tx is atomic).
+        // Deliver plaintext through the app hook (the ONLY exit for the decrypted body). It may ABORT
+        // (unknown sender / rejected) — then nothing is delivered, the do_ic promotion rolls back, and
+        // no receipt/notify is emitted (the tx is atomic).
         sc on_message_received (
             $sender_id   -> sender_id,
             $sender_name -> sender_name,
@@ -2755,12 +2781,7 @@ library a2a_messaging loads libraries
             $reply_to    -> reply_to
         ) -- ( -> a) { actions (_count actions|) -> a. }
         sc monitor_copy_actions "in" sender_id msg_date text -- ( -> a) { actions (_count actions|) -> a. }
-        if wire_id != ""
-        { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { actions (_count actions|) -> a. } }
-        // §4 observability — $session_id from the ACTUAL inbound envelope (NON-circular #1867 proof).
-        actions (_count actions|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
-        // The e2e decode advanced the ratchet (m_sessions / m_staged) — persist unconditionally.
-        actions (_count actions|) -> _save_state NIL.
+        sc mig_e2e_deliver_tail sender_id wire_id env_sid -- ( -> a) { actions (_count actions|) -> a. }
         return transaction::success actions.
     }
 
@@ -2781,37 +2802,20 @@ library a2a_messaging loads libraries
         // GATE 0 — carrier shape (no-downgrade).
         env is e2e::t_e2e_envelope+ = (args $e2e_envelope) safe e2e::t_e2e_envelope.
         emsig is crypto_signature+ = (args $emsignature) safe crypto_signature.
-        if env == NIL || emsig == NIL
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $ok -> FALSE, $wire_id -> "") ]. }
+        if env == NIL || emsig == NIL { return mig_e2e_reject sender_id NIL. }
         env_sid = (env? $session_id).
 
-        // GATE 1 — ACCEPT gate + do_ic (identical to the message handler; do_ic DECOUPLED from the
-        // accept branch so it stays reachable for a box-only committed initiator even when seen).
-        st  = contact_migration sender_id.
-        committed_match is bool = FALSE.
-        do_ic is bool = FALSE.
-        if st != NIL && ((st?) $phase) == "committed" && ((st?) $initiator) == TRUE
-        {
-            staged_sid = e2e::staged_session_id sender_id.
-            if staged_sid != NIL && ((st?) $session_id) != NIL && staged_sid == ((st?) $session_id)
-            {
-                committed_match -> TRUE.
-                if (e2e::active_session_id sender_id) == NIL && (contact_e2e_epoch sender_id) == NIL { do_ic -> TRUE. }
-            }
-        }
-        accept is bool = FALSE.
-        if committed_match || (e2e_pinned sender_id) { accept -> TRUE. }
-        if accept != TRUE
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
+        // GATE 1 — ACCEPT gate + do_ic (shared with the message handler; do_ic decoupled).
+        g = mig_e2e_accept sender_id.
+        if (g $accept) != TRUE { return mig_e2e_reject sender_id env_sid. }
+        do_ic is bool = (g $do_ic).
 
         pad = peer_ads sender_id.
-        if pad == NIL
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
+        if pad == NIL { return mig_e2e_reject sender_id env_sid. }
 
         // GATE 2 — authenticated decode.
         r = e2e::decode_migration_envelope sender_id (_get_container_id()) (pad?) (env?) (emsig?).
-        if (r $ok) != TRUE
-        { return transaction::success [ _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "") ]. }
+        if (r $ok) != TRUE { return mig_e2e_reject sender_id env_sid. }
         // Decrypted inner file body (mirrors send_file's finner _write shape).
         iv = key_storage::read_external ((r $plaintext)?).
         filename = (iv $filename) safe str.
@@ -2824,20 +2828,7 @@ library a2a_messaging loads libraries
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
 
         actions is transaction::action::type[] = [].
-        if do_ic
-        {   // §5.5 must-fix-C implicit confirm (see handle_receive_e2e_message).
-            e2e::commit_rotation sender_id.
-            ic_fin = e2e::active_session_id sender_id.
-            ic_ep = ((st?) $epoch)?.
-            contact_e2e_epoch sender_id -> ( $epoch -> ic_ep, $session_id -> (ic_fin?) ).
-            contact_e2e_seen sender_id -> TRUE.
-            ic_now = (current_transaction_info::get_transaction_time())?.
-            contact_migration sender_id -> ( $phase -> "active", $initiator -> TRUE,
-                $local_nonce -> ((st?) $local_nonce), $peer_nonce -> ((st?) $peer_nonce), $epoch -> ic_ep, $session_id -> (ic_fin?),
-                $local_bundle -> ((st?) $local_bundle), $local_fp -> ((st?) $local_fp), $attempts -> ((st?) $attempts), $updated -> ic_now ).
-            actions (_count actions|) -> _notify_agent ($event -> $migration_active, $cid -> sender_id, $role -> $initiator, $epoch -> ic_ep, $session_id -> (ic_fin?)).
-            sc flush_mig_deferred_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }
-        }
+        if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { actions (_count actions|) -> a. } }
 
         sender = contacts sender_id.
         sender_name is str+ = NIL.
@@ -2853,24 +2844,13 @@ library a2a_messaging loads libraries
             $reply_to    -> reply_to
         ) -- ( -> a) { actions (_count actions|) -> a. }
         sc monitor_copy_actions "in" sender_id file_date (file_monitor_summary filename mime data) -- ( -> a) { actions (_count actions|) -> a. }
-        if wire_id != ""
-        { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { actions (_count actions|) -> a. } }
-        actions (_count actions|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
-        actions (_count actions|) -> _save_state NIL.
+        sc mig_e2e_deliver_tail sender_id wire_id env_sid -- ( -> a) { actions (_count actions|) -> a. }
         return transaction::success actions.
     }
 
     trn receive_e2e_file args: any
     {
         return handle_receive_e2e_file args.
-    }
-
-    // Readonly cross-check for the daemon (#1867): the current active e2e session id for a contact
-    // (NIL if none). Belt-and-suspenders alongside the $e2e_app_send/$e2e_app_recv/$migration_active
-    // envelope session ids — lets the daemon assert session_id == pin == active session out-of-band.
-    trn readonly e2e_active_session _:($cid -> cid: global_id)
-    {
-        return ($session_id -> (e2e::active_session_id cid)).
     }
 
     // core 0.7.0: receipt ingest — a peer confirms delivery/read of messages I

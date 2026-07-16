@@ -296,8 +296,8 @@ async function main() {
   ok(bSend.Reduce('route').Visualize() === 'e2e', 'app-e2e(B) send: send_message routed "e2e" (cored over the migrated session as receive_e2e_message_tx, not boxed legacy)');
   await sleep(4000);   // the e2e box relays over the broker
   ok(ro(hiN, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === bMsg, 'app-e2e(B) recv: handle_receive_e2e_message decrypted + DELIVERED the plaintext to on_message_received');
-  const hiActX = getBin(ro(hiN, '::a2a_messaging::e2e_active_session', { cid: loN.cid }), 'session_id');
-  ok(hex(hiActX) === hex(hiAct) && hex(hiActX) === hex(loAct), 'app-e2e(B) recv: e2e_active_session(loN) == the migrated session on BOTH sides (non-circular #1867 cross-check trn)');
+  const hiActX = getBin(ro(hiN, '::actor::qa_e2e_active', { cid: loN.cid }), 'sid');
+  ok(hex(hiActX) === hex(hiAct) && hex(hiActX) === hex(loAct), 'app-e2e(B) recv: active session(loN) == the migrated session on BOTH sides (non-circular #1867 cross-check)');
   // File analogue: send_file → receive_e2e_file → on_file_received.
   await mutate(hiN, '::actor::qa_recv_reset', {});
   const bFile = Buffer.from('increment-B file bytes riding the migrated e2e session');
