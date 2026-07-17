@@ -80,6 +80,9 @@ library a2a_messaging loads libraries
     e2e_migrate_ack_tx         = "::a2a_messaging::e2e_migrate_ack".
     e2e_migrate_commit_tx      = "::a2a_messaging::e2e_migrate_commit".
     e2e_migrate_confirm_tx     = "::a2a_messaging::e2e_migrate_confirm".
+    // core 0.10 (B1): stateless AD re-advertise pushed to pre-existing legacy contacts on
+    // upgrade, so an idle legacy pair learns both sides are now v2 and the migration FSM fires.
+    readvertise_ad_tx          = "::a2a_messaging::readvertise_ad".
     // core 0.9.0 boxed APP-E2E (Option B): app data over the MIGRATED session rides these named
     // boxes ($targ = the e2e_signed_message). DISTINCT from legacy receive_message_tx so the wire
     // separates e2e-carrying box from legacy box (an attacker cannot confuse them).
@@ -90,6 +93,11 @@ library a2a_messaging loads libraries
     // migration contract). Bump ONLY on a breaking blob-shape change, together
     // with a migration from the previous stamp.
     core_format_version = 1.
+    // Invite-format version stamped on every invite this build mints (invite_eph_t
+    // $iv). A redeemer that reads NIL there treats the inviter as pre-versioning and
+    // down-levels its address document to v1. See invite_eph_t in a2a_protocol for
+    // the exact cases that bump this.
+    invite_current_version = 1.
     // Give up re-requesting a restore after this many attempts per contact (the
     // host sweep re-fires on its GC cadence; a peer that upgraded and came back
     // online answers on the first post-upgrade attempt).
@@ -133,6 +141,13 @@ library a2a_messaging loads libraries
     // Exported so the guarantee survives restart/migration. Gates send-side routing
     // (e2e_route), never authz (REG-6).
     contact_e2e_seen is (global_id ->> bool) = (,).
+    // core 0.10: born-on-DR marker. TRUE when a contact was FIRST established with a
+    // v2 (bundle-carrying) address document — it started on the double ratchet
+    // (born-DR), never on a legacy session. A pre-existing LEGACY contact (a v1 AD at
+    // registration, INCLUDING an A-down-levelled peer) is NEVER marked. Read by
+    // mig_should_trigger to keep migration STRICTLY for legacy sessions: a born-DR
+    // contact is already on the ratchet and must not be "migrated". Exported.
+    contact_born_dr is (global_id ->> bool) = (,).
     // core 3.0: invites I generated, keyed by invite id. Holds the NON-secret
     // per-invite material — the assigned contact name ("" = none), the ephemeral
     // encryption PUBLIC key shipped in the slim invite, and the crypto scheme id.
@@ -677,7 +692,11 @@ library a2a_messaging loads libraries
     // My identity bundle payload fields: my AD plus, when I am a delegated role,
     // my chain blobs (cert / root profile / optional §3c cp binding). The caller
     // appends its own correlation id ($invite_id or $rid) and _write's the record.
-    fn my_identity_bundle_fields (_) -> ($ad -> address_document_types::t_address_document, $cert -> bin+, $root_profile -> bin+, $cp_binding -> bin+)
+    // peer_is_v1 (NULLABLE): TRUE emits a v1 (down-levelled, bundle-less) address
+    // document so an older peer accepts it; NIL/FALSE emits the current AD. The
+    // invite/handshake down-level sites pass a computed bool; the contact-restore
+    // sites pass NIL (unchanged behaviour).
+    fn my_identity_bundle_fields (peer_is_v1: bool+) -> ($ad -> address_document_types::t_address_document, $cert -> bin+, $root_profile -> bin+, $cp_binding -> bin+)
     {
         my_cert_blob is bin+ = NIL.
         my_rp_blob is bin+ = NIL.
@@ -688,7 +707,7 @@ library a2a_messaging loads libraries
             my_rp_blob -> (_write root_profile?).
             if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
         }
-        return ($ad -> address_document::get_my_address_document(), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
+        return ($ad -> address_document::get_my_address_document_versioned(peer_is_v1), $cert -> my_cert_blob, $root_profile -> my_rp_blob, $cp_binding -> my_rpb_blob).
     }
 
     // ---- core 0.8.0 E2E capability + monotonic anti-downgrade ----------------
@@ -838,6 +857,7 @@ library a2a_messaging loads libraries
     {
         if (contact_migration cid) != NIL { return FALSE. }                  // already in-flight / done
         if (contact_e2e_epoch cid) != NIL { return FALSE. }                  // already epoch-pinned (migrated) — never re-offer; defense-in-depth vs any future contact_migration-clearing path (MR2)
+        if (contact_born_dr cid) == TRUE { return FALSE. }                   // born-on-DR (fresh v2 contact): already on the ratchet — migration is reserved STRICTLY for pre-existing legacy sessions
         if (a2a_capabilities::self_advertises a2a_capabilities::cap_e2e_migrate) != TRUE { return FALSE. }
         peer_capable is bool = FALSE.
         caps = contact_caps cid.
@@ -1063,7 +1083,8 @@ library a2a_messaging loads libraries
             $c -> (my_ad $identity $container_id),
             $n -> my_name,
             $k -> (kp $public_key),
-            $v -> scheme
+            $v -> scheme,
+            $iv -> invite_current_version
         ).
         return ($blob -> (_write invite), $invite_id -> invite_id).
     }
@@ -1117,7 +1138,10 @@ library a2a_messaging loads libraries
 
         // My identity bundle: my AD plus, if I am a delegated role, my chain so the
         // inviter learns my root linkage symmetrically. All inside the box.
-        b = my_identity_bundle_fields NIL.
+        // A NIL invite version ($iv) means the inviter predates the invite-version
+        // field (an old node) — down-level my AD to v1 so it accepts my leg-1 bundle.
+        peer_is_v1 = ((inv $iv) == NIL).
+        b = my_identity_bundle_fields peer_is_v1.
         // The literal sir_payload_v5_t shape: 0.5.0 stamps its wire dialect +
         // capability ids (SPEC §3/§4). Pre-0.5 inviters ignore both (unknown
         // fields — shipped, proven behavior).
@@ -2056,6 +2080,8 @@ library a2a_messaging loads libraries
         // Passive version learning (SPEC §3): dialect + piggybacked caps.
         learn_contact_version sender_id (a2a_versions::sir_version_of payload) (a2a_versions::sir_caps narrowed).
         peer_ads sender_id -> (vb $ad).
+        // Born-on-DR iff the peer presented a v2 (bundle-carrying) AD at first contact.
+        if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
         delete pending_invites invite_id.
@@ -2069,7 +2095,12 @@ library a2a_messaging loads libraries
         // inviter ephemeral; the responder opens it with the ephemeral private key it
         // kept. encrypted_channel resumes for all post-contact traffic, both sides
         // being registered after leg 3.
-        b = my_identity_bundle_fields NIL.
+        // The responder's just-verified AD tells me its version directly: a v1 AD
+        // ($version==1, no $e2e_bundle) is an old peer — down-level my leg-3 AD to v1
+        // so it accepts my bundle. (leg 1 read the invite version blind; here I have
+        // the real AD, so I key off it.)
+        peer_is_v1 = (((vb $ad) $version) == 1).
+        b = my_identity_bundle_fields peer_is_v1.
         kpi = _crypto_construct_encryption_keypair (rec? $scheme).
         // The literal cin_payload_v5_t shape ($pv/$caps; this surface never
         // carried $name). 0.2.0 responders ignore the additions.
@@ -2157,6 +2188,8 @@ library a2a_messaging loads libraries
         contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
         learn_contact_version sender_id (a2a_versions::cin_version_of payload) (a2a_versions::cin_caps narrowed).
         peer_ads sender_id -> (vb $ad).
+        // Born-on-DR iff the peer presented a v2 (bundle-carrying) AD at first contact.
+        if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
         delete pending_redemptions invite_id.
@@ -2964,9 +2997,13 @@ library a2a_messaging loads libraries
         // carry an $e2e_bundle; otherwise a typed refusal (error-as-data, no state write).
         if (((vb $ad) as any) $identity $e2e_bundle) == NIL
         { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $peer_offered_without_e2e_bundle) ]. }
-        // This offer/ack exchange IS the missing caps/AD refresh — learn the piggyback.
+        // This offer/ack exchange IS the missing caps/AD refresh — learn the piggyback AND install the
+        // refreshed AD. Storing peer_ads here is REQUIRED for a pre-existing legacy contact whose stored
+        // AD is still v1 (no $e2e_bundle): the epoch/decode below reads the peer bundle off peer_ads, so
+        // without this refresh a legacy upgrade would fail the bundle cast. Idempotent for an already-v2 peer.
         pv_seen = a2a_versions::peer_pv args.
         learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) (((p $caps) == NIL ?? [] ; (p $caps)?)).
+        peer_ads sender_id -> (vb $ad).
         // GATE 4 — election collapse / solicitation. If the offer came from the HIGHER
         // cid (mig_initiator sender_id TRUE => I am the elected LOWER-cid initiator), it
         // is a SOLICITATION: keep the AD/caps refresh above, supersede any of my own
@@ -3044,6 +3081,43 @@ library a2a_messaging loads libraries
     }
     trn e2e_migrate_offer args: any { return handle_e2e_migrate_offer args. }
 
+    // core 0.10 (B1): RE-ADVERTISE handler. A contact that has upgraded to v2 pushes its fresh
+    // AD (with $e2e_bundle + the caps piggyback) to me. This is a STATELESS refresh — unlike a
+    // migration offer it creates NO FSM state, so a still-v1 peer that never sends one is never
+    // left with a stalled `offered` entry that would permanently block a later genuine upgrade. I
+    // verify + ingest the AD (refreshes peer_ads + learns caps/pv), then nudge the migration
+    // trigger: if this is a still-legacy contact I now know is v2 (and it carries a bundle),
+    // mig_trigger_actions elects the initiator and emits the authoritative offer, and the existing
+    // offer/ack/commit/confirm FSM upgrades the pre-existing legacy session to the double ratchet.
+    // A born-DR / epoch-pinned / in-flight contact is a no-op (mig_should_trigger returns FALSE).
+    fn handle_readvertise_ad (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        // Only known contacts; an unknown sender is a silent no-op (no state, no leak).
+        if (contacts sender_id) == NIL { return transaction::success []. }
+        // Verify + ingest the refreshed AD (cid-bind + PoP; forgery aborts). Caller writes peer_ads.
+        vb = verify_identity_bundle (args as any) sender_id.
+        peer_ads sender_id -> (vb $ad).
+        // Learn the peer's version + caps piggyback so it becomes known-0.9 (the mig_should_trigger gate).
+        pv_seen = a2a_versions::peer_pv args.
+        caps_in is str[] = ((args $caps) == NIL ?? [] ; ((args $caps) safe (str[]))).
+        learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) caps_in.
+        // Nudge the trigger only when the refreshed AD actually carries a v2 bundle (a real
+        // upgrade). mig_trigger_actions internally gates on mig_should_trigger (skips born-DR /
+        // epoch-pinned / in-flight / not-known-0.9), so this is a safe no-op otherwise.
+        actions is transaction::action::type[] = [].
+        if (peer_has_e2e_bundle sender_id)
+        {
+            trig is transaction::action::type[] = mig_trigger_actions sender_id.
+            sc trig -- ( -> a) { actions (_count actions|) -> a. }
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+    trn readvertise_ad args: any { return handle_readvertise_ad args. }
+
     // ACK handler (initiator). Gates: narrow -> FSM phase==offered ∧ ack echoes my nonce
     // -> verify bundle (forgery aborts) -> bundle-presence -> compute the SAME epoch ->
     // WRITES LAST. NOTE: the §5.5 COMMIT continuation (stage_outbound_rotation + send
@@ -3071,6 +3145,9 @@ library a2a_messaging loads libraries
         { return transaction::success [ _notify_agent ($event -> $migration_rejected, $cid -> sender_id, $reason -> $peer_acked_without_e2e_bundle) ]. }
         pv_seen = a2a_versions::peer_pv args.
         learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) (((p $caps) == NIL ?? [] ; (p $caps)?)).
+        // Install the ack's refreshed AD (REQUIRED for a legacy contact whose stored AD is still v1):
+        // GATE 4 below reads the peer $e2e_bundle off peer_ads, which must now be the v2 AD.
+        peer_ads sender_id -> (vb $ad).
         // GATE 4 — compute the SAME epoch (I am the elected initiator = LOWER cid).
         ack_nonce = (p $nonce) safe bin.
         my_fp   = ((st?) $local_fp)?.       // my offer snapshot fp (same bundle -> same fp)
@@ -3359,6 +3436,34 @@ library a2a_messaging loads libraries
     // at mig_max_attempts → $migration_stalled notify (state KEPT — legacy still flows offered/ack,
     // committed keeps queueing; NOTHING silently downgrades). A committed entry whose staged session
     // was lost is abandoned + superseded (fresh offer). Idempotent; re-fires on the host cadence.
+    // core 0.10 (B1): boot/upgrade RE-ADVERTISE. The daemon calls this at startup (see the DAEMON
+    // CONTRACT). It pushes my fresh v2 AD (+ caps piggyback) to every PRE-EXISTING LEGACY contact —
+    // one that is NOT epoch-pinned, NOT born-DR, and has NO migration in flight — over the legacy
+    // encrypted_channel. A v2 peer ingests it (handle_readvertise_ad) and offers back; a still-v1
+    // peer does not understand the tx and ignores it, leaving NO state that could block a future
+    // upgrade. STATELESS (no _save_state): it only sends, changing no local state, so it is idempotent
+    // and safe to call on every boot. A still-legacy contact becomes migration-eligible only after
+    // this re-advertise round-trips, so no separate production boot sweep is needed.
+    trn readvertise_on_upgrade _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        b  = my_identity_bundle_fields_fresh NIL.
+        actions is transaction::action::type[] = [].
+        n is int = 0.
+        sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) == NIL && (contact_born_dr cid) != TRUE && (contact_migration cid) == NIL)
+        {
+            actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
+                $name -> readvertise_ad_tx,
+                $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                           $cp_binding -> (b $cp_binding),
+                           $pv -> a2a_versions::wire_version,
+                           $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
+            n -> n + 1.
+        }
+        actions (_count actions|) -> _return_data ($readvertised -> n).
+        return transaction::success actions.
+    }
+
     trn sweep_e2e_migrations _
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
@@ -3465,6 +3570,7 @@ library a2a_messaging loads libraries
             $contact_pv      -> contact_pv,
             $contact_caps    -> contact_caps,
             $contact_e2e_seen -> contact_e2e_seen,
+            $contact_born_dr -> contact_born_dr,
             // core 0.9.0 migration FSM metadata — additive, all keyed by cid. Only
             // PUBLIC FSM/epoch/queue metadata travels; the staged/active Olm session
             // pickles stay packet-local in the adapt e2e library (INV-4 / spec §5.1).
@@ -3588,6 +3694,10 @@ library a2a_messaging loads libraries
         if (data $contact_e2e_seen) != NIL
         {
             contact_e2e_seen -> (data $contact_e2e_seen) safe (global_id ->> bool).
+        }
+        if (data $contact_born_dr) != NIL
+        {
+            contact_born_dr -> (data $contact_born_dr) safe (global_id ->> bool).
         }
         // core 0.9.0: migration FSM metadata (absent from pre-0.9 exports → all
         // three stay empty = legacy, spec §5.1). Guarded exactly like the pins.

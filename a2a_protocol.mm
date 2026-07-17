@@ -83,12 +83,27 @@ library a2a_protocol loads library
     //   $d invite_id (correlates leg-1 to the stored eph privkey; single-use)
     //   $c inviter container_id (routing target + identity pin)
     //   $n inviter display name (metadata only)   $k eph_pub_inviter   $v scheme id
+    //   $iv invite-format version (NULLABLE). The version of the invite/handshake
+    //     contract the inviter speaks. A redeemer that reads it as NIL treats the
+    //     inviter as a pre-versioning node (one that predates this field) and
+    //     down-levels its own address document to v1 (omits $e2e_bundle, sets
+    //     $version->1) so that older peer accepts it; a present value means the
+    //     inviter understands this contract. The field is wire-safe in BOTH
+    //     directions: an older decoder ignores the extra member and a newer decoder
+    //     reads a missing one as NIL, because mufl metadefs are name-keyed and this
+    //     field is nullable. Bump it ONLY for a change that breaks cross-version
+    //     invite/handshake compatibility — one that forces the sender to know the
+    //     peer's version to interoperate. The confirmed cases are:
+    //       - invite_eph_t changing shape such that an older decoder cannot consume it;
+    //       - the address-document format moving to an incompatible version (the
+    //         v1->v2 $e2e_bundle bump) so a v1 peer would reject a v2 AD.
     metadef invite_eph_t: (
         $d -> global_id,
         $c -> global_id,
         $n -> str,
         $k -> publickey_encrypt,
-        $v -> int
+        $v -> int,
+        $iv -> int+
     ).
 
     // A reply pointer carried on a message: the stable wire id of the message

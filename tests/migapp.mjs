@@ -370,7 +370,7 @@ async function main() {
   // mig_trigger_actions is now mirrored into BOTH e2e delivery tails. Driven over the REAL send_*→receive
   // path (NOT qa_mig_trigger_offer), using the live-session harness (fresh meta-fuel + the recv hooks).
   // ═══════════════════════════════════════════════════════════════════════════════════════════════════
-  console.log('=== migapp: ★ NATURAL trigger (D-message) — inbound e2e app message auto-triggers migration → ACTIVE ===');
+  console.log('=== migapp: ★ born-DR invariant (D-message) — inbound e2e app message does NOT migrate a born-DR pair (core 0.10 B2) ===');
   { const { I, R } = await connect('dmsg');
     const [RCV, SND] = I.cid < R.cid ? [I, R] : [R, I];   // receiver = lower cid = elected initiator when it offers
     const rcvIk = getBin(ro(RCV, '::actor::qa_e2e_ik', {}), 'ik');
@@ -390,19 +390,21 @@ async function main() {
     const s = await mutate(SND, '::a2a_messaging::send_message', { contact: RCV.name, text: appPt });
     ok(s.Reduce('route').Visualize() === 'e2e', 'D-msg: sender routes the app e2e (receive_e2e_message_tx) — the already-e2e path that had no trigger');
     await sleep(10000);   // delivery + offer → ack → commit → confirm
-    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === appPt, 'D-msg: the inbound e2e app message was DELIVERED to the app hook (delivery + trigger are same-tx)');
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === appPt, 'D-msg: the inbound e2e app message was DELIVERED to the app hook (over the existing born-DR session)');
     const rSt = ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }), sSt = ro(SND, '::actor::qa_mig_state', { cid: RCV.cid });
     console.log(`  DIAG D-msg rcv=${rSt.Reduce('phase').Visualize()} snd=${sSt.Reduce('phase').Visualize()}`);
-    ok(rSt.Reduce('phase').Visualize() === 'active', '★ D-msg: inbound e2e message AUTO-TRIGGERED the migration → receiver ACTIVE (the PRIMARY production case now migrates)');
-    ok(sSt.Reduce('phase').Visualize() === 'active', '★ D-msg: peer reached ACTIVE (real inbound-e2e → trigger → handshake, no qa_mig_trigger_offer)');
-    // IDEMPOTENCY: a second inbound e2e message does NOT re-trigger (contact_migration!=NIL / epoch-pin gate).
-    const epoch0 = hex(getBin(rSt, 'epoch'));
-    await mutate(SND, '::a2a_messaging::send_message', { contact: RCV.name, text: 'second message post-migration' });
+    // core 0.10 (B2): this pair is BORN-DR (both v2 from first contact → contact_born_dr set at
+    // registration), so it is ALREADY on the double ratchet. Migration is reserved STRICTLY for
+    // pre-existing LEGACY sessions, so inbound e2e traffic must NOT start a migration here (it would
+    // be a redundant epoch-pin re-key of an already-DR session). The message still delivers over DR.
+    ok(!T(rSt.Reduce('present').Visualize()), '★ D-msg(B2): a born-DR pair does NOT migrate on inbound e2e — no contact_migration on the receiver (migration reserved for legacy)');
+    ok(!T(sSt.Reduce('present').Visualize()), '★ D-msg(B2): the born-DR peer likewise did not migrate');
+    // A second inbound e2e message likewise starts no migration (stays pure born-DR).
+    await mutate(SND, '::a2a_messaging::send_message', { contact: RCV.name, text: 'second message stays born-DR' });
     await sleep(4000);
-    const rSt2 = ro(RCV, '::actor::qa_mig_state', { cid: SND.cid });
-    ok(rSt2.Reduce('phase').Visualize() === 'active' && hex(getBin(rSt2, 'epoch')) === epoch0, '★ D-msg IDEMPOTENCY: a second inbound e2e message does NOT re-offer (phase + epoch unchanged — no double-fire)'); }
+    ok(!T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), '★ D-msg(B2): a second inbound e2e message still does NOT migrate (stays pure born-DR)'); }
 
-  console.log('=== migapp: ★ NATURAL trigger (D-file) — inbound e2e FILE auto-triggers migration (the _file tail fires the trigger too) ===');
+  console.log('=== migapp: ★ born-DR invariant (D-file) — inbound e2e FILE does NOT migrate a born-DR pair (core 0.10 B2) ===');
   { const { I, R } = await connect('dfile');
     const [RCV, SND] = I.cid < R.cid ? [I, R] : [R, I];
     const rcvIk = getBin(ro(RCV, '::actor::qa_e2e_ik', {}), 'ik');
@@ -417,8 +419,8 @@ async function main() {
     const s = await mutate(SND, '::a2a_messaging::send_file', { contact: RCV.name, filename: 'photo.bin', mime: 'application/octet-stream', data: binv(SND, Buffer.from('e2e-file-payload')) });
     ok(s.Reduce('route').Visualize() === 'e2e', 'D-file: sender routes the file e2e (receive_e2e_file_tx)');
     await sleep(5000);
-    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'photo.bin', 'D-file: the inbound e2e file was DELIVERED to on_file_received');
-    ok(T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), '★ D-file: inbound e2e FILE auto-triggered the migration (mig_trigger_actions mirrored into the _file delivery tail too)'); }
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'photo.bin', 'D-file: the inbound e2e file was DELIVERED to on_file_received (over the existing born-DR session)');
+    ok(!T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), '★ D-file(B2): a born-DR pair does NOT migrate on inbound e2e file (migration reserved for legacy)'); }
 
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
