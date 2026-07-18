@@ -226,6 +226,15 @@ library a2a_messaging loads libraries
     peer_ads is (global_id ->> address_document_types::t_address_document) = (,).
     // My delegation cert. NIL == I am a root or a legacy flat identity.
     delegation_cert is a2a_protocol::delegation_cert_t+ = NIL.
+    // My delegation cert bound to my v1 (down-levelled, bundle-less) address
+    // document — the SAME chain, but its $role_ad_hash commits to _value_id of
+    // produce_v1_address_document() instead of the current v2 AD. Sent INSTEAD of
+    // delegation_cert whenever I down-level my AD to v1 for a pre-E2E (0.11.2)
+    // peer, so that peer's verify_peer_delegation (which hashes the v1 AD it
+    // actually received) finds a matching cert. NIL for a root, a legacy flat
+    // identity, or a role whose host has not yet minted the v1 cert (in which
+    // case the down-level omits the chain rather than send a mismatching v2 cert).
+    delegation_cert_v1 is a2a_protocol::delegation_cert_t+ = NIL.
     // My root's address document (set with the cert; its key list is what
     // sibling introductions and my own cert are verified against).
     root_ad is address_document_types::t_address_document+ = NIL.
@@ -701,9 +710,19 @@ library a2a_messaging loads libraries
         my_cert_blob is bin+ = NIL.
         my_rp_blob is bin+ = NIL.
         my_rpb_blob is bin+ = NIL.
-        if delegation_cert != NIL && root_profile != NIL
+        down_level = (peer_is_v1 != NIL) && (peer_is_v1?).
+        // The cert I attach MUST commit to the same AD version I attach: a v1 peer
+        // hashes the v1 AD it receives and compares it to cert.$role_ad_hash, so a
+        // down-level MUST carry the v1-AD-bound cert (delegation_cert_v1). If it is
+        // absent (a role whose host predates the v1-cert mint), send the AD WITHOUT
+        // a chain rather than a mismatching v2 cert — a bundle-less contact with no
+        // recorded root linkage still connects (verify_identity_bundle treats a NIL
+        // cert as a flat identity); attaching the v2 cert would abort the peer.
+        eff_cert is a2a_protocol::delegation_cert_t+ = delegation_cert.
+        if down_level { eff_cert -> delegation_cert_v1. }
+        if eff_cert != NIL && root_profile != NIL
         {
-            my_cert_blob -> (_write delegation_cert?).
+            my_cert_blob -> (_write eff_cert?).
             my_rp_blob -> (_write root_profile?).
             if root_cp_binding != NIL { my_rpb_blob -> (_write root_cp_binding?). }
         }
@@ -3556,6 +3575,7 @@ library a2a_messaging loads libraries
             $my_bio          -> my_bio,
             $my_persona      -> my_persona,
             $delegation_cert -> delegation_cert,
+            $delegation_cert_v1 -> delegation_cert_v1,
             $root_ad         -> root_ad,
             $root_profile    -> root_profile,
             $root_cp_binding -> root_cp_binding,
@@ -3633,6 +3653,13 @@ library a2a_messaging loads libraries
         if (data $delegation_cert) != NIL
         {
             delegation_cert -> (data $delegation_cert) safe a2a_protocol::delegation_cert_t.
+        }
+        // Additive (absent in pre-fix exports → stays NIL; the host re-mints it on
+        // the next set_delegation, so an un-upgraded role degrades to omitting the
+        // chain on down-level rather than aborting the peer).
+        if (data $delegation_cert_v1) != NIL
+        {
+            delegation_cert_v1 -> (data $delegation_cert_v1) safe a2a_protocol::delegation_cert_t.
         }
         if (data $root_ad) != NIL
         {

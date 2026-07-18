@@ -34,7 +34,14 @@ async function delegate(root, role, roleName) {
   const prof = await mutate(root, '::actor::export_root_profile', {});
   const profBlob = Buffer.from(prof.Reduce('profile').GetBinary());
   const rootAd = Buffer.from(ro(root, '::actor::export_address_document', undefined).GetBinary());
-  await mutate(role, '::actor::set_delegation', { cert: binv(role, cert), root_ad: binv(role, rootAd), root_profile: binv(role, profBlob) });
+  // Also mint the v1-AD-bound cert: the root signs a delegation over the role's
+  // DOWN-LEVELLED (bundle-less) AD, so a cross-version (0.11.2) peer that hashes
+  // the v1 AD it receives finds a matching $role_ad_hash. This is the daemon's
+  // real sa() flow — sign_delegation takes any AD blob, so we hand it the v1 one.
+  const roleAdV1 = Buffer.from((await mutate(role, '::actor::export_v1_address_document', {})).Reduce('ad').GetBinary());
+  const signedV1 = await mutate(root, '::actor::sign_delegation', { role_ad: binv(root, roleAdV1), role_id: roleName });
+  const certV1 = Buffer.from(signedV1.Reduce('cert').GetBinary());
+  await mutate(role, '::actor::set_delegation', { cert: binv(role, cert), root_ad: binv(role, rootAd), root_profile: binv(role, profBlob), cert_v1: binv(role, certV1) });
 }
 
 async function main() {

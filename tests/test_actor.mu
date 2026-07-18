@@ -153,7 +153,10 @@ application actor loads libraries
         return transaction::success [ _return_data ($profile -> (_write profile)) ].
     }
 
-    trn set_delegation _:($cert -> cert_blob: bin, $root_ad -> root_ad_blob: bin, $root_profile -> rp_blob: bin)
+    // $cert_v1 (NULLABLE): the SAME chain minted over my v1 (bundle-less) AD, so a
+    // down-level to a pre-E2E peer carries a cert whose $role_ad_hash matches the v1
+    // AD that peer receives. Verified against _value_id(produce_v1_address_document()).
+    trn set_delegation _:($cert -> cert_blob: bin, $root_ad -> root_ad_blob: bin, $root_profile -> rp_blob: bin, $cert_v1 -> cert_v1_blob: bin+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         cert = (_read_or_abort cert_blob) safe a2a_protocol::delegation_cert_t.
@@ -168,7 +171,25 @@ application actor loads libraries
         a2a_messaging::delegation_cert -> cert.
         a2a_messaging::root_ad -> new_root_ad.
         a2a_messaging::root_profile -> rp.
+        if cert_v1_blob != NIL
+        {
+            cert_v1 = (_read_or_abort cert_v1_blob?) safe a2a_protocol::delegation_cert_t.
+            v1_ad = address_document::get_my_address_document_versioned(TRUE).
+            abort "v1 cert not for me." when (cert_v1 $c $role_cid) != _get_container_id().
+            abort "v1 cert AD mismatch." when (cert_v1 $c $role_ad_hash) != (_value_id v1_ad).
+            abort "v1 cert root mismatch." when (cert_v1 $c $root_cid) != (cert $c $root_cid).
+            abort "v1 cert not root-signed." when key_storage::check_signature_new_container (_value_id (cert_v1 $c)) (cert_v1 $s) (new_root_ad $identity $key_list) != TRUE.
+            a2a_messaging::delegation_cert_v1 -> cert_v1.
+        }
         return transaction::success [ _return_data ($delegated -> TRUE), _save_state NIL ].
+    }
+
+    // Expose my v1 (bundle-less) AD so the root can sign a v1-bound delegation cert
+    // (the daemon mints this by calling sign_delegation with this blob).
+    trn export_v1_address_document _
+    {
+        v1_ad = address_document::get_my_address_document_versioned(TRUE).
+        return transaction::success [ _return_data ($ad -> (_write v1_ad)) ].
     }
 
     // export/import wrappers (migration scenario): the core state under $core, as a
