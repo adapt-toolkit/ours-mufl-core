@@ -1,59 +1,22 @@
 #!/usr/bin/env node
 // M2 loopback test suite for the core-3.0 ephemeral-invite redeem flow.
 // Asserts RECEIVER-SIDE outcomes (state), per the Critic requirement.
+//
+// T/V/RC-series only — the a2a_notifications N-series moved to notif.mjs (its own
+// compiled unit, notif_actor.mu). The shared wrapper/packet bootstrap + the
+// mk/wire/mutate/ro/binv/mkPacket/sleep/log helpers live in ./test_common.mjs.
 import { resolve } from 'node:path';
 import * as fs from 'node:fs';
-import { adapt_wrapper } from '@adapt-toolkit/sdk/executables';
-import { PacketWrapperConfigurator } from '@adapt-toolkit/sdk/wrappers';
-import { object_to_adapt_value } from '@adapt-toolkit/sdk/wrapper';
+import { createHarness, mk } from './test_common.mjs';
 
 const BROKER_URL = process.env.BROKER_URL || 'ws://127.0.0.1:9790';
 const UNIT_DIR = resolve('.');
-const unitHash = fs.readdirSync(UNIT_DIR).find((f) => f.endsWith('.muflo')).slice(0, -'.muflo'.length);
-const UNIT = new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, `${unitHash}.muflo`)));
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (...a) => process.stderr.write(`[t] ${a.join(' ')}\n`);
 const scorecard = [];
 let CUR = '';
 const ok = (c, m) => { if (!c) { scorecard.push(`✗ [${CUR}] ${m}`); console.log(`  ✗ FAIL: ${m}`); } else { console.log(`  ✓ ${m}`); } };
 const isT = (s) => /true/i.test(String(s));
 
-let wrapper;
-function mk(name) { return { name, pw: null, cid: '', pending: [], rejects: [], events: [] }; }
-function wire(id) {
-  id.pw.on_return_data = (d) => {
-    const kind = d.Reduce('kind').Visualize();
-    if (kind === 'notify_agent') { id.events.push(d.Reduce('payload').Reduce('event').Visualize()); return; }
-    if (kind === 'save_state') return;
-    const p = id.pending.shift(); if (!p) return;
-    clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
-  };
-  id.pw.on_transaction_failure = (msg) => {
-    const p = id.pending.shift();
-    if (p) { clearTimeout(p.timer); p.reject(new Error(msg)); }
-    else { id.rejects.push(String(msg)); log(`${id.name} inbound rejected:`, String(msg).split('\n')[0]); }
-  };
-}
-function mutate(id, name, targ) {
-  return new Promise((res, rej) => {
-    const timer = setTimeout(() => rej(new Error(`${id.name}.${name} timed out`)), 20000);
-    id.pending.push({ resolve: res, reject: rej, timer });
-    id.pw.add_client_message(object_to_adapt_value({ name, targ }));
-  });
-}
-const ro = (id, name, targ) => id.pw.packet.ExecuteTransaction(object_to_adapt_value({ name, targ }));
-const binv = (id, buf) => id.pw.packet.NewBinaryFromBuffer(Buffer.from(buf));
-async function mkPacket(id, seed) {
-  const cfg = new PacketWrapperConfigurator();
-  cfg.process_arguments(['--unit_hash', unitHash, '--seed_phrase', seed, '--unit_dir_path', UNIT_DIR]);
-  await new Promise((res, rej) => {
-    const t = setTimeout(() => rej(new Error(`${id.name} create timeout`)), 30000);
-    wrapper.packet_manager.create_packet(cfg, (pw) => {
-      clearTimeout(t); id.pw = pw; id.cid = pw.packet.GetContainerID().Visualize(); wire(id);
-      log(`${id.name} cid ${id.cid.slice(0, 12)}…`); res();
-    }, UNIT);
-  });
-}
+let wrapper, mutate, ro, binv, mkPacket, sleep, log;
 const st = (id) => { const s = ro(id, '::actor::qa_state', undefined); return {
   c: +s.Reduce('n_contacts').Visualize(), p: +s.Reduce('n_peer_ads').Visualize(),
   pi: +s.Reduce('n_pending_invites').Visualize(), pr: +s.Reduce('n_pending_redemptions').Visualize(),
@@ -75,10 +38,8 @@ async function delegate(root, role, roleName) {
 }
 
 async function main() {
-  wrapper = await adapt_wrapper.start(['--broker_address', BROKER_URL, '--test_mode',
-    '--logger_config', '--level', 'WARNING', '--stdout', 'stderr', '--logger_config_end']);
-  wrapper.start();
-  await sleep(1500);
+  const h = await createHarness({ brokerUrl: BROKER_URL, unitDir: UNIT_DIR, logTag: 't' });
+  ({ wrapper, mutate, ro, binv, mkPacket, sleep, log } = h);
 
   const I = mk('I'); const R = mk('R'); const F = mk('F');
   await mkPacket(I, 'eph-t-I-01'); await mkPacket(R, 'eph-t-R-02'); await mkPacket(F, 'eph-t-F-03');
@@ -302,7 +263,7 @@ async function main() {
   await mutate(I2, '::actor::import_state', adData);
   const s10 = st(I2);
   ok(s10.c >= 1 && s10.p >= 1, `import restored contacts + peer_ads (c=${s10.c},peer_ads=${s10.p})`);
-  ok(s10.pi === 0, `import reset pending_invites to empty (migration §4.4) → ${s10.pi}`);
+  ok(s10.pi === 0, `import reset pending_invites to empty (migration) → ${s10.pi}`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
   // version-0 path: strip the stamp from a re-exported blob → still imports.
   const exp0 = ro(I2, '::actor::export_state', undefined);
@@ -456,6 +417,280 @@ async function main() {
     await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'post-T11e-I-to-R' });
     await sleep(2500);
     ok(/post-T11e-I-to-R/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), `channel healthy after the T11e restore race`);
+  }
+
+  // ================= V-series: versioned type registry (core 0.5.0) =========
+  // Cross-version leg-1 shapes against a 0.5.0 inviter (fresh packet pair so
+  // earlier scenarios' contacts cannot mask the registration outcomes).
+  const VI = mk('VI'); const VL = mk('VL');
+  await mkPacket(VI, 'eph-t-VI-04'); await mkPacket(VL, 'eph-t-VL-05');
+  await sleep(1200);
+  await setName(VI, 'VerInviter'); await setName(VL, 'VerLegacy');
+  const pvOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('pv').Visualize();
+  const capsOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('caps').Visualize();
+  const nameOfContact = (id, cid) => ro(id, '::actor::qa_contact_name', { cid }).Reduce('name').Visualize();
+
+  // ---------- V1 legacy v2 leg-1 (the 0.2.0 incident shape: no $name) ----------
+  CUR = 'V1 legacy-v2-leg1';
+  console.log('\n=== V1 legacy v2 leg-1 (no $name — THE incident shape) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});   // NO assigned name — the incident precondition
+  const blobV1 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const before = st(VI); const rejB = VI.rejects.length; const legRejB = VL.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV1), shape: 'v2', name: '' });
+    await sleep(4000);
+    const after = st(VI);
+    ok(VI.rejects.length === rejB, `v2 leg-1: inviter did NOT abort (no EVAL_ERROR reject) — the incident is dead`);
+    ok(after.pi === before.pi - 1, `v2 leg-1: invite consumed (pi ${before.pi}→${after.pi})`);
+    ok(after.c === before.c + 1, `v2 leg-1: responder registered as contact (c ${before.c}→${after.c})`);
+    ok(nameOfContact(VI, VL.cid) === VL.cid, `v2 leg-1: no $name → contact named by sender cid (typed v2 branch)`);
+    ok(pvOf(VI, VL.cid) === '2', `v2 leg-1: contact_pv learned as 2 (shape-inferred)`);
+    ok(VL.rejects.slice(legRejB).some((x) => /Unsolicited completion|Redemption ephemeral key/.test(x)),
+      `v2 leg-1: inviter DID send leg-3 (arrived at the emulated legacy responder)`);
+  }
+
+  // ---------- V2 legacy v3 leg-1 ($name honored) ----------
+  CUR = 'V2 legacy-v3-leg1';
+  console.log('\n=== V2 legacy v3 leg-1 ($name, no $pv) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV2 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const rejB = VI.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV2), shape: 'v3', name: 'LegacyBob' });
+    await sleep(4000);
+    ok(VI.rejects.length === rejB, `v3 leg-1: no abort at inviter`);
+    ok(nameOfContact(VI, VL.cid) === 'LegacyBob', `v3 leg-1: $name honored (typed v3 branch)`);
+    ok(pvOf(VI, VL.cid) === '3', `v3 leg-1: contact_pv learned as 3 (shape-inferred)`);
+  }
+
+  // ---------- V3 v5 leg-1 ($pv stamped + $caps piggyback) ----------
+  CUR = 'V3 v5-leg1';
+  console.log('\n=== V3 v5 leg-1 ($pv + $caps) ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV3 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const rejB = VI.rejects.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV3), shape: 'v5', name: 'NewCarol' });
+    await sleep(4000);
+    ok(VI.rejects.length === rejB, `v5 leg-1: no abort at inviter`);
+    ok(nameOfContact(VI, VL.cid) === 'NewCarol', `v5 leg-1: $name honored (typed v5 branch)`);
+    ok(pvOf(VI, VL.cid) === '5', `v5 leg-1: contact_pv learned as 5 ($pv stamped)`);
+    ok(/core\.notifications/.test(String(capsOf(VI, VL.cid))), `v5 leg-1: piggybacked $caps learned into contact_caps`);
+  }
+
+  // ---------- V4 Additions A+B: below-floor leg-1 → error-as-data to inviter ----------
+  CUR = 'V4 too-old-leg1 (Additions A/B)';
+  console.log('\n=== V4 below-floor leg-1 ($pv=1) → inviter error-as-data, invite NOT consumed ===');
+  m = await mutate(VI, '::a2a_messaging::generate_invite', {});
+  const blobV4 = Buffer.from(m.Reduce('invite').GetBinary());
+  {
+    const before = st(VI); const rejB = VI.rejects.length; const errB = VI.errEvents.length;
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'too_old', name: '' });
+    await sleep(4000);
+    const after = st(VI);
+    ok(VI.rejects.length === rejB, `A: inviter did NOT abort/rollback on a below-floor peer (no reject)`);
+    const errs = VI.errEvents.slice(errB);
+    ok(errs.length === 1, `A: exactly one $protocol_error event surfaced to the inviter's client`);
+    const e = errs[0] ?? {};
+    ok(e.code === 'peer_version_unsupported', `A: error-as-data code is peer_version_unsupported (got ${e.code})`);
+    ok(e.surface === 'sir' && e.peerVersion === '1' && e.minSupported === '2',
+      `A: typed error carries surface=sir peer_version=1 min_supported=2`);
+    ok(e.context === 'invite_redeem', `B: context marks the invite second phase (invite_redeem)`);
+    ok(/An invite you created was accepted by a peer running an unsupported \(too old\) protocol version/.test(e.message)
+      && /update their client/.test(e.message),
+      `B: inviter-facing message is the clear human-readable wording`);
+    ok(after.pi === before.pi && after.c === before.c && after.p === before.p,
+      `B: NO state consumed (invite intact, no contact registered)`);
+    // The same invite redeems fine once the peer "updates" (proves not consumed).
+    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'v3', name: 'UpdatedPeer' });
+    await sleep(4000);
+    ok(st(VI).pi === before.pi - 1, `B: SAME invite redeems after the peer updates (invite was not consumed)`);
+    ok(nameOfContact(VI, VL.cid) === 'UpdatedPeer', `B: post-update redeem registered the contact normally`);
+  }
+
+  // NOTE: V5 CAP-1 (the notify client's capability gate — notify_register denied
+  // on positive missing-cap evidence) exercises the a2a_notifications library and
+  // the alice/nsvc notify nodes, so it moved to notif.mjs with the N-series (this
+  // messaging-only unit no longer loads a2a_notifications).
+
+  // ---------- V6 $pv stamping on message traffic + passive learning ----------
+  // Uses the T1 pair (I↔R, MUTUAL contacts from the real 0.5.0 redeem): both
+  // legs of that redeem were the stamped v5 shapes, and message $targs carry
+  // $pv — so both sides must have learned dialect 5, and a fresh stamped
+  // message must deliver normally.
+  CUR = 'V6 pv-stamp';
+  console.log('\n=== V6 $pv stamp on send_message + passive learning at the receiver ===');
+  {
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'v5-stamped-msg' });
+    await sleep(2500);
+    ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
+      `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
+    ok(pvOf(R, I.cid) === '8', `responder learned contact_pv=8 (wire-8 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '8', `inviter learned contact_pv=8 (real current-build leg-1)`);
+  }
+
+  // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
+  // A contact was v2 at invite time (V1 proves a real v2 leg-1 learns
+  // contact_pv=2; the emulated legacy responder has no reverse channel, so that
+  // v2-era state is ARRANGED here on the channel-connected T1 pair). Then the
+  // peer "upgrades": its first v5-STAMPED ordinary message must re-learn
+  // contact_pv 2→5 through handle_receive_message (ongoing learning, not
+  // invite-time-only). Finally a stale/replayed v2-SHAPE (unstamped) legacy
+  // message must NOT downgrade the learned pv nor clobber learned v5 caps.
+  CUR = 'V7 upgrade+monotonic';
+  console.log('\n=== V7 upgrade-later re-learn + monotonic (no downgrade by legacy traffic) ===');
+  {
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 2 });
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });  // v2-era: nothing advertised
+    ok(pvOf(I, R.cid) === '2', `arranged: contact recorded as v2-era (the state a real v2 leg-1 yields, per V1)`);
+    // The upgrade: the peer's next ORDINARY message is v5-stamped.
+    await mutate(R, '::a2a_messaging::send_message', { contact: I.cid, text: 'post-upgrade-hello' });
+    await sleep(2500);
+    ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
+      `post-upgrade stamped message delivered`);
+    ok(pvOf(I, R.cid) === '8', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→8 (ongoing learning)`);
+    // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
+    await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
+    await sleep(2500);
+    ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
+      `legacy (pre-wire_id, unstamped) message still delivers`);
+    ok(pvOf(I, R.cid) === '8', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
+      `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
+  }
+
+  // ================= RC-series: receipts (core 0.7.0, Rev 2 spec) ==========
+  // Uses the I/R mutual pair. Gate polarity: fail-CLOSED on unknown caps.
+  const rlog = (id) => ro(id, '::actor::qa_receipts_log', undefined).Visualize();
+  const rcount = (id) => (String(rlog(id)).match(/"kind"/g) || []).length;
+
+  CUR = 'RC1 receipts-off baseline';
+  console.log('\n=== RC1 receipts baseline (no caps → zero receipt traffic, zero failures) ===');
+  {
+    const rejI = I.rejects.length; const rejR = R.rejects.length; const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc1-no-receipts' });
+    await sleep(2500);
+    ok(/rc1-no-receipts/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), 'RC1: message delivered');
+    ok(rcount(I) === c0, 'RC1: NO receipt emitted (peer caps absent → gate closed, the new↔old cell)');
+    ok(I.rejects.length === rejI && R.rejects.length === rejR, 'RC1: zero failures either side');
+  }
+
+  CUR = 'RC2 delivered receipt';
+  console.log('\n=== RC2 delivered receipt (both caps positive) ===');
+  let rcWid = '';
+  {
+    await mutate(R, '::actor::qa_init_caps', { advertise: ['core.receipts.emit', 'core.receipts.receive'] });
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: ['core.receipts.receive'] });
+    const c0 = rcount(I); const rejI = I.rejects.length;
+    const sm = await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc2-confirm-me' });
+    rcWid = sm.Reduce('wire_id').Visualize();
+    await sleep(3000);
+    ok(rcount(I) === c0 + 1, 'RC2: exactly ONE delivered receipt arrived at the sender');
+    const lg = String(rlog(I)).replace(/\s/g, '');
+    ok(lg.includes('"kind"->"delivered"'), 'RC2: receipt kind is "delivered"');
+    ok(lg.includes(rcWid), 'RC2: receipt carries the message wire_id');
+    ok(I.rejects.length === rejI, 'RC2: receipt ingest clean (no rejects at sender)');
+  }
+
+  CUR = 'RC3 expectation';
+  console.log('\n=== RC3 sender-side expectation (derived, unknown ≠ failed) ===');
+  {
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.receipts.emit'] });
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: R.cid }).Reduce('state').Visualize() === 'expected',
+      'RC3: peer advertising emit → "expected"');
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: VL.cid }).Reduce('state').Visualize() === 'unknown',
+      'RC3: peer without emit cap → "unknown" (never failed)');
+  }
+
+  CUR = 'RC4 read receipt';
+  console.log('\n=== RC4 read receipt (auto on the get/mark-read path) ===');
+  {
+    const c0 = rcount(I);
+    await mutate(R, '::actor::qa_mark_read', { contact: I.cid, wire_ids: [rcWid] });
+    await sleep(2500);
+    ok(rcount(I) === c0 + 1, 'RC4: read receipt arrived');
+    ok(String(rlog(I)).replace(/\s/g, '').includes('"kind"->"read"'), 'RC4: kind is "read"');
+  }
+
+  CUR = 'RC5 file receipt';
+  console.log('\n=== RC5 file delivery receipt (shared wire_id namespace) ===');
+  {
+    const c0 = rcount(I);
+    const sf = await mutate(I, '::a2a_messaging::send_file',
+      { contact: R.cid, filename: 'rc5.bin', mime: 'application/octet-stream', data: binv(I, Buffer.from('RC5')) });
+    const fwid = sf.Reduce('wire_id').Visualize();
+    await sleep(3000);
+    ok(rcount(I) === c0 + 1 && String(rlog(I)).includes(fwid), 'RC5: delivered receipt for the FILE wire_id');
+  }
+
+  CUR = 'RC6 emit toggle off';
+  console.log('\n=== RC6 emit toggle off (dynamic user policy) ===');
+  {
+    await mutate(R, '::actor::qa_init_caps', { advertise: ['core.receipts.receive'] });  // emit dropped
+    const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc6-silent' });
+    await sleep(2500);
+    ok(/rc6-silent/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()), 'RC6: message still delivered');
+    ok(rcount(I) === c0, 'RC6: no receipt after the emitter toggled off');
+  }
+
+  CUR = 'RC7 forward-compat + tolerance';
+  console.log('\n=== RC7 unknown kind + malformed shape are ignored (never load-bearing) ===');
+  {
+    const c0 = rcount(I); const rejI = I.rejects.length;
+    await mutate(R, '::actor::qa_send_raw_receipt', { target: I.cid, kind: 'typing', wire_ids: [rcWid] });
+    await sleep(2000);
+    await mutate(R, '::actor::qa_send_raw_receipt', { target: I.cid, kind: 42, wire_ids: [rcWid] });
+    await sleep(2000);
+    await mutate(R, '::actor::qa_send_raw_receipt', { target: I.cid, kind: 'delivered', wire_ids: 'not-a-list' });
+    await sleep(2000);
+    ok(rcount(I) === c0, 'RC7: unknown kind / mistyped kind / scalar wire_ids — nothing reached the hook');
+    ok(I.rejects.length === rejI, 'RC7: and nothing aborted (ignore-success, forward-compat)');
+  }
+
+  CUR = 'RC8 stale-caps self-heal';
+  console.log('\n=== RC8 hybrid gate: stale caps + learned pv>=7 → receipts fire (the upgrade fix) ===');
+  {
+    await mutate(R, '::actor::qa_init_caps', { advertise: ['core.receipts.emit', 'core.receipts.receive'] });
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: ['core.notifications'] });  // stale pre-receipts caps (no opinion)
+    await mutate(R, '::actor::qa_set_contact_pv', { cid: I.cid, pv: 7 });
+    const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc8-selfheal' });
+    await sleep(3000);
+    ok(rcount(I) === c0 + 1, 'RC8: delivered receipt fired despite stale caps (pv>=7 implied receive)');
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 7 });
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: R.cid }).Reduce('state').Visualize() === 'expected',
+      'RC8: expectation = expected via pv>=7 (caps silent)');
+  }
+
+  CUR = 'RC9 explicit opt-out';
+  console.log('\n=== RC9 hybrid gate: caps WITH receipts opinion but no receive → strict opt-out ===');
+  {
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: ['core.receipts.emit'] });  // opinion, no receive
+    await mutate(R, '::actor::qa_set_contact_pv', { cid: I.cid, pv: 7 });
+    const c0 = rcount(I);
+    await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'rc9-optout' });
+    await sleep(2500);
+    ok(rcount(I) === c0, 'RC9: NO receipt — explicit caps opinion without receive wins over pv (opt-out respected)');
+  }
+
+  CUR = 'RC10 old peer stays silent';
+  console.log('\n=== RC10 hybrid gate: no caps opinion + pv 5 (old peer) → silent ===');
+  {
+    await mutate(R, '::actor::qa_set_contact_caps', { cid: I.cid, caps: [] });
+    const c0 = rcount(I);
+    // the OLD peer's message must itself carry the old dialect: the receiver
+    // learns pv from THIS message before gating (that's the self-heal), so a
+    // current-build send_message (stamps 7) cannot emulate a pv-5 peer.
+    await mutate(I, '::actor::qa_send_stamped_message', { target: R.cid, text: 'rc10-oldpeer', pv: 5, wire_id: 'rc10-w1' });
+    await sleep(2500);
+    ok(rcount(I) === c0, 'RC10: NO receipt toward a pv-5 peer (old clients stay silent, zero noise)');
+    await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: [] });
+    await mutate(I, '::actor::qa_set_contact_pv', { cid: R.cid, pv: 5 });
+    ok(ro(I, '::actor::qa_receipt_expectation', { cid: R.cid }).Reduce('state').Visualize() === 'unknown',
+      'RC10: expectation = unknown toward a pv-5 peer');
   }
 
   console.log('\n================ SCORECARD ================');

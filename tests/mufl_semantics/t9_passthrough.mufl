@@ -1,0 +1,19 @@
+// Disjunction result identity: pass-through (same value) or rebuilt?
+script
+{
+    metadef sir_v0_t: ($invite_id -> str, $data -> str).
+    metadef sir_v1_t: ($invite_id -> str, $data -> str, $name -> str, $pv -> int).
+    metadef union_t: sir_v1_t || sir_v0_t.
+    fn probe (v: any) -> str {
+        u = v SAFE(union_t).
+        return (_value_id u == _value_id v ?? "pass-through (same value_id)" ; "rebuilt").
+    }
+    np = ($invite_id -> "I2", $data -> "D", $name -> "Alice", $pv -> 1, $future -> "F").
+    _print "disjunction cast: " (probe np) "\n".
+    fn probe2 (v: any) -> str {
+        u = v SAFE(union_t).
+        f = (u as any) $future.
+        return (f == NIL ?? "future field LOST" ; "future field kept").
+    }
+    _print "unknown extra across union: " (probe2 np) "\n".
+}

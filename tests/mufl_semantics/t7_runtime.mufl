@@ -1,0 +1,30 @@
+// Runtime (any-typed) behavior: stripping, disjunction ordering, union param check
+script
+{
+    metadef small_t: ($a -> int, $b -> str).
+    metadef sir_v0_t: ($invite_id -> str, $data -> str).
+    metadef sir_v1_t: ($invite_id -> str, $data -> str, $name -> str, $pv -> int).
+    metadef old_first_t: sir_v0_t || sir_v1_t.
+    metadef new_first_t: sir_v1_t || sir_v0_t.
+
+    fn strip_probe (v: any) -> str {
+        w = v SAFE(small_t).
+        c = (w as any) $c.
+        return (c == NIL ?? "stripped" ; "kept").
+    }
+    fn old_first_probe (v: any) -> str {
+        u = v SAFE(old_first_t).
+        n = (u as any) $name.
+        return (n == NIL ?? "name LOST" ; "name kept").
+    }
+    fn new_first_probe (v: any) -> str {
+        u = v SAFE(new_first_t).
+        n = (u as any) $name.
+        return (n == NIL ?? "name LOST" ; "name kept").
+    }
+
+    _print "runtime extra-field: " (strip_probe ($a -> 1, $b -> "x", $c -> "EXTRA")) "\n".
+    np = ($invite_id -> "I2", $data -> "D", $name -> "Alice", $pv -> 1).
+    _print "runtime old-first:   " (old_first_probe np) "\n".
+    _print "runtime new-first:   " (new_first_probe np) "\n".
+}

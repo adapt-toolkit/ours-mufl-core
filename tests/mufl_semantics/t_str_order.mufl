@@ -1,0 +1,19 @@
+// Language-semantics pin: MUFL string '<' is a STRICT TOTAL ORDER.
+// The 0.9.0 migration election (a2a_messaging::str_lt / mig_initiator) rests on this:
+// side A computes myCid < peerCid, side B computes peerCid < myCid; for exactly one
+// proposer to be elected, '<' must be irreflexive + antisymmetric + a total order over
+// the hex container-id space. If the vendored toolchain ever regressed string '<' to a
+// non-order, the election would split-brain (both or neither propose). This fails BEFORE
+// the behavioral suite so that never ships silently.
+script
+{
+    _print "irreflexive: " (("a" < "a") ?? "T" ; "F") "\n".       // F — nothing is < itself
+    _print "lt: "          (("a" < "b") ?? "T" ; "F") "\n".       // T
+    _print "antisym: "     (("b" < "a") ?? "T" ; "F") "\n".       // F — a<b implies not b<a
+    _print "prefix1: "     (("a" < "ab") ?? "T" ; "F") "\n".      // T — proper prefix is smaller
+    _print "prefix2: "     (("ab" < "b") ?? "T" ; "F") "\n".      // T
+    // Equal-length hex — the actual container-id case (cids are fixed-length hex):
+    _print "hexlt: "       (("0a1f" < "0a20") ?? "T" ; "F") "\n". // T
+    _print "hexeq: "       (("deadbeef" < "deadbeef") ?? "T" ; "F") "\n". // F — irreflexive on hex too
+    _print "hexgt: "       (("ff" < "00") ?? "T" ; "F") "\n".     // F
+}

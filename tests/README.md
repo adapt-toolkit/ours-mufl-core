@@ -18,6 +18,13 @@ source is vendored** — the actor is derived locally for this repo.
   runs the scenarios, asserting **receiver-side state** (not just send emission).
 - **`run.sh`** — builds a throwaway harness, compiles, boots a local broker, runs
   the driver. Exit 0 = all green.
+- **`corpus.mjs` / `run_corpus.sh`** — the **golden-wire corpus gate**
+  (`COMPATIBILITY.md`): replays one fixture per registered wire version per
+  registry through the `a2a_versions` dispatch and asserts the branch taken.
+  Fast (single packet); a release is green only if this passes.
+- **`mufl_semantics/run.sh`** — toolchain-behavior pins the registry rests on
+  (safe-cast extra-field strip, disjunction canonical-order rebuild, 3-version
+  dispatch), run against the vendored `@adapt-toolkit/mufl` package.
 
 ## Prerequisites (external to this repo)
 
@@ -64,3 +71,13 @@ Hard invariants exercised: **INV-5** (no `contacts`/`peer_ads`/`contact_roots`
 write before lookup → decrypt → cid-bind → PoP → chain) on both legs; **single-use**
 consumes both per-side ephemeral stores; **INV-4** (ephemeral secrets never
 exported).
+
+The R- and N-series (contact restore, notifications v1/v2) and the 0.5.0
+**V-series** follow the same pattern. V-series (versioned type registry,
+`COMPATIBILITY.md`): V1 the exact 0.2.0 leg-1 shape (no `$name` — the incident)
+registers under the sender cid with **no abort**; V2 the 0.3.0 shape honors
+`$name`; V3 the v5 shape learns `contact_pv`/`contact_caps`; V4 a below-floor
+peer (`$pv=1`) produces the **error-as-data** `$protocol_error` notify at the
+inviter, consumes **nothing**, and the same invite redeems after the peer
+"updates"; V5 the CAP-1 capability gate denies as data only on positive
+evidence; V6 stamped `$targ`s deliver normally and are learned passively.

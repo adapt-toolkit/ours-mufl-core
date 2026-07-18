@@ -29,6 +29,7 @@ library a2a_capabilities loads libraries
     cap_configuration = "core.configuration".
     cap_monitoring    = "core.monitoring".
     cap_connect       = "core.connect".
+    cap_notifications = "core.notifications". // NaaS node surface (a2a_notifications.mm; NOTIFICATIONS_CONTRACT.md) — reserved id, no control verbs in v1.
     // core.cluster (core 2.3): promotes cluster/subagent management from private
     // a2a_messaging plumbing to a FIRST-CLASS, app-reusable capability. It owns
     // child/subagent lifecycle, per-child monitoring authorization, the host-local
@@ -79,6 +80,29 @@ library a2a_capabilities loads libraries
     // child.create/child.remove. Benign for messenger (only bound roots show the
     // Cluster tab); a false-positive for capability-presence-keyed UIs.
     cap_cluster       = "core.cluster".
+    // core 0.7.0 — message receipts (delivery + read), the emit/receive split
+    // (COMPATIBILITY.md §receipts). PROTOCOL-surface ids with NO control verbs:
+    // they gate receipt traffic (fail-CLOSED on absent caps — emitting to a
+    // client that can't parse receipts is the incident class), never authz
+    // (REG-6). Delivery-vs-read is the wire $kind, not a capability split.
+    cap_receipts_emit    = "core.receipts.emit".    // "I WILL emit receipts (delivered on arrival, read on my get path)"
+    cap_receipts_receive = "core.receipts.receive". // "I consume receipts — send me yours"
+
+    // core 0.8.0 — end-to-end encryption (Olm double-ratchet signed-message
+    // envelope). PROTOCOL-surface id with NO control verbs (cf. core.notifications):
+    // "I speak the e2e_signed_message envelope and publish an AD v2 $e2e_bundle."
+    // Gates E2E traffic + drives monotonic anti-downgrade (a2a_messaging::e2e_route);
+    // never authz (REG-6). Crypto + session state live in the adapt `e2e` library.
+    cap_e2e = "core.e2e".
+
+    // core 0.9.0 — the per-connection E2E migration FSM (offer/ack/commit/confirm
+    // + exactly-once bilateral key rotation, a2a_messaging §5). PROTOCOL-surface
+    // id with NO control verbs, $advertise-carried: "I run the migration FSM."
+    // Gates offer emission (fail-closed + pv self-heal, spec §5.4); never authz
+    // (REG-6). SINGLE id, deliberately: migration has NO peer opt-out semantics —
+    // a peer that doesn't want it simply never advertises/answers and legacy
+    // continues untouched (so the receipts-style id PAIR is not needed here).
+    cap_e2e_migrate = "core.e2e.migrate".
 
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
@@ -162,6 +186,12 @@ library a2a_capabilities loads libraries
         // NIL until init wires it; dispatch FAIL-FASTS (abort) if a controller-class
         // verb is routed with this unset, so an app can never forget the gate.
         authorizer is (any -> bool)+ = NIL.
+        // The static capability-id list captured from init's $supported — the
+        // source for the 0.5.0 $caps wire piggyback (self_cap_ids below).
+        // DELIBERATELY not derived through describe(): that hook aborts when
+        // an app never wires capabilities, and the piggyback must degrade to
+        // "advertises nothing" there, never abort an invite/restore leg.
+        self_caps is str[] = [].
     }
 
     // FAIL-FAST: $supported is the static list of capability ids this app
@@ -177,17 +207,62 @@ library a2a_capabilities loads libraries
         // controller-class verbs (e.g. the connector: only core.configuration via
         // its own path) may omit it. If omitted, dispatch fail-fasts on the first
         // controller-class verb, so a cluster app MUST wire it.
-        $authorizer -> authorizer_cb: (any -> bool)+
+        $authorizer -> authorizer_cb: (any -> bool)+,
+        // core 0.7.0, OPTIONAL (absent from pre-0.7 callers): PROTOCOL-surface
+        // capability ids advertised on the wire piggyback WITHOUT control-verb
+        // handlers (e.g. core.receipts.*). $supported keeps its declared-implies-
+        // implemented handler guard; $advertise is for ids that gate peer
+        // traffic shaping only and never route through dispatch.
+        $advertise  -> advertise_list: str[]+
     ))
     {
         describe -> describe_cb.
         handlers -> handler_map.
         on_unknown -> fallback.
         if authorizer_cb != NIL { authorizer -> authorizer_cb. }
+        merged is str[] = [].
+        sc supported_caps -- ( -> cap) { merged (_count merged|) -> cap. }
+        if advertise_list != NIL
+        {
+            sc advertise_list? -- ( -> cap) { merged (_count merged|) -> cap. }
+        }
+        self_caps -> merged.
         sc supported_caps -- ( -> cap)
         {
             abort "Capability declared without a handler: " + cap when (handler_map cap) == NIL.
         }
+    }
+
+    // Does THIS node advertise `cap` on the wire piggyback ($supported ∪
+    // $advertise, captured at init)? Empty/uninited apps advertise nothing —
+    // degrade, never abort (the self_cap_ids contract).
+    fn self_advertises (cap: str) -> bool
+    {
+        found is bool = FALSE.
+        sc self_caps -- ( -> c)
+        {
+            if c == cap { found -> TRUE. break. }
+        }
+        return found.
+    }
+
+    // The capability ids THIS node advertises on the 0.5.0 wire piggyback
+    // ($caps in the invite/restore identity bundles, SPEC §4). Empty for an
+    // app that never ran init — degrade, never abort (CAP-1 spirit).
+    fn self_cap_ids (_) -> str[]
+    {
+        return self_caps.
+    }
+
+    // Append a PROTOCOL-surface ($advertise-class) capability id to the live self_caps at RUNTIME —
+    // e.g. enable migration mid-session (cap_e2e_migrate) WITHOUT a restart, so the existing e2e
+    // session is preserved (a restart re-keys the Olm ratchet). Idempotent (no duplicate). The next
+    // outbound message's self_cap_ids piggyback carries it, so the peer re-learns and its
+    // mig_should_trigger fires. Intended for $advertise-class ids (traffic-shaping, no control verb) —
+    // NOT $supported ids (those require a wired handler, still enforced at init).
+    fn add_self_cap (cap: str) -> nil
+    {
+        if (self_advertises cap) != TRUE { self_caps (_count self_caps|) -> cap. }
     }
 
     // ---- manifest helpers -------------------------------------------------
