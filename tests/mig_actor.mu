@@ -246,6 +246,19 @@ application actor loads libraries
     }
     trn readonly qa_mig_should_trigger _:($cid -> cid: global_id) { return ($fire -> (a2a_messaging::mig_should_trigger cid)). }
 
+    // core 0.10 born-DR probe/override. A pair established through a real invite handshake presents a
+    // v2 (bundle-carrying) AD, so core marks it born-DR (contact_born_dr=TRUE) — correctly INELIGIBLE
+    // for migration (B2 invariant). qa_mig_born_dr reads that marker; qa_mig_clear_born_dr deletes it,
+    // turning the just-handshaked pair into a genuinely PRE-EXISTING LEGACY session (as if it had been
+    // registered from a v1 AD before DR) so the proactive-trigger paths (advertise_migrate / sweep) can
+    // be exercised end-to-end against a legacy pair. No crypto state touched — only the eligibility flag.
+    trn readonly qa_mig_born_dr _:($cid -> cid: global_id) { return ($born_dr -> ((a2a_messaging::contact_born_dr cid) == TRUE)). }
+    trn qa_mig_clear_born_dr _:($cid -> cid: global_id)
+    {
+        delete a2a_messaging::contact_born_dr cid.
+        return transaction::success [ _return_data ($born_dr -> ((a2a_messaging::contact_born_dr cid) == TRUE)) ].
+    }
+
     // §5.6 sweep test helpers. Force an `offered` FSM entry (real snapshot, via mig_offer_actions —
     // discard the send) so the sweep has something to re-drive; and set $attempts to exercise the cap.
     trn qa_mig_force_offered _:($cid -> cid: global_id)

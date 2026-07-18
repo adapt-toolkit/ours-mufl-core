@@ -589,8 +589,13 @@ async function main() {
   // sweep as the idle reconciler); D (inbound e2e) lives in migapp.mjs (needs the live-session harness).
   // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-  // ── (B) NATURAL trigger via advertise_migrate → proactive offer to the eligible e2e contact → ACTIVE.
-  console.log('=== mig: ★ NATURAL trigger (B) — advertise_migrate proactively offers an eligible e2e contact → ACTIVE ===');
+  // ── (B) NATURAL trigger via advertise_migrate → proactive offer to the eligible LEGACY e2e contact → ACTIVE.
+  //    core 0.10 (B2): a pair established through a real invite handshake presents a v2 bundle-carrying AD →
+  //    core marks it BORN-DR → migration is reserved STRICTLY for pre-existing legacy sessions, so a born-DR
+  //    pair MUST NOT get a proactive offer. This row asserts BOTH: (i) born-DR no-op (advertise offers 0), and
+  //    (ii) after we demote the pair to LEGACY (clear the born-DR flag — as if it had registered from a v1 AD),
+  //    advertise_migrate DOES proactively offer it and drives BOTH sides to ACTIVE + epoch-pin.
+  console.log('=== mig: ★ NATURAL trigger (B) — advertise_migrate proactively offers an eligible LEGACY e2e contact → ACTIVE; born-DR pair is a no-op (B2) ===');
   { const NI = await mkNode('mig-gate-NI', 'NI');
     const NR = await mkNode('mig-gate-NR', 'NR'); await sleep(1000);
     const inv = await mutate(NI, '::a2a_messaging::generate_invite', { name: 'NR' });
@@ -601,18 +606,25 @@ async function main() {
     // but NO plaintext app traffic ever flows — so the legacy plaintext trigger can never fire.
     await mutate(lo, '::actor::qa_learn_peer', { cid: hi.cid, pv: 9, caps: [CAP] });
     ok(!T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), 'B-path setup: no migration exists before advertise_migrate (the gap: this pair never auto-triggered)');
-    const amr = await mutate(lo, '::a2a_messaging::advertise_migrate', {});   // THE natural trigger (real production tx)
-    ok(T(amr.Reduce('advertising').Visualize()) && amr.Reduce('offers_initiated').Visualize() === '1', '★ B-path: advertise_migrate enabled the cap AND proactively offered the 1 eligible e2e contact (mig_offer_eligible_actions)');
+    // (B2 INVARIANT) the handshake made this pair BORN-DR → advertise_migrate must offer NOTHING.
+    ok(T(ro(lo, '::actor::qa_mig_born_dr', { cid: hi.cid }).Reduce('born_dr').Visualize()), 'B-path(B2): the invite handshake marked the pair BORN-DR (v2 AD at first contact)');
+    const amrBorn = await mutate(lo, '::a2a_messaging::advertise_migrate', {});   // enable the cap while still born-DR
+    ok(T(amrBorn.Reduce('advertising').Visualize()) && amrBorn.Reduce('offers_initiated').Visualize() === '0', '★ B-path(B2): advertise_migrate enabled the cap but proactively offered NOTHING to the born-DR pair (migration reserved for legacy)');
+    ok(!T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), 'B-path(B2): no migration was created for the born-DR contact');
+    // Demote to a genuinely PRE-EXISTING LEGACY session (v1-AD-era contact), then re-run the proactive trigger.
+    await mutate(lo, '::actor::qa_mig_clear_born_dr', { cid: hi.cid });
+    const amr = await mutate(lo, '::a2a_messaging::advertise_migrate', {});   // idempotent cap-add; re-scans → now offers the legacy pair
+    ok(T(amr.Reduce('advertising').Visualize()) && amr.Reduce('offers_initiated').Visualize() === '1', '★ B-path: advertise_migrate proactively offered the 1 eligible LEGACY e2e contact (mig_offer_eligible_actions)');
     await sleep(10000);   // offer → ack → commit → confirm over the broker
     const lSt = ro(lo, '::actor::qa_mig_state', { cid: hi.cid }), hSt = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
     console.log(`  DIAG B init=${lSt.Reduce('phase').Visualize()} resp=${hSt.Reduce('phase').Visualize()}`);
-    ok(lSt.Reduce('phase').Visualize() === 'active', '★ B-path: advertise_migrate proactive offer drove the initiator to ACTIVE (already-e2e pair, no manual trigger)');
+    ok(lSt.Reduce('phase').Visualize() === 'active', '★ B-path: advertise_migrate proactive offer drove the initiator to ACTIVE (legacy e2e pair, no manual trigger)');
     ok(hSt.Reduce('phase').Visualize() === 'active', '★ B-path: responder reached ACTIVE (real advertise/receive handshake, not qa_mig_trigger_offer)');
     ok(T(ro(lo, '::actor::qa_mig_pin', { cid: hi.cid }).Reduce('pinned').Visualize()) && T(ro(hi, '::actor::qa_mig_pin', { cid: lo.cid }).Reduce('pinned').Visualize()), 'B-path: contact_e2e_epoch pinned BOTH sides (the rotation landed)'); }
 
   // ── (C) NATURAL trigger via the SWEEP as the idle reconciler: default-cap boot + a pre-existing eligible
   //    e2e contact + NO inbound traffic → the sweep INITIATES the migration (MR2 ruling). + dormancy + idempotency.
-  console.log('=== mig: ★ NATURAL trigger (C) — sweep_e2e_migrations INITIATES for an idle eligible contact → ACTIVE ===');
+  console.log('=== mig: ★ NATURAL trigger (C) — sweep_e2e_migrations INITIATES for an idle eligible LEGACY contact → ACTIVE; born-DR pair is a no-op (B2) ===');
   { const CS = await mkNode('mig-gate-CS', 'CS');
     const CR = await mkNode('mig-gate-CR', 'CR'); await sleep(1000);
     const inv = await mutate(CS, '::a2a_messaging::generate_invite', { name: 'CR' });
@@ -624,8 +636,14 @@ async function main() {
     const sweep0 = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});
     ok(sweep0.Reduce('initiated').Visualize() === '0' && !T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), 'C-path DORMANCY: sweep initiates nothing before cap_e2e_migrate is advertised (pre-Phase-F it is inert) — no migration created');
     await mutate(lo, '::actor::qa_init_caps', { advertise: [CAP] });   // default-cap boot state (no restart-offer)
+    // (B2 INVARIANT) the invite handshake made this pair BORN-DR → even with the cap advertised the sweep is a no-op.
+    ok(T(ro(lo, '::actor::qa_mig_born_dr', { cid: hi.cid }).Reduce('born_dr').Visualize()), 'C-path(B2): the invite handshake marked the pair BORN-DR (v2 AD at first contact)');
+    const sweepBorn = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});
+    ok(sweepBorn.Reduce('initiated').Visualize() === '0' && !T(ro(lo, '::actor::qa_mig_state', { cid: hi.cid }).Reduce('present').Visualize()), '★ C-path(B2): sweep INITIATES NOTHING for the born-DR pair even with the cap advertised (migration reserved for legacy)');
+    // Demote to a genuinely PRE-EXISTING LEGACY session (v1-AD-era contact), then re-run the sweep reconciler.
+    await mutate(lo, '::actor::qa_mig_clear_born_dr', { cid: hi.cid });
     const sweep1 = await mutate(lo, '::a2a_messaging::sweep_e2e_migrations', {});   // THE natural trigger
-    ok(sweep1.Reduce('initiated').Visualize() === '1', '★ C-path: sweep INITIATED 1 migration for the idle eligible pre-existing e2e contact (proactive offer — the default-cap-boot reconciler)');
+    ok(sweep1.Reduce('initiated').Visualize() === '1', '★ C-path: sweep INITIATED 1 migration for the idle eligible pre-existing LEGACY e2e contact (proactive offer — the default-cap-boot reconciler)');
     await sleep(10000);
     const lSt = ro(lo, '::actor::qa_mig_state', { cid: hi.cid }), hSt = ro(hi, '::actor::qa_mig_state', { cid: lo.cid });
     console.log(`  DIAG C init=${lSt.Reduce('phase').Visualize()} resp=${hSt.Reduce('phase').Visualize()}`);
