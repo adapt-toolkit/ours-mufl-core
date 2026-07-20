@@ -1,13 +1,10 @@
 #!/usr/bin/env node
-// Cross-version matrix orchestrator: spawns one OLD-runtime peer and one NEW-runtime peer
+// Cross-version matrix orchestrator: spawns OLD-runtime and NEW-runtime peers
 // (compat_peer.mjs each, separate processes, own node_modules + own unit — see README),
 // then drives the M-legs against the pair. Scorecard semantics: an MP leg failing (or not
 // implemented) exits non-zero; NTH legs report but never gate. No leg ever silently skips.
-//
-// Verb maps are per-era DATA. The OLD map targets the v0.2.0 test actor surface and must
-// be validated when the OLD toolchain is first staged — a wrong verb fails loudly
-// (transaction failure / timeout), which is the intended behavior, not a hazard.
 import { spawn } from 'node:child_process';
+import { openSync as fsOpenSync } from 'node:fs';
 import * as readline from 'node:readline';
 import { resolve } from 'node:path';
 
@@ -16,24 +13,18 @@ const NEW_DIR = process.env.NEW_BUILD_DIR;
 const BROKER_URL = process.env.BROKER_URL || 'ws://127.0.0.1:9797';
 if (!OLD_DIR || !NEW_DIR) { console.error('OLD_BUILD_DIR / NEW_BUILD_DIR required'); process.exit(2); }
 
-const VERBS = {
-  old: { invite: '::a2a_messaging::generate_invite', redeem: '::a2a_messaging::add_contact',
-         send: '::a2a_messaging::send_message', sendFile: '::a2a_messaging::send_file',
-         contacts: '::a2a_messaging::list_contacts', inbox: '::actor::get_messages', files: '::actor::get_files' },
-  new: { invite: '::a2a_messaging::generate_invite', redeem: '::a2a_messaging::add_contact',
-         send: '::a2a_messaging::send_message', sendFile: '::a2a_messaging::send_file',
-         contacts: '::a2a_messaging::list_contacts', inbox: '::actor::get_messages', files: '::actor::get_files' },
-};
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let nextId = 1;
 
-function spawnPeer(dir, name, era, extraEnv = {}) {
+function spawnPeer(dir, name, extraEnv = {}) {
+  // stderr goes to a per-peer log — handshake rejects surface there, and
+  // discarding it turned real compat failures into blind timeouts.
+  const errLog = fsOpenSync(resolve(dir, `${name}.stderr.log`), 'a');
   const child = spawn(process.execPath, [resolve(dir, 'compat_peer.mjs')], {
-    cwd: dir, stdio: ['pipe', 'pipe', 'inherit'],
+    cwd: dir, stdio: ['pipe', 'pipe', errLog],
     env: { ...process.env, BROKER_URL, PEER_NAME: name, PEER_SEED: `compat ${name} seed`, ...extraEnv },
   });
-  const peer = { name, era, verbs: VERBS[era], child, cid: '', events: [], waiters: new Map(), readyP: null };
+  const peer = { name, dir, child, cid: '', events: [], waiters: new Map(), readyP: null };
   const rl = readline.createInterface({ input: child.stdout });
   let readyResolve; peer.readyP = new Promise((r) => { readyResolve = r; });
   rl.on('line', (line) => {
@@ -54,59 +45,142 @@ function call(peer, op, fields = {}) {
     peer.child.stdin.write(JSON.stringify({ id, op, ...fields }) + '\n');
   });
 }
-const tx = (peer, verb, arg, readonly = false) => call(peer, 'tx', { verb, arg, readonly });
+
+// ---- shared drive helpers --------------------------------------------------
+async function contactsInclude(peer, cid, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const contacts = String(await call(peer, 'contacts').catch(() => ''));
+    if (contacts.includes(cid)) return true;
+    if (Date.now() > deadline) return false;
+    await sleep(1500);
+  }
+}
+async function pair(inviter, redeemer) {
+  const inviteB64 = await call(inviter, 'invite', { name: redeemer.name });
+  await call(redeemer, 'redeem', { invite_b64: inviteB64, name: inviter.name });
+  // Handshake is multi-leg and cross-runtime — poll until BOTH sides list the
+  // peer instead of guessing a sleep. A timeout here is a real M1 verdict.
+  const a = await contactsInclude(inviter, redeemer.cid);
+  const b = await contactsInclude(redeemer, inviter.cid);
+  if (!a || !b) throw new Error(`pairing incomplete after 30s (inviter-sees=${a} redeemer-sees=${b})`);
+}
+async function roundTrip(from, to, text, expectRoute) {
+  const sent = await call(from, 'send', { cid: to.cid, text });
+  if (expectRoute && sent?.route !== expectRoute) {
+    throw new Error(`route mismatch: expected ${expectRoute}, got ${sent?.route} for "${text}"`);
+  }
+  await sleep(2500);
+  const inbox = await call(to, 'inbox');
+  if (!String(inbox).includes(text)) throw new Error(`message not delivered: "${text}"`);
+  return sent;
+}
 
 // ---- legs ------------------------------------------------------------------
-// Each leg: { id, gate: 'MP'|'NTH', dod, run(ctx) } — run throws on failure.
-// ctx = { oldPeer, newPeer, respawn(peerRef, withState) }.
-async function pair(a, b) {
-  const inv = await tx(a, a.verbs.invite, { name: b.name });
-  await tx(b, b.verbs.redeem, { invite: inv, name: a.name });
-  await sleep(1500);
-  const ca = await tx(a, a.verbs.contacts, undefined, true);
-  const cb = await tx(b, b.verbs.contacts, undefined, true);
-  if (!String(ca).includes(b.name) && !String(cb).includes(a.name)) throw new Error('pairing not reflected in contacts');
-}
-async function roundTrip(a, b, text) {
-  await tx(a, a.verbs.send, { contact: b.name, text });
-  await sleep(1500);
-  const inbox = await tx(b, b.verbs.inbox, undefined, false);
-  if (!String(inbox).includes(text)) throw new Error(`message not delivered: "${text}"`);
-}
-
 const LEGS = [
   { id: 'M1', gate: 'MP', dod: 'D1', name: 'invite gen→redeem, both directions',
-    run: async ({ oldPeer, newPeer }) => { await pair(oldPeer, newPeer); } },
-  { id: 'M2', gate: 'MP', dod: 'D1', name: 'first-contact message after redeem',
-    run: async ({ oldPeer, newPeer }) => { await roundTrip(newPeer, oldPeer, 'first-contact new→old'); } },
+    run: async (ctx) => {
+      await pair(ctx.oldPeer, ctx.newPeer); // OLD invites, NEW redeems (primary pair, reused by later legs)
+      // Reverse direction on a fresh throwaway pair: NEW invites, OLD redeems.
+      const old2 = spawnPeer(OLD_DIR, 'old2', { PEER_SEED: 'compat old2 seed' });
+      const new2 = spawnPeer(NEW_DIR, 'new2', { PEER_SEED: 'compat new2 seed' });
+      try {
+        await old2.readyP; await new2.readyP;
+        if (!old2.cid || !new2.cid) throw new Error('reverse-pair peers failed to boot');
+        await pair(new2, old2);
+        await roundTrip(new2, old2, 'reverse-pair first-contact new2→old2');
+      } finally {
+        await call(old2, 'exit').catch(() => {}); await call(new2, 'exit').catch(() => {});
+      } } },
+  { id: 'M2', gate: 'MP', dod: 'D1', name: 'first-contact message after redeem (new→old)',
+    run: async (ctx) => { await roundTrip(ctx.newPeer, ctx.oldPeer, 'first-contact new->old'); } },
   { id: 'M3', gate: 'MP', dod: 'D1', name: 'steady-state send/receive both ways',
-    run: async ({ oldPeer, newPeer }) => {
-      await roundTrip(oldPeer, newPeer, 'steady old→new'); await roundTrip(newPeer, oldPeer, 'steady new→old'); } },
+    run: async (ctx) => {
+      await roundTrip(ctx.oldPeer, ctx.newPeer, 'steady old->new');
+      await roundTrip(ctx.newPeer, ctx.oldPeer, 'steady new->old'); } },
   { id: 'M4', gate: 'MP', dod: 'D1', name: 'file transfer both ways',
-    run: async ({ oldPeer, newPeer }) => {
-      const data = Buffer.from('compat file payload').toString('base64');
-      await tx(oldPeer, oldPeer.verbs.sendFile, { contact: newPeer.name, filename: 'a.txt', data });
-      await tx(newPeer, newPeer.verbs.sendFile, { contact: oldPeer.name, filename: 'b.txt', data });
-      await sleep(2000);
-      const fa = await tx(newPeer, newPeer.verbs.files, undefined, false);
-      const fb = await tx(oldPeer, oldPeer.verbs.files, undefined, false);
-      if (!String(fa).includes('a.txt') || !String(fb).includes('b.txt')) throw new Error('file not received'); } },
+    run: async (ctx) => {
+      const data_b64 = Buffer.from('compat file payload').toString('base64');
+      await call(ctx.oldPeer, 'send_file', { cid: ctx.newPeer.cid, filename: 'from-old.txt', data_b64 });
+      await call(ctx.newPeer, 'send_file', { cid: ctx.oldPeer.cid, filename: 'from-new.txt', data_b64 });
+      await sleep(3000);
+      const fNew = String(await call(ctx.newPeer, 'files'));
+      const fOld = String(await call(ctx.oldPeer, 'files'));
+      if (!fNew.includes('from-old.txt')) throw new Error('old→new file not received');
+      if (!fOld.includes('from-new.txt')) throw new Error('new→old file not received'); } },
   { id: 'M5', gate: 'MP', dod: 'D1,D2', name: 'OLD restart: v0-blob export→reimport, channel resumes',
     run: async (ctx) => {
       await call(ctx.oldPeer, 'export_state', { file: resolve(OLD_DIR, 'state.bin') });
       await ctx.respawn('oldPeer', true);
-      await roundTrip(ctx.newPeer, ctx.oldPeer, 'post-old-restart new→old'); } },
+      await roundTrip(ctx.newPeer, ctx.oldPeer, 'post-old-restart new->old'); } },
   { id: 'M6', gate: 'MP', dod: 'D1,D2', name: 'NEW restart: stamped blob + DR-session restore',
     run: async (ctx) => {
       await call(ctx.newPeer, 'export_state', { file: resolve(NEW_DIR, 'state.bin') });
       await ctx.respawn('newPeer', true);
-      await roundTrip(ctx.oldPeer, ctx.newPeer, 'post-new-restart old→new'); } },
+      await roundTrip(ctx.oldPeer, ctx.newPeer, 'post-new-restart old->new'); } },
   { id: 'M7', gate: 'MP', dod: 'D1', name: 'NEW↔NEW DR handshake + ratchet + dual restart',
-    run: async () => { throw new Error('NOT IMPLEMENTED — needs a second NEW peer (config-only once M1–M6 are green)'); } },
+    run: async () => {
+      const A = spawnPeer(NEW_DIR, 'newA', { PEER_SEED: 'compat newA seed' });
+      const B = spawnPeer(NEW_DIR, 'newB', { PEER_SEED: 'compat newB seed' });
+      try {
+        await A.readyP; await B.readyP;
+        if (!A.cid || !B.cid) throw new Error('M7 peers failed to boot');
+        const CAPS = { advertise: ['core.e2e', 'core.e2e.migrate'] };
+        await call(A, 'tx', { verb: '::actor::qa_init_caps', targ: CAPS });
+        await call(B, 'tx', { verb: '::actor::qa_init_caps', targ: CAPS });
+        await pair(A, B);
+        // Drive migration sweeps until the route flips to the double ratchet.
+        let route = '';
+        const deadline = Date.now() + 45000;
+        for (let i = 1; Date.now() < deadline && route !== 'e2e'; i++) {
+          await call(A, 'tx', { verb: '::a2a_messaging::sweep_e2e_migrations', targ: {} }).catch(() => {});
+          await call(B, 'tx', { verb: '::a2a_messaging::sweep_e2e_migrations', targ: {} }).catch(() => {});
+          await sleep(2000);
+          route = (await roundTrip(A, B, `dr-probe-${i}`))?.route ?? '';
+        }
+        if (route !== 'e2e') throw new Error(`route never reached e2e (last: ${route || 'legacy'})`);
+        // Ratchet advance both directions on the live session.
+        await roundTrip(A, B, 'dr-ratchet-a1', 'e2e');
+        await roundTrip(B, A, 'dr-ratchet-b1', 'e2e');
+        await roundTrip(A, B, 'dr-ratchet-a2', 'e2e');
+        // Dual restart with state — DR sessions must survive on BOTH ends.
+        await call(A, 'export_state', { file: resolve(NEW_DIR, 'stateA.bin') });
+        await call(B, 'export_state', { file: resolve(NEW_DIR, 'stateB.bin') });
+        await call(A, 'exit').catch(() => {}); await call(B, 'exit').catch(() => {});
+        await sleep(1000);
+        const A2 = spawnPeer(NEW_DIR, 'newA', { PEER_SEED: 'compat newA seed', PEER_STATE_FILE: resolve(NEW_DIR, 'stateA.bin') });
+        const B2 = spawnPeer(NEW_DIR, 'newB', { PEER_SEED: 'compat newB seed', PEER_STATE_FILE: resolve(NEW_DIR, 'stateB.bin') });
+        try {
+          await A2.readyP; await B2.readyP;
+          if (!A2.cid || !B2.cid) throw new Error('M7 respawn failed');
+          await sleep(2000);
+          await roundTrip(A2, B2, 'dr-post-restart-a');
+          await roundTrip(B2, A2, 'dr-post-restart-b');
+        } finally {
+          await call(A2, 'exit').catch(() => {}); await call(B2, 'exit').catch(() => {});
+        }
+      } finally {
+        await call(A, 'exit').catch(() => {}); await call(B, 'exit').catch(() => {});
+      } } },
   { id: 'M8', gate: 'NTH', dod: 'D2', name: 'stale-snapshot restore → self-heal',
     run: async () => { throw new Error('NOT IMPLEMENTED'); } },
-  { id: 'M9', gate: 'MP', dod: 'D2', name: 'corrupt blob import reject-to-empty (NEW)',
-    run: async () => { throw new Error('NOT IMPLEMENTED'); } },
+  { id: 'M9', gate: 'MP', dod: 'D2', name: 'corrupt blob import reject-to-functional (NEW)',
+    run: async (ctx) => {
+      await call(ctx.newPeer, 'export_state', { file: resolve(NEW_DIR, 'state.bin') });
+      const { readFileSync, writeFileSync } = await import('node:fs');
+      const good = readFileSync(resolve(NEW_DIR, 'state.bin'));
+      writeFileSync(resolve(NEW_DIR, 'state.bin'), good.subarray(0, Math.floor(good.length / 2)));
+      await ctx.respawn('newPeer', true);
+      const failed = ctx.newPeer.events.some((e) => String(e).startsWith('import_failed'));
+      if (!failed) throw new Error('corrupt blob did not surface import_failed');
+      // Reject-to-FUNCTIONAL: the fresh identity must still pair + message.
+      const inviteB64 = await call(ctx.oldPeer, 'invite', { name: 'renew' });
+      await call(ctx.newPeer, 'redeem', { invite_b64: inviteB64, name: 'oldpeer-again' });
+      const seen = await contactsInclude(ctx.newPeer, ctx.oldPeer.cid);
+      if (!seen) throw new Error('post-corruption re-pairing failed');
+      // Restore the good blob so later runs/legs are unaffected.
+      writeFileSync(resolve(NEW_DIR, 'state.bin'), good);
+    } },
   { id: 'M10', gate: 'NTH', dod: 'D1', name: 'version_error_t as data',
     run: async () => { throw new Error('NOT IMPLEMENTED — assertion pattern in tests/test.mjs V-series'); } },
   { id: 'M11', gate: 'NTH', dod: 'D1', name: 'pv re-learning on peer downgrade',
@@ -115,21 +189,24 @@ const LEGS = [
 
 // ---- main ------------------------------------------------------------------
 const ctx = {
-  oldPeer: spawnPeer(OLD_DIR, 'oldpeer', 'old'),
-  newPeer: spawnPeer(NEW_DIR, 'newpeer', 'new'),
+  oldPeer: spawnPeer(OLD_DIR, 'oldpeer'),
+  newPeer: spawnPeer(NEW_DIR, 'newpeer'),
   async respawn(ref, withState) {
     const prev = ctx[ref];
     await call(prev, 'exit').catch(() => {});
-    await sleep(500);
+    await sleep(1000);
     const dir = ref === 'oldPeer' ? OLD_DIR : NEW_DIR;
-    ctx[ref] = spawnPeer(dir, prev.name, prev.era,
+    ctx[ref] = spawnPeer(dir, prev.name,
       withState ? { PEER_STATE_FILE: resolve(dir, 'state.bin') } : {});
     await ctx[ref].readyP;
+    if (!ctx[ref].cid) throw new Error(`${prev.name} failed to respawn`);
+    await sleep(2000);
   },
 };
 
 const results = [];
 await ctx.oldPeer.readyP; await ctx.newPeer.readyP;
+if (!ctx.oldPeer.cid || !ctx.newPeer.cid) { console.error('peer boot failed'); process.exit(1); }
 console.log(`peers up: old=${ctx.oldPeer.cid.slice(0, 10)} new=${ctx.newPeer.cid.slice(0, 10)}`);
 for (const leg of LEGS) {
   try { await leg.run(ctx); results.push({ leg, pass: true }); console.log(`  ✓ ${leg.id} [${leg.gate}/${leg.dod}] ${leg.name}`); }
@@ -137,5 +214,5 @@ for (const leg of LEGS) {
 }
 await call(ctx.oldPeer, 'exit').catch(() => {}); await call(ctx.newPeer, 'exit').catch(() => {});
 const mpFails = results.filter((r) => !r.pass && r.leg.gate === 'MP');
-console.log(`\n${results.filter((r) => r.pass).length}/${LEGS.length} legs passed; MP failures: ${mpFails.length}`);
+console.log(`\n${results.filter((r) => r.pass).length}/${LEGS.length} legs passed; MP failures: ${mpFails.length} (${mpFails.map((r) => r.leg.id).join(', ') || 'none'})`);
 process.exit(mpFails.length ? 1 : 0);
