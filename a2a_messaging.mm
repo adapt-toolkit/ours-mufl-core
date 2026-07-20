@@ -4223,7 +4223,11 @@ library a2a_messaging loads libraries
         // budget is deferred; the EXPORTED cursor resumes there next sweep, and a
         // sweep-txn abort rolls the cursor back so a retry covers the same segment.
         crypto_budget is int = redrive_sweep_max_entries.
-        action_budget is int = redrive_sweep_max_actions.
+        // Ship-review round-2 minor: reserve the fixed 2-action tail (_save_state +
+        // _return_data) up front so the emitted total NEVER exceeds
+        // redrive_sweep_max_actions — the no-save case uses only 1 of the 2 (the
+        // _return_data), which is slack, not overflow.
+        action_budget is int = redrive_sweep_max_actions - 2.
         resume_after is global_id+ = redrive_sweep_cursor.
         past_cursor is bool = (resume_after == NIL).
         last_done is global_id+ = NIL.
