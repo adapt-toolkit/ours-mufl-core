@@ -130,6 +130,11 @@ library a2a_messaging loads libraries
     // and a lost receipt. Repeats are harmless: the receiver's delivered_wire dedup
     // re-acks without re-depositing, and the re-ack clears our buffer.
     redrive_min_age_seconds = 120.
+    // Review #12: per-sweep re-encryption budget (entries, not contacts) — one txn
+    // re-driving 50×N contacts could hit fuel/action limits and lose the WHOLE sweep.
+    // A contact's queue is capped at unacked_cap (50) < this budget, so every contact
+    // is individually processable; overflow defers the remainder to the cursor.
+    redrive_sweep_max_entries = 100.
     // Data-at-rest bounds for the retained plaintext (review: a peer withholding
     // receipts must not pin our plaintext forever): total per-contact byte budget
     // (oldest dropped first; an entry alone above the budget is never retained),
@@ -145,6 +150,10 @@ library a2a_messaging loads libraries
     // served to one cid (see handle_e2e_rekey_request — requester-side rate-limit
     // alone does not bound a misbehaving authenticated contact).
     rekey_min_interval_seconds = 30.
+    // Review #9: the rekey_served attempts cap used to be PERMANENT (until restart) —
+    // a peer that legitimately needed >5 rotations over a long uptime was stalled
+    // forever. Entries older than this window are treated as expired: a fresh budget.
+    rekey_served_reset_seconds = 3600.
 
     // 6-digit bind ceremony limits (code is generated host-side — MUFL has no
     // random source — and handed to set_proxy_pending).
@@ -283,15 +292,28 @@ library a2a_messaging loads libraries
     metadef rekey_served_t: ($attempts -> int, $updated -> time).
     rekey_served is (global_id ->> rekey_served_t) = (,).
     rekey_served_max = 5.
-    // Recently DELIVERED inbound wire_ids per contact (ring, delivered_wire_cap) — the
-    // receive-side dedup for the at-least-once redrive: a re-delivered wire_id re-acks
-    // (delivered receipt, so the sender's buffer clears) but never re-deposits into the
-    // inbox. EXPORTED (tiny): the inbox it guards is persisted too, so the guard must
-    // survive the same restarts. Ring > unacked_cap so it always covers a full redrive.
-    delivered_wire is (global_id ->> str[]) = (,).
-    // Review: strictly larger than unacked_cap with headroom — an old wire_id must not
-    // evict from the ring before its (possibly receipt-lost, sweep-redriven) retry lands.
-    delivered_wire_cap = 256.
+    // Review #9: responder-side AD-response cooldown — its OWN ledger. The old check
+    // read rekey_served, which only maybe_init_rekey writes, so the NON-initiator
+    // responder had no cooldown: every authenticated rekey_request minted a fresh
+    // signed AD + save. Transient (not exported): worst case after restart is one
+    // extra readvertise.
+    ad_response_last is (global_id ->> time) = (,).
+    // Review #12: resume point for the budgeted redrive sweep. Deliberately NOT
+    // exported: after a restart the sweep simply starts from the beginning — safe
+    // (idempotent redrives, receiver dedup) and simpler than migrating a cursor.
+    redrive_sweep_cursor is global_id+ = NIL.
+    // Recently DELIVERED inbound wire_ids per contact — the receive-side dedup for the
+    // at-least-once redrive: a re-delivered wire_id re-acks (delivered receipt, so the
+    // sender's buffer clears) but never re-deposits into the inbox. EXPORTED (tiny):
+    // the inbox it guards is persisted too, so the guard must survive the same restarts.
+    // Retention is AGE-BASED (finding H): an entry lives as long as the SENDER can still
+    // redrive it (unacked_ttl_seconds) — a count-only ring could evict an id under
+    // heavy traffic while the sender's 2-day retry window was still open, and the late
+    // redrive would re-deposit a duplicate. delivered_wire_cap stays as a hard ceiling
+    // against pathological per-contact chatter (oldest evicted first past the cap).
+    metadef delivered_entry_t: ($w -> str, $d -> time).
+    delivered_wire is (global_id ->> delivered_entry_t[]) = (,).
+    delivered_wire_cap = 4096.
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -358,13 +380,14 @@ library a2a_messaging loads libraries
 
     hidden
     {
-        // core 0.11 persist hardening: set when import_core_state rejected a corrupt
-        // $e2e_sessions blob (validation under pickle_key failed) — the e2e state was
-        // reset to empty and the self-heal fallback re-establishes. Surfaced ONCE as a
-        // $e2e_restore_rejected notify by the boot readvertise_e2e_recovery sweep (the
-        // import itself runs inside boot import_state, which cannot emit actions).
-        // Deliberately NOT exported: a transient boot-observation flag.
-        e2e_restore_rejected is bool = FALSE.
+        // core 0.11 persist hardening (finding C redo): the $e2e_sessions blob from the
+        // boot import is PARKED here UNVALIDATED and UNASSIGNED — validation happens in
+        // the dedicated commit_e2e_restore transaction, where a corrupt pickle's hard
+        // BAD_PICKLE error fails that txn alone (atomic rollback, nothing assigned) and
+        // the host observes an identity-scoped failure. Transient boot state: NOT
+        // exported (the source blob is still on disk; a crash between import and commit
+        // simply re-stages on the next boot).
+        e2e_restore_staged is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+ = NIL.
 
         // ---- monitoring + config gate state (NON-app-writable) -----------
         // Hidden so only this library mutates it (the "app can't override"
@@ -928,62 +951,75 @@ library a2a_messaging loads libraries
     // Bounded three ways, never an abort: entry count (unacked_cap, oldest first),
     // per-contact bytes (unacked_max_bytes — an entry alone above the budget is not
     // retained at all), and age (unacked_ttl_seconds, purged by the periodic sweep).
-    fn unacked_note (cid: global_id, kind: str, wire_id: str, inner: bin, date: time) -> nil
+    // Typed retention result (review #7): the caller must SURFACE what the redrive
+    // guarantee actually covers. $retained FALSE = this send exceeded its byte budget
+    // and will NOT auto-resend on a lost session; $evicted = wire_ids of OLDER sends
+    // shed to admit this one (their at-least-once guarantee just ended) — never a
+    // silent drop.
+    fn unacked_note (cid: global_id, kind: str, wire_id: str, inner: bin, date: time)
+        -> ( $retained -> bool, $evicted -> str[] )
     {
         new_len = _binlen inner.
         entry_cap is int = unacked_max_bytes.
         if kind == "f" { entry_cap -> unacked_file_entry_max_bytes. }
-        if new_len <= entry_cap
+        if new_len > entry_cap { return ( $retained -> FALSE, $evicted -> [] ). }
+        evicted is str[] = [].
+        q0 = unacked_e2e cid.
+        kept is unacked_entry_t[] = [].
+        if q0 != NIL
         {
-            q0 = unacked_e2e cid.
-            kept is unacked_entry_t[] = [].
-            if q0 != NIL
+            // Totals INCLUDING the new entry, then shed oldest-first until both
+            // budgets (count, bytes) hold; copy the surviving suffix in order.
+            total is int = new_len.
+            cnt is int = 1.
+            sc q0? -- ( -> ent) { total -> total + (_binlen (ent $inner)).  cnt -> cnt + 1. }
+            drop is int = 0.
+            sc q0? -- ( -> ent)
             {
-                // Totals INCLUDING the new entry, then shed oldest-first until both
-                // budgets (count, bytes) hold; copy the surviving suffix in order.
-                total is int = new_len.
-                cnt is int = 1.
-                sc q0? -- ( -> ent) { total -> total + (_binlen (ent $inner)).  cnt -> cnt + 1. }
-                drop is int = 0.
-                sc q0? -- ( -> ent)
+                if cnt > unacked_cap || total > unacked_max_bytes
                 {
-                    if cnt > unacked_cap || total > unacked_max_bytes
-                    {
-                        total -> total - (_binlen (ent $inner)).
-                        cnt -> cnt - 1.
-                        drop -> drop + 1.
-                    }
+                    total -> total - (_binlen (ent $inner)).
+                    cnt -> cnt - 1.
+                    drop -> drop + 1.
+                    evicted (_count evicted|) -> (ent $wire_id).
                 }
-                i is int = 0.
-                sc q0? -- ( -> ent) { if i >= drop { kept (_count kept|) -> ent. }  i -> i + 1. }
             }
-            kept (_count kept|) -> ($kind -> kind, $wire_id -> wire_id, $inner -> inner, $date -> date).
-            unacked_e2e cid -> kept.
+            i is int = 0.
+            sc q0? -- ( -> ent) { if i >= drop { kept (_count kept|) -> ent. }  i -> i + 1. }
         }
+        kept (_count kept|) -> ($kind -> kind, $wire_id -> wire_id, $inner -> inner, $date -> date).
+        unacked_e2e cid -> kept.
+        return ( $retained -> TRUE, $evicted -> evicted ).
     }
-    // Receive-side dedup ring (see delivered_wire above): membership probe + bounded note.
+    // Receive-side dedup store (see delivered_wire above): membership probe + bounded note.
     fn wire_seen (cid: global_id, wire_id: str) -> bool
     {
         q = delivered_wire cid.
         if q == NIL { return FALSE. }
         hit is bool = FALSE.
-        sc q? -- ( -> w) { if w == wire_id { hit -> TRUE. } }
+        sc q? -- ( -> e) { if (e $w) == wire_id { hit -> TRUE. } }
         return hit.
     }
     fn delivered_note (cid: global_id, wire_id: str) -> nil
     {
         if wire_id != ""
         {
+            now = (current_transaction_info::get_transaction_time())?.
             q0 = delivered_wire cid.
-            q is str[] = [].
+            aged is delivered_entry_t[] = [].
             if q0 != NIL
             {
-                start is int = 0.
-                if (_count (q0?)|) >= delivered_wire_cap { start -> (_count (q0?)|) - delivered_wire_cap + 1. }
-                i is int = 0.
-                sc q0? -- ( -> w) { if i >= start { q (_count q|) -> w. }  i -> i + 1. }
+                // Age-based retention (finding H): keep every entry the sender could
+                // still redrive; only past unacked_ttl_seconds is eviction safe.
+                sc q0? -- ( -> e)
+                { if (_substract_seconds now (e $d)) <= unacked_ttl_seconds { aged (_count aged|) -> e. } }
             }
-            q (_count q|) -> wire_id.
+            q is delivered_entry_t[] = [].
+            start is int = 0.
+            if (_count aged|) >= delivered_wire_cap { start -> (_count aged|) - delivered_wire_cap + 1. }
+            i is int = 0.
+            sc aged -- ( -> e) { if i >= start { q (_count q|) -> e. }  i -> i + 1. }
+            q (_count q|) -> ($w -> wire_id, $d -> now).
             delivered_wire cid -> q.
         }
     }
@@ -1008,8 +1044,23 @@ library a2a_messaging loads libraries
     // (encrypt_to lazily establishes a fresh born-DR pre-key when none is live). Entries
     // STAY in the buffer — they clear on the delivered receipt (at-least-once; receivers
     // key receipts/dedup by wire_id). No-op without a usable peer bundle.
+    // Does this peer advertise the self-heal cap (Leg-5 compat gate)? A pre-0.11 peer never
+    // receives the unknown e2e_rekey_request tx — it gets a readvertise_ad instead.
+    fn peer_supports_rekey (cid: global_id) -> bool
+    {
+        pcaps = contact_caps cid.
+        if pcaps == NIL { return FALSE. }
+        hit is bool = FALSE.
+        sc pcaps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_rekey { hit -> TRUE. } }
+        return hit.
+    }
     fn redrive_unacked_actions (cid: global_id) -> transaction::action::type[]
     {
+        // Cap-gate (finding F): the at-least-once redrive REQUIRES receive-side
+        // wire_id dedup, which only a 0.11 (cap_e2e_rekey) peer has. Replaying into
+        // a pre-0.11 peer would deposit duplicates it cannot recognize. Its heal
+        // path stays the readvertise + next-real-send establish (pre-existing).
+        if (peer_supports_rekey cid) != TRUE { return []. }
         q = unacked_e2e cid.
         if q == NIL || (_count (q?)|) == 0 { return []. }
         pad = peer_ads cid.
@@ -1036,6 +1087,10 @@ library a2a_messaging loads libraries
     // minted session (caller mints first); no-op without a peer bundle.
     fn rekey_ping_actions (cid: global_id) -> transaction::action::type[]
     {
+        // Cap-gate (finding F): a pre-0.11 peer does not understand the $rekey_ping
+        // marker — its receive path would treat the contentless bootstrap as an app
+        // message. Only cap-advertising peers get pings.
+        if (peer_supports_rekey cid) != TRUE { return []. }
         pad = peer_ads cid.
         if pad == NIL { return []. }
         epb = (((pad?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
@@ -1047,16 +1102,6 @@ library a2a_messaging loads libraries
                      $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ),
                  _notify_agent ( $event -> $e2e_app_send, $cid -> cid, $rekey_ping -> TRUE,
                      $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type) ) ].
-    }
-    // Does this peer advertise the self-heal cap (Leg-5 compat gate)? A pre-0.11 peer never
-    // receives the unknown e2e_rekey_request tx — it gets a readvertise_ad instead.
-    fn peer_supports_rekey (cid: global_id) -> bool
-    {
-        pcaps = contact_caps cid.
-        if pcaps == NIL { return FALSE. }
-        hit is bool = FALSE.
-        sc pcaps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_rekey { hit -> TRUE. } }
-        return hit.
     }
     // SIGNAL the peer to (re-)establish: carry my FRESH AD so it can authenticate my pre-keys,
     // and — if it speaks the cap — ask it to re-key. fsid is ADVISORY ($failed_session_id, NIL
@@ -1107,6 +1152,12 @@ library a2a_messaging loads libraries
     // calls through here — it signals and waits for THIS side's pre-key.
     fn maybe_init_rekey (cid: global_id, fsid: bin+) -> transaction::action::type[]
     {
+        // Review #5: the whole self-heal replay/bootstrap is cap-gated, not just the
+        // rekey_request leg — a pre-0.11 peer has no delivered_wire dedup (replay
+        // would deposit duplicates) and no $rekey_ping handling (the contentless
+        // bootstrap would surface as a broken app message). Its heal path remains
+        // readvertise + the next real outbound establishing a fresh session.
+        if (peer_supports_rekey cid) != TRUE { return []. }
         if (mig_initiator cid) != TRUE { return []. }
         if (peer_has_e2e_bundle cid) != TRUE { return []. }
         st = contact_migration cid.
@@ -1118,7 +1169,14 @@ library a2a_messaging loads libraries
         now = (current_transaction_info::get_transaction_time())?.
         active is bin+ = e2e::active_session_id cid.
         if fsid != NIL && active != NIL && (active?) != (fsid?) { return []. }   // stale request — I already rotated
-        served = rekey_served cid.
+        served is rekey_served_t+ = rekey_served cid.
+        // Review #9: an aged ledger entry grants a fresh budget instead of a
+        // permanent (until-restart) stall at the attempts cap.
+        if served != NIL && (_substract_seconds now ((served?) $updated)) >= rekey_served_reset_seconds
+        {
+            delete rekey_served cid.
+            served -> NIL.
+        }
         if served != NIL
         {
             if ((served?) $attempts) >= rekey_served_max { return []. }
@@ -1607,7 +1665,7 @@ library a2a_messaging loads libraries
             eenv = e2e::encrypt_to target_id einner epb.
             // core 0.11 self-heal: retain until the delivered receipt — the redrive source
             // if the peer restarted and this send lands on a dead session (silent-drop fix).
-            unacked_note target_id "m" wire_id einner sent_date.
+            m_res = unacked_note target_id "m" wire_id einner sent_date.
             eacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_message_tx,
@@ -1617,8 +1675,8 @@ library a2a_messaging loads libraries
             // §4 observability: source $session_id from the ACTUAL envelope (NOT a re-read of
             // active_session_id — that would make the #1867 "session_id==pin" assertion CIRCULAR;
             // the real envelope id proves the app traversed the migrated session).
-            eacts (_count eacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
-            eacts (_count eacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
+            eacts (_count eacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type), $wire_id -> wire_id, $retained -> (m_res $retained), $evicted -> (m_res $evicted) ).
+            eacts (_count eacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e, $retained -> (m_res $retained)).
             eacts (_count eacts|) -> _save_state NIL.
             return transaction::success eacts.
         }
@@ -1688,15 +1746,17 @@ library a2a_messaging loads libraries
             fenv = e2e::encrypt_to target_id finner fepb.
             // core 0.11 self-heal: files retain for redrive exactly like messages (review
             // fix — a restarted receiver silently losing FILES is the owner's primary case).
-            unacked_note target_id "f" wire_id finner sent_date.
+            // finding J: an oversized file (> unacked_file_entry_max_bytes) is NOT retained —
+            // that MUST be surfaced, not silently reported as a plain success.
+            f_res = unacked_note target_id "f" wire_id finner sent_date.
             feacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_file_tx,
                     $targ -> ( $e2e_envelope -> (fenv $e2e_envelope), $emsignature -> (fenv $emsignature) ) ) ].
             sc on_file_sent ($target_id -> target_id, $filename -> filename, $mime -> mime_s, $data -> data, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { feacts (_count feacts|) -> a. }
             sc monitor_copy_actions "out" target_id sent_date (file_monitor_summary filename mime_s data) -- ( -> a) { feacts (_count feacts|) -> a. }
-            feacts (_count feacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((fenv $e2e_envelope) $session_id), $olm_type -> ((fenv $e2e_envelope) $olm_type), $wire_id -> wire_id ).
-            feacts (_count feacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e).
+            feacts (_count feacts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> target_id, $session_id -> ((fenv $e2e_envelope) $session_id), $olm_type -> ((fenv $e2e_envelope) $olm_type), $wire_id -> wire_id, $retained -> (f_res $retained), $evicted -> (f_res $evicted) ).
+            feacts (_count feacts|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $route -> $e2e, $retained -> (f_res $retained)).
             feacts (_count feacts|) -> _save_state NIL.
             return transaction::success feacts.
         }
@@ -3208,7 +3268,21 @@ library a2a_messaging loads libraries
         if wire_id != "" && (wire_seen sender_id wire_id)
         {
             dacts is transaction::action::type[] = [].
+            // Review #10: a duplicate can be the FIRST proof of the migrated session —
+            // the implicit-confirm promotion must not be skipped or committed stalls.
+            if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { dacts (_count dacts|) -> a. } }
             sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { dacts (_count dacts|) -> a. }
+            // Convergence must not be skipped on the duplicate path (finding I): the
+            // decode above was a REAL successful decode — reset both re-key budgets
+            // (a future genuine desync needs a fresh one), and if it was a pre-key
+            // that REPLACED our live session (the peer restarted and is redriving),
+            // re-encrypt our own retained sends onto the fresh session NOW — the
+            // duplicate is often the FIRST inbound after the peer's recovery.
+            if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+            if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
+            dup_post_sid is bin+ = e2e::active_session_id sender_id.
+            if pre_sid != NIL && dup_post_sid != NIL && (pre_sid?) != (dup_post_sid?)
+            { sc redrive_unacked_actions sender_id -- ( -> a) { dacts (_count dacts|) -> a. } }
             dacts (_count dacts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id, $duplicate -> TRUE).
             dacts (_count dacts|) -> _save_state NIL.
             return transaction::success dacts.
@@ -3310,6 +3384,27 @@ library a2a_messaging loads libraries
         if (iv $wire_id) != NIL { wire_id -> (iv $wire_id) safe str. }
         reply_to is a2a_protocol::reply_ref_t+ = NIL.
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
+
+        // At-least-once redrive dedup for FILES (finding E) — mirrors the message
+        // handler: a re-delivered wire_id RE-ACKS (the sender's buffer clears even
+        // when the first receipt was lost) but never re-deposits the file. Includes
+        // the same convergence as the message path (finding I): budget resets + the
+        // session-replace redrive. Without this a file redrive deposited a duplicate.
+        if wire_id != "" && (wire_seen sender_id wire_id)
+        {
+            fdacts is transaction::action::type[] = [].
+            // Review #10: same implicit-confirm promotion as the message dup path.
+            if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { fdacts (_count fdacts|) -> a. } }
+            sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { fdacts (_count fdacts|) -> a. }
+            if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+            if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
+            fdup_post_sid is bin+ = e2e::active_session_id sender_id.
+            if pre_sid != NIL && fdup_post_sid != NIL && (pre_sid?) != (fdup_post_sid?)
+            { sc redrive_unacked_actions sender_id -- ( -> a) { fdacts (_count fdacts|) -> a. } }
+            fdacts (_count fdacts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id, $duplicate -> TRUE, $file -> TRUE).
+            fdacts (_count fdacts|) -> _save_state NIL.
+            return transaction::success fdacts.
+        }
 
         actions is transaction::action::type[] = [].
         if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { actions (_count actions|) -> a. } }
@@ -3601,15 +3696,18 @@ library a2a_messaging loads libraries
         actions is transaction::action::type[] = [].
         fsid is bin+ = (args $failed_session_id) safe bin.
         now = (current_transaction_info::get_transaction_time())?.
-        served = rekey_served sender_id.
         // CONVERGENCE LEG (Dev-1 residual LOW): readvertise my fresh AD BACK — this is how the
         // requester refreshes ITS stored copy of MY bundle when I (not it) re-minted my account.
         // It must NOT hide behind the rotation gate (a throttled/non-initiator request would then
-        // starve the one-side-restarted case). Bounded against amplification by the cooldown
-        // ALONE (a spammer gets ≤1 readvertise per window), independent of role/attempts.
-        cool_ok is bool = served == NIL || (_substract_seconds now ((served?) $updated)) >= rekey_min_interval_seconds.
+        // starve the one-side-restarted case).
+        // Review #9: the cooldown now has its OWN ledger (ad_response_last) — the old check read
+        // rekey_served, which only maybe_init_rekey writes, so a NON-initiator responder had NO
+        // cooldown at all: every authenticated request minted a fresh signed AD + save.
+        prev_resp = ad_response_last sender_id.
+        cool_ok is bool = prev_resp == NIL || (_substract_seconds now (prev_resp?)) >= rekey_min_interval_seconds.
         if cool_ok
         {
+            ad_response_last sender_id -> now.
             b = my_identity_bundle_fields_fresh NIL.
             actions (_count actions|) -> encrypted_channel::send_encrypted_tx sender_id (
                 $name -> readvertise_ad_tx,
@@ -3624,6 +3722,30 @@ library a2a_messaging loads libraries
         // back; the initiator (the requester, here) mints on ITS side and its pre-key
         // establishes the shared session on mine. Exactly one minter ⇒ no glare.
         sc maybe_init_rekey sender_id fsid -- ( -> a) { actions (_count actions|) -> a. }
+        // TRUE-loss liveness, higher-cid side (review #6 — NO MINT, no glare). When the
+        // REQUESTER is the elected initiator (I am NOT), it lost its state: it has
+        // nothing to redrive and nothing re-triggers its own mint — my readvertise
+        // above only refreshes its copy of my bundle, and my own sweep waits up to a
+        // GC period. fsid == my ACTIVE session id proves the request is about my
+        // CURRENT session (not stale/replayed). Re-drive my buffer (or send a
+        // cap-gated ping) on the EXISTING session NOW: the requester cannot decode
+        // those (it lost the session), each failed decode fires its reject path —
+        // rekey_signal + maybe_init_rekey — and by then it holds my fresh AD from the
+        // readvertise above, so THE INITIATOR mints, exactly one minter, no glare.
+        // Bounded by the same ad_response cooldown as the readvertise (cool_ok).
+        if cool_ok && (mig_initiator sender_id) != TRUE && (contact_migration sender_id) == NIL
+        {
+            g_active is bin+ = e2e::active_session_id sender_id.
+            if fsid != NIL && g_active != NIL && (g_active?) == (fsid?)
+            {
+                pre_cnt is int = (_count actions|).
+                sc redrive_unacked_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }
+                if (_count actions|) == pre_cnt
+                { sc rekey_ping_actions sender_id -- ( -> a) { actions (_count actions|) -> a. } }
+                if (_count actions|) > pre_cnt
+                { actions (_count actions|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $responder_retrigger, $session_id -> fsid). }
+            }
+        }
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -3975,6 +4097,46 @@ library a2a_messaging loads libraries
         return transaction::success actions.
     }
 
+    // Coherence probe (finding #3 evidence): the ik_curve of MY CURRENT account's
+    // public bundle. Host compares it against the transport IPD's advertised bundle
+    // post-restore. Readonly; account() only mutates when NO account exists — never
+    // the case on this call path (ctor mints one before any host-driven restore).
+    trn readonly e2e_self_fp _
+    {
+        return ( $ik -> ((e2e::my_public_bundle NIL) $ik_curve) ).
+    }
+
+    // Finding C redo — the VALIDATION transaction. Runs alone (host-driven, boot,
+    // pre-exposure): validates + assigns the staged $e2e_sessions blob. A corrupt
+    // pickle raises the engine's HARD BAD_PICKLE inside e2e::import_sessions, which
+    // fails THIS txn atomically — nothing assigned, staging untouched — and the host
+    // observes the failure (unambiguous: nothing but validation runs here) and calls
+    // reject_e2e_restore. Success persists the restored sessions with the txn.
+    trn commit_e2e_restore _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if e2e_restore_staged == NIL
+        { return transaction::success [ _return_data ($status -> $none) ]. }
+        n = e2e::import_sessions (e2e_restore_staged?).
+        e2e_restore_staged -> NIL.
+        return transaction::success [ _return_data ($status -> $ok, $sessions -> n), _save_state NIL ].
+    }
+
+    // Finding C redo — the REJECT leg: discard the corrupt staged blob (the live e2e
+    // state is untouched — the ctor-minted fresh account stays, the self-heal fallback
+    // re-establishes) and surface the rejection. Host calls this after observing a
+    // commit_e2e_restore failure; the _save_state persists the now-clean export so the
+    // corrupt pickles never come back on the next boot.
+    trn reject_e2e_restore _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        e2e_restore_staged -> NIL.
+        return transaction::success [
+            _notify_agent ($event -> $e2e_restore_rejected),
+            _return_data ($status -> $rejected),
+            _save_state NIL ].
+    }
+
     // core 0.11 (session self-heal, boot leg): push my FRESH AD to every E2E-CAPABLE contact —
     // the complement of readvertise_on_upgrade's legacy-only set. Every daemon restart re-mints
     // the Olm account (fresh entropy — INV-4 keeps it off disk), so the e2e_bundle every peer
@@ -3989,13 +4151,6 @@ library a2a_messaging loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         b  = my_identity_bundle_fields_fresh NIL.
         actions is transaction::action::type[] = [].
-        // One-shot surfacing of a corrupt-$e2e_sessions rejection (finding C): the
-        // boot import cannot notify, this first boot sweep can.
-        if e2e_restore_rejected
-        {
-            e2e_restore_rejected -> FALSE.
-            actions (_count actions|) -> _notify_agent ( $event -> $e2e_restore_rejected ).
-        }
         n is int = 0.
         sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) != NIL || (contact_born_dr cid) == TRUE || (e2e_pinned cid) || (contact_migration cid) != NIL)
         {
@@ -4020,34 +4175,83 @@ library a2a_messaging loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         now = (current_transaction_info::get_transaction_time())?.
         actions is transaction::action::type[] = [].
-        n is int = 0.
+        // Separate counters (finding K / review #15): a TTL purge is NOT a redrive,
+        // and a deferred contact is neither — the log must say what actually happened.
+        purged is int = 0.
+        redriven is int = 0.
+        deferred is int = 0.
         // TTL purge first (data-at-rest bound): entries past unacked_ttl_seconds are
         // dropped for good — a peer withholding receipts cannot pin plaintext forever.
+        // Review #7: every purge is an EXPLICIT permanent delivery failure event.
         expired is global_id[] = [].
         sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
         {
             live is unacked_entry_t[] = [].
+            gone is str[] = [].
             sc q -- ( -> ent)
-            { if (_substract_seconds now (ent $date)) <= unacked_ttl_seconds { live (_count live|) -> ent. } }
-            if (_count live|) < (_count q|)
             {
+                if (_substract_seconds now (ent $date)) <= unacked_ttl_seconds { live (_count live|) -> ent. }
+                else { gone (_count gone|) -> (ent $wire_id). }
+            }
+            if (_count gone|) > 0
+            {
+                actions (_count actions|) -> _notify_agent ($event -> $e2e_delivery_expired, $cid -> cid, $wire_ids -> gone).
                 if (_count live|) == 0 { expired (_count expired|) -> cid. } else { unacked_e2e cid -> live. }
-                n -> n + 1.
+                purged -> purged + 1.
             }
         }
         sc expired -- ( -> cid) { delete unacked_e2e cid. }
+        // Redrive phase — BUDGETED with a resume cursor (review #12): one sweep txn
+        // re-encrypts at most redrive_sweep_max_entries entries; the remainder is
+        // deferred to the next sweep, resuming AFTER the cursor contact. A vanished
+        // cursor (acked away) resets to a full scan next round.
+        budget is int = redrive_sweep_max_entries.
+        resume_after is global_id+ = redrive_sweep_cursor.
+        past_cursor is bool = (resume_after == NIL).
+        last_done is global_id+ = NIL.
+        exhausted is bool = FALSE.
         sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
         {
-            oldest is time+ = NIL.
-            sc q -- ( -> ent) { if oldest == NIL { oldest -> (ent $date). } }
-            if oldest != NIL && (_substract_seconds now (oldest?)) > redrive_min_age_seconds
+            if past_cursor != TRUE
             {
-                sc redrive_unacked_actions cid -- ( -> a) { actions (_count actions|) -> a. }
-                n -> n + 1.
+                deferred -> deferred + 1.
+                if cid == (resume_after?) { past_cursor -> TRUE. }
+            }
+            else
+            {
+                if exhausted { deferred -> deferred + 1. }
+                else
+                {
+                oldest is time+ = NIL.
+                sc q -- ( -> ent) { if oldest == NIL { oldest -> (ent $date). } }
+                if oldest != NIL && (_substract_seconds now (oldest?)) > redrive_min_age_seconds
+                {
+                    if (_count q|) > budget
+                    {
+                        exhausted -> TRUE.
+                        deferred -> deferred + 1.
+                    }
+                    else
+                    {
+                        pre_cnt is int = (_count actions|).
+                        sc redrive_unacked_actions cid -- ( -> a) { actions (_count actions|) -> a. }
+                        // Count only contacts something was actually re-sent for (the
+                        // cap-gate or a missing bundle can make the redrive a no-op).
+                        if (_count actions|) > pre_cnt
+                        {
+                            redriven -> redriven + 1.
+                            budget -> budget - (_count q|).
+                        }
+                        last_done -> cid.
+                    }
+                }
+                }
             }
         }
-        if n > 0 { actions (_count actions|) -> _save_state NIL. }
-        actions (_count actions|) -> _return_data ($redriven_contacts -> n).
+        if past_cursor != TRUE { redrive_sweep_cursor -> NIL. }
+        else { if exhausted { redrive_sweep_cursor -> last_done. } else { redrive_sweep_cursor -> NIL. } }
+        if purged > 0 || redriven > 0 { actions (_count actions|) -> _save_state NIL. }
+        actions (_count actions|) -> _return_data ($redriven_contacts -> redriven, $purged_contacts -> purged, $deferred_contacts -> deferred).
         return transaction::success actions.
     }
 
@@ -4331,7 +4535,25 @@ library a2a_messaging loads libraries
         }
         if (data $delivered_wire) != NIL
         {
-            delivered_wire -> (data $delivered_wire) safe (global_id ->> str[]).
+            // Current shape first; a pre-H blob carried bare wire_id strings — migrate
+            // them with the import time as the delivery date (they age out on the same
+            // TTL clock from now, which can only RETAIN LONGER, never dedup less).
+            dwn = (data $delivered_wire) safe (global_id ->> delivered_entry_t[]).
+            if dwn != NIL { delivered_wire -> dwn?. }
+            else
+            {
+                dwo = (data $delivered_wire) safe (global_id ->> str[]).
+                if dwo != NIL
+                {
+                    mnow = (current_transaction_info::get_transaction_time())?.
+                    sc dwo? -- (mcid -> ws)
+                    {
+                        mq is delivered_entry_t[] = [].
+                        sc ws -- ( -> w) { mq (_count mq|) -> ($w -> w, $d -> mnow). }
+                        delivered_wire mcid -> mq.
+                    }
+                }
+            }
         }
         // core 0.11 Signal-model restart survival: restore the SEALED Olm account + sessions +
         // staged pickles BEFORE anything can lazily mint a fresh account (import_core_state runs
@@ -4342,15 +4564,11 @@ library a2a_messaging loads libraries
         // written atomically via tmp+rename, so partial writes do not occur).
         es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+
             = (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
-        if es != NIL
-        {
-            // Validated import (finding C): every pickle is proved to unseal under
-            // pickle_key before assignment; a corrupt blob is atomically rejected to
-            // EMPTY e2e state (status < 0) and the fallback re-establishes. Flag it so
-            // the boot sweep surfaces the rejection once.
-            st = e2e::import_sessions (es?).
-            if st < 0 { e2e_restore_rejected -> TRUE. }
-        }
+        // Finding C redo: do NOT validate or assign here — a corrupt pickle raises a
+        // HARD engine error that would fail the whole boot import (contacts and inbox
+        // included). Park the blob; the host drives commit_e2e_restore next (still
+        // pre-exposure), where a validation failure is isolated + atomic.
+        if es != NIL { e2e_restore_staged -> es. }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the
