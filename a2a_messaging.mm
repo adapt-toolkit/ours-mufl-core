@@ -358,6 +358,14 @@ library a2a_messaging loads libraries
 
     hidden
     {
+        // core 0.11 persist hardening: set when import_core_state rejected a corrupt
+        // $e2e_sessions blob (validation under pickle_key failed) — the e2e state was
+        // reset to empty and the self-heal fallback re-establishes. Surfaced ONCE as a
+        // $e2e_restore_rejected notify by the boot readvertise_e2e_recovery sweep (the
+        // import itself runs inside boot import_state, which cannot emit actions).
+        // Deliberately NOT exported: a transient boot-observation flag.
+        e2e_restore_rejected is bool = FALSE.
+
         // ---- monitoring + config gate state (NON-app-writable) -----------
         // Hidden so only this library mutates it (the "app can't override"
         // guarantee). A pending 6-digit bind, and the verified control plane that
@@ -3981,6 +3989,13 @@ library a2a_messaging loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         b  = my_identity_bundle_fields_fresh NIL.
         actions is transaction::action::type[] = [].
+        // One-shot surfacing of a corrupt-$e2e_sessions rejection (finding C): the
+        // boot import cannot notify, this first boot sweep can.
+        if e2e_restore_rejected
+        {
+            e2e_restore_rejected -> FALSE.
+            actions (_count actions|) -> _notify_agent ( $event -> $e2e_restore_rejected ).
+        }
         n is int = 0.
         sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) != NIL || (contact_born_dr cid) == TRUE || (e2e_pinned cid) || (contact_migration cid) != NIL)
         {
@@ -4327,7 +4342,15 @@ library a2a_messaging loads libraries
         // written atomically via tmp+rename, so partial writes do not occur).
         es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+
             = (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
-        if es != NIL { e2e::import_sessions (es?). }
+        if es != NIL
+        {
+            // Validated import (finding C): every pickle is proved to unseal under
+            // pickle_key before assignment; a corrupt blob is atomically rejected to
+            // EMPTY e2e state (status < 0) and the fallback re-establishes. Flag it so
+            // the boot sweep surfaces the rejection once.
+            st = e2e::import_sessions (es?).
+            if st < 0 { e2e_restore_rejected -> TRUE. }
+        }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the
