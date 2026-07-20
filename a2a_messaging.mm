@@ -90,9 +90,10 @@ library a2a_messaging loads libraries
     receive_e2e_file_tx        = "::a2a_messaging::receive_e2e_file".
     // core 0.11 (session self-heal): authenticated re-key request. Sent by the side whose
     // e2e DECODE failed (no_session / session_mismatch / tampered from an accepted contact —
-    // the restart-desync signature) so the peer drops its dead outbound session, refreshes
-    // my AD (the restart re-mints the Olm account, so my old advertised bundle is stale by
-    // construction) and re-establishes a fresh born-DR session, then redrives unacked sends.
+    // the TRUE-loss signature: since persist-primary a normal restart RESUMES its sessions,
+    // so this fires only when the persisted state was lost/rejected and the account was
+    // re-minted, making my old advertised bundle stale) so the peer refreshes my AD and
+    // the elected initiator re-establishes a fresh born-DR session, then redrives unacked.
     // A pre-0.11 peer does not understand the tx and ignores it (readvertise precedent).
     e2e_rekey_request_tx       = "::a2a_messaging::e2e_rekey_request".
 
@@ -130,15 +131,19 @@ library a2a_messaging loads libraries
     // and a lost receipt. Repeats are harmless: the receiver's delivered_wire dedup
     // re-acks without re-depositing, and the re-ack clears our buffer.
     redrive_min_age_seconds = 120.
-    // Review #12: per-sweep re-encryption budget (entries, not contacts) — one txn
-    // re-driving 50×N contacts could hit fuel/action limits and lose the WHOLE sweep.
-    // A contact's queue is capped at unacked_cap (50) < this budget, so every contact
-    // is individually processable; overflow defers the remainder to the cursor.
-    // DELIBERATELY denominated in CRYPTO OPERATIONS (each entry = one e2e::encrypt_to
-    // ratchet encryption), NOT in fuel: the fuel model undercounts fixed signature/
-    // crypto costs (cross-fleet finding), so a fuel-denominated budget would be a
-    // weaker resource guard than it looks. Counting real crypto ops is exact.
+    // Review #12 + ship-review major-4: per-sweep budgets — one txn re-driving 50×N
+    // contacts (or emitting one expiry notify per contact across thousands) could hit
+    // fuel/action limits and lose the WHOLE sweep, cyclically. A contact's queue is
+    // capped at unacked_cap (50) < the crypto budget, so every contact is individually
+    // processable; overflow defers the remainder to the (exported) cursor.
+    // The crypto budget is DELIBERATELY denominated in CRYPTO OPERATIONS (each entry =
+    // one e2e::encrypt_to = 1 ratchet encryption + 1 signature GENERATION; this path
+    // performs zero sig-verifies), NOT in fuel: the fuel model undercounts fixed
+    // crypto costs (cross-fleet finding), so a fuel number would be a weaker guard.
+    // The action budget bounds emitted SEND/RET actions INCLUDING the per-contact
+    // expiry notifies of the purge phase.
     redrive_sweep_max_entries = 100.
+    redrive_sweep_max_actions = 250.
     // Data-at-rest bounds for the retained plaintext (review: a peer withholding
     // receipts must not pin our plaintext forever): total per-contact byte budget
     // (oldest dropped first; an entry alone above the budget is never retained),
@@ -302,22 +307,31 @@ library a2a_messaging loads libraries
     // signed AD + save. Transient (not exported): worst case after restart is one
     // extra readvertise.
     ad_response_last is (global_id ->> time) = (,).
-    // Review #12: resume point for the budgeted redrive sweep. Deliberately NOT
-    // exported: after a restart the sweep simply starts from the beginning — safe
-    // (idempotent redrives, receiver dedup) and simpler than migrating a cursor.
+    // Review #12 + ship-review major-4: resume point for the budgeted sweep, covering
+    // BOTH phases (TTL purge and redrive). EXPORTED: a deployment that only ever runs
+    // boot sweeps (short-lived daemons) would otherwise re-scan the same prefix every
+    // boot and starve the tail forever. A sweep-txn failure rolls the cursor back with
+    // everything else, so a retried sweep resumes from the last COMMITTED position.
     redrive_sweep_cursor is global_id+ = NIL.
     // Recently DELIVERED inbound wire_ids per contact — the receive-side dedup for the
     // at-least-once redrive: a re-delivered wire_id re-acks (delivered receipt, so the
     // sender's buffer clears) but never re-deposits into the inbox. EXPORTED (tiny):
     // the inbox it guards is persisted too, so the guard must survive the same restarts.
-    // Retention is AGE-BASED (finding H): an entry lives as long as the SENDER can still
-    // redrive it (unacked_ttl_seconds) — a count-only ring could evict an id under
-    // heavy traffic while the sender's 2-day retry window was still open, and the late
-    // redrive would re-deposit a duplicate. delivered_wire_cap stays as a hard ceiling
-    // against pathological per-contact chatter (oldest evicted first past the cap).
+    // Retention is AGE-ONLY (finding H + ship-review major-3): an entry lives exactly
+    // as long as the SENDER can still redrive it (unacked_ttl_seconds). There is
+    // deliberately NO count-based eviction inside that window — any count cap could be
+    // pushed past by heavy (still authenticated) traffic while one receipt was lost,
+    // and the late redrive would re-deposit a duplicate. The storage bound is the
+    // AUTHENTICATED per-contact inbound rate over the 2-day window (each entry is one
+    // wire_id string + a date; only accepted contacts reach delivered_note).
     metadef delivered_entry_t: ($w -> str, $d -> time).
     delivered_wire is (global_id ->> delivered_entry_t[]) = (,).
-    delivered_wire_cap = 4096.
+    // Storage CEILING (not a dedup window): an authenticated flooder must not grow
+    // delivered_wire without bound over the 2-day window (memory-DoS). Reaching it is
+    // a GUARANTEE-LOSS event — the oldest in-TTL entry is dropped AND the loss is
+    // SURFACED ($dedup_degraded notify), never a silent eviction. ~16k entries ≈ low
+    // single-digit MB per pathological contact.
+    delivered_wire_hard_cap = 16384.
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -942,11 +956,12 @@ library a2a_messaging loads libraries
 
     // core 0.11 self-heal TRIGGER (receive side of a failed decode). A decode failure with
     // one of the desync codes from an ACCEPTED e2e contact means the pair's session views
-    // diverged (the reproduced daemon-restart case: the peer sends olm_type=1 on a session I
-    // no longer hold, or its fresh pre-key carries an ik my stored peer_ads predates). The
-    // message itself is undecryptable forever — recovery = tell the peer, authenticated,
-    // to re-key AND to refresh my AD (my account re-mints on restart, so my previously
-    // advertised e2e_bundle is stale by construction). Rate-limited per (cid, session_id).
+    // diverged. Since persist-primary a clean restart RESUMES the live sessions, so this is
+    // the TRUE-loss path (state lost/rejected → account re-minted, sessions gone): the peer
+    // sends olm_type=1 on a session I no longer hold, or its fresh pre-key carries an ik my
+    // stored peer_ads predates. The message itself is undecryptable forever — recovery =
+    // tell the peer, authenticated, to re-key AND to refresh my AD (my re-minted account
+    // makes my previously advertised e2e_bundle stale). Rate-limited per (cid, session_id).
     fn rekey_desync_code (code: str) -> bool
     {
         return code == "no_session" || code == "session_mismatch" || code == "tampered".
@@ -1004,8 +1019,13 @@ library a2a_messaging loads libraries
         sc q? -- ( -> e) { if (e $w) == wire_id { hit -> TRUE. } }
         return hit.
     }
-    fn delivered_note (cid: global_id, wire_id: str) -> nil
+    // AGE-ONLY retention (ship-review major-3): an entry is evicted only past
+    // unacked_ttl_seconds — no count-based eviction inside the sender's redrive
+    // window. The hard storage ceiling above is the sole exception; crossing it
+    // returns the dropped wire_id so the CALLER surfaces the guarantee loss.
+    fn delivered_note (cid: global_id, wire_id: str) -> ( $dropped -> str+ )
     {
+        dropped is str+ = NIL.
         if wire_id != ""
         {
             now = (current_transaction_info::get_transaction_time())?.
@@ -1013,19 +1033,22 @@ library a2a_messaging loads libraries
             aged is delivered_entry_t[] = [].
             if q0 != NIL
             {
-                // Age-based retention (finding H): keep every entry the sender could
-                // still redrive; only past unacked_ttl_seconds is eviction safe.
                 sc q0? -- ( -> e)
                 { if (_substract_seconds now (e $d)) <= unacked_ttl_seconds { aged (_count aged|) -> e. } }
             }
             q is delivered_entry_t[] = [].
-            start is int = 0.
-            if (_count aged|) >= delivered_wire_cap { start -> (_count aged|) - delivered_wire_cap + 1. }
+            skip is int = 0.
+            if (_count aged|) >= delivered_wire_hard_cap
+            {
+                skip -> 1.
+                sc aged -- ( -> e) { if dropped == NIL { dropped -> (e $w). } }
+            }
             i is int = 0.
-            sc aged -- ( -> e) { if i >= start { q (_count q|) -> e. }  i -> i + 1. }
+            sc aged -- ( -> e) { if i >= skip { q (_count q|) -> e. }  i -> i + 1. }
             q (_count q|) -> ($w -> wire_id, $d -> now).
             delivered_wire cid -> q.
         }
+        return ( $dropped -> dropped ).
     }
     // Drop the entries a delivered/read receipt covers. Returns TRUE when anything cleared.
     fn unacked_clear (cid: global_id, ids: str[]) -> bool
@@ -3162,7 +3185,11 @@ library a2a_messaging loads libraries
         if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
         // Record the delivery for the at-least-once redrive dedup (no-op on ""). Rides the
         // same tx as the deposit, so guard and inbox commit or roll back together.
-        delivered_note sender_id wire_id.
+        // Ship-review major-3: crossing the storage ceiling drops the oldest in-TTL
+        // entry — a real dedup-guarantee loss, surfaced, never silent.
+        dn = delivered_note sender_id wire_id.
+        if (dn $dropped) != NIL
+        { acts (_count acts|) -> _notify_agent ($event -> $dedup_degraded, $cid -> sender_id, $dropped_wire_id -> ((dn $dropped)?)). }
         if wire_id != ""
         { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { acts (_count acts|) -> a. } }
         acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
@@ -4142,13 +4169,14 @@ library a2a_messaging loads libraries
     }
 
     // core 0.11 (session self-heal, boot leg): push my FRESH AD to every E2E-CAPABLE contact —
-    // the complement of readvertise_on_upgrade's legacy-only set. Every daemon restart re-mints
-    // the Olm account (fresh entropy — INV-4 keeps it off disk), so the e2e_bundle every peer
-    // holds for me is stale BY CONSTRUCTION; until a peer refreshes it, my fresh pre-keys fail
-    // its authenticated decode (session_mismatch) while its olm_type=1 traffic to me is
-    // undecryptable (no_session) — the reproduced two-sided restart black hole. This stateless
-    // push re-arms the 0.8.0 pre-key-replace self-heal. A pre-0.10 peer ignores the tx
-    // (readvertise precedent). The daemon calls this on EVERY boot, alongside
+    // the complement of readvertise_on_upgrade's legacy-only set. Since persist-primary a
+    // clean restart RESUMES the account+sessions and this push is a cheap refresh; it is
+    // LOAD-BEARING on the fallback path (persisted state lost/rejected → the account was
+    // re-minted, so the e2e_bundle every peer holds for me is stale; until a peer refreshes
+    // it, my fresh pre-keys fail its authenticated decode (session_mismatch) while its
+    // olm_type=1 traffic to me is undecryptable (no_session) — the two-sided black hole).
+    // This stateless push re-arms the 0.8.0 pre-key-replace self-heal. A pre-0.10 peer
+    // ignores the tx (readvertise precedent). The daemon calls this on EVERY boot, alongside
     // readvertise_on_upgrade and sweep_e2e_migrations (DAEMON CONTRACT).
     trn readvertise_e2e_recovery _
     {
@@ -4184,36 +4212,23 @@ library a2a_messaging loads libraries
         purged is int = 0.
         redriven is int = 0.
         deferred is int = 0.
-        // TTL purge first (data-at-rest bound): entries past unacked_ttl_seconds are
-        // dropped for good — a peer withholding receipts cannot pin plaintext forever.
-        // Review #7: every purge is an EXPLICIT permanent delivery failure event.
-        expired is global_id[] = [].
-        sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
-        {
-            live is unacked_entry_t[] = [].
-            gone is str[] = [].
-            sc q -- ( -> ent)
-            {
-                if (_substract_seconds now (ent $date)) <= unacked_ttl_seconds { live (_count live|) -> ent. }
-                else { gone (_count gone|) -> (ent $wire_id). }
-            }
-            if (_count gone|) > 0
-            {
-                actions (_count actions|) -> _notify_agent ($event -> $e2e_delivery_expired, $cid -> cid, $wire_ids -> gone).
-                if (_count live|) == 0 { expired (_count expired|) -> cid. } else { unacked_e2e cid -> live. }
-                purged -> purged + 1.
-            }
-        }
-        sc expired -- ( -> cid) { delete unacked_e2e cid. }
-        // Redrive phase — BUDGETED with a resume cursor (review #12): one sweep txn
-        // re-encrypts at most redrive_sweep_max_entries entries; the remainder is
-        // deferred to the next sweep, resuming AFTER the cursor contact. A vanished
-        // cursor (acked away) resets to a full scan next round.
-        budget is int = redrive_sweep_max_entries.
+        // Ship-review major-4: ONE bounded, resumable pass over BOTH phases. Per
+        // contact: (1) TTL purge — entries past unacked_ttl_seconds drop for good
+        // (a peer withholding receipts cannot pin plaintext forever) with ONE
+        // $e2e_delivery_expired RET per affected contact (review #7: explicit, never
+        // silent) — then (2) the aged redrive. Budgets bound the WHOLE txn: crypto
+        // ops (ratchet encryptions — this path performs zero sig-verifies, so the op
+        // count is exact, not a fuel proxy) and emitted actions (SEND/RET including
+        // the expiry notifies). A contact whose worst case would overflow either
+        // budget is deferred; the EXPORTED cursor resumes there next sweep, and a
+        // sweep-txn abort rolls the cursor back so a retry covers the same segment.
+        crypto_budget is int = redrive_sweep_max_entries.
+        action_budget is int = redrive_sweep_max_actions.
         resume_after is global_id+ = redrive_sweep_cursor.
         past_cursor is bool = (resume_after == NIL).
         last_done is global_id+ = NIL.
         exhausted is bool = FALSE.
+        expired is global_id[] = [].
         sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
         {
             if past_cursor != TRUE
@@ -4223,38 +4238,55 @@ library a2a_messaging loads libraries
             }
             else
             {
-                if exhausted { deferred -> deferred + 1. }
+                // worst case for this contact: 1 expiry RET + (1 crypto op + 2 actions)
+                // per redriven entry
+                if exhausted || (_count q|) > crypto_budget || action_budget < ((_count q|) * 2 + 1)
+                {
+                    exhausted -> TRUE.
+                    deferred -> deferred + 1.
+                }
                 else
                 {
-                oldest is time+ = NIL.
-                sc q -- ( -> ent) { if oldest == NIL { oldest -> (ent $date). } }
-                if oldest != NIL && (_substract_seconds now (oldest?)) > redrive_min_age_seconds
-                {
-                    if (_count q|) > budget
+                    live is unacked_entry_t[] = [].
+                    gone is str[] = [].
+                    sc q -- ( -> ent)
                     {
-                        exhausted -> TRUE.
-                        deferred -> deferred + 1.
+                        if (_substract_seconds now (ent $date)) <= unacked_ttl_seconds { live (_count live|) -> ent. }
+                        else { gone (_count gone|) -> (ent $wire_id). }
                     }
-                    else
+                    if (_count gone|) > 0
                     {
-                        pre_cnt is int = (_count actions|).
-                        sc redrive_unacked_actions cid -- ( -> a) { actions (_count actions|) -> a. }
-                        // Count only contacts something was actually re-sent for (the
-                        // cap-gate or a missing bundle can make the redrive a no-op).
-                        if (_count actions|) > pre_cnt
+                        actions (_count actions|) -> _notify_agent ($event -> $e2e_delivery_expired, $cid -> cid, $wire_ids -> gone).
+                        action_budget -> action_budget - 1.
+                        if (_count live|) == 0 { expired (_count expired|) -> cid. } else { unacked_e2e cid -> live. }
+                        purged -> purged + 1.
+                    }
+                    if (_count live|) > 0
+                    {
+                        oldest is time+ = NIL.
+                        sc live -- ( -> ent) { if oldest == NIL { oldest -> (ent $date). } }
+                        if oldest != NIL && (_substract_seconds now (oldest?)) > redrive_min_age_seconds
                         {
-                            redriven -> redriven + 1.
-                            budget -> budget - (_count q|).
+                            pre_cnt is int = (_count actions|).
+                            sc redrive_unacked_actions cid -- ( -> a) { actions (_count actions|) -> a. }
+                            // Count only contacts something was actually re-sent for (the
+                            // cap-gate or a missing bundle can make the redrive a no-op).
+                            if (_count actions|) > pre_cnt
+                            {
+                                redriven -> redriven + 1.
+                                crypto_budget -> crypto_budget - (_count live|).
+                                action_budget -> action_budget - ((_count actions|) - pre_cnt).
+                            }
                         }
-                        last_done -> cid.
                     }
-                }
+                    last_done -> cid.
                 }
             }
         }
+        sc expired -- ( -> cid) { delete unacked_e2e cid. }
         if past_cursor != TRUE { redrive_sweep_cursor -> NIL. }
         else { if exhausted { redrive_sweep_cursor -> last_done. } else { redrive_sweep_cursor -> NIL. } }
-        if purged > 0 || redriven > 0 { actions (_count actions|) -> _save_state NIL. }
+        if purged > 0 || redriven > 0 || exhausted { actions (_count actions|) -> _save_state NIL. }
         actions (_count actions|) -> _return_data ($redriven_contacts -> redriven, $purged_contacts -> purged, $deferred_contacts -> deferred).
         return transaction::success actions.
     }
@@ -4388,7 +4420,10 @@ library a2a_messaging loads libraries
             // material — INV-4 holds). rekey_pending is deliberately NOT exported (transient
             // rate-limit ledger; a restart at worst re-sends one idempotent request).
             $unacked_e2e        -> unacked_e2e,
-            $delivered_wire     -> delivered_wire
+            $delivered_wire     -> delivered_wire,
+            // Ship-review major-4: the sweep resume cursor survives restarts, else a
+            // boot-sweep-only lifecycle re-scans the same prefix forever (tail starves).
+            $redrive_cursor     -> redrive_sweep_cursor
         ).
     }
 
@@ -4520,9 +4555,10 @@ library a2a_messaging loads libraries
         }
         // core 0.9.0: migration FSM metadata (absent from pre-0.9 exports → all
         // three stay empty = legacy, spec §5.1). Guarded exactly like the pins.
-        // The adapt staged/active session pickles are packet-local and gone after
-        // an export/import; a non-active FSM entry is re-driven by the host sweep,
-        // an `active` entry with a lost session takes the recovery path (phases C-E).
+        // Since persist-primary the ACTIVE session pickles ride $e2e_sessions and
+        // survive export/import (validated commit); only the transient STAGED pickle
+        // is gone after a restart — a non-active FSM entry is re-driven by the host
+        // sweep, a committed-with-lost-staged rotation is superseded by it (§5.6).
         if (data $contact_migration) != NIL
         {
             contact_migration -> (data $contact_migration) safe (global_id ->> mig_state_t).
@@ -4575,6 +4611,9 @@ library a2a_messaging loads libraries
         // included). Park the blob; the host drives commit_e2e_restore next (still
         // pre-exposure), where a validation failure is isolated + atomic.
         if es != NIL { e2e_restore_staged -> es. }
+        // Ship-review major-4: restore the sweep resume cursor (absent in older blobs).
+        if (data $redrive_cursor) != NIL
+        { redrive_sweep_cursor -> (data $redrive_cursor) safe global_id. }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the
