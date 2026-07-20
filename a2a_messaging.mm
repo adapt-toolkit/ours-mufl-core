@@ -134,6 +134,10 @@ library a2a_messaging loads libraries
     // re-driving 50×N contacts could hit fuel/action limits and lose the WHOLE sweep.
     // A contact's queue is capped at unacked_cap (50) < this budget, so every contact
     // is individually processable; overflow defers the remainder to the cursor.
+    // DELIBERATELY denominated in CRYPTO OPERATIONS (each entry = one e2e::encrypt_to
+    // ratchet encryption), NOT in fuel: the fuel model undercounts fixed signature/
+    // crypto costs (cross-fleet finding), so a fuel-denominated budget would be a
+    // weaker resource guard than it looks. Counting real crypto ops is exact.
     redrive_sweep_max_entries = 100.
     // Data-at-rest bounds for the retained plaintext (review: a peer withholding
     // receipts must not pin our plaintext forever): total per-contact byte budget
@@ -4370,9 +4374,12 @@ library a2a_messaging loads libraries
             $contact_e2e_epoch  -> contact_e2e_epoch,
             $mig_deferred       -> mig_deferred,
             // core 0.11 Signal-model restart survival: the pickle_key-SEALED Olm account +
-            // per-peer session + staged pickles (all opaque bin). Persisting them lets a restart
-            // RESUME the exact ratchet instead of re-minting a fresh account (the desync root
-            // cause) — self-heal then only runs on TRUE loss (reinstall/corruption). state_data.bin
+            // LIVE per-peer session pickles (opaque bin). m_staged is deliberately NOT
+            // exported — a restart mid-migration drops the transient staged session and the
+            // migration sweep supersedes it (review #16: this comment previously claimed
+            // staged was persisted). Persisting account+live lets a restart RESUME the exact
+            // ratchet instead of re-minting a fresh account (the desync root cause) —
+            // self-heal then only runs on TRUE loss (reinstall/corruption). state_data.bin
             // is LOCAL-ONLY, so this stays off any peer/broker; the sealed bytes carry no raw
             // secretkey type. NOTE: if state_data.bin is ever repurposed as a CROSS-NODE portable
             // blob, move this to a local sidecar (the material is local-secrecy class).
@@ -4555,13 +4562,12 @@ library a2a_messaging loads libraries
                 }
             }
         }
-        // core 0.11 Signal-model restart survival: restore the SEALED Olm account + sessions +
-        // staged pickles BEFORE anything can lazily mint a fresh account (import_core_state runs
-        // during boot import_state, before the daemon serves any send/receive that calls
-        // account()). A pre-0.11 blob lacks the field → safe-cast NIL → no restore → a fresh
-        // account is lazily minted and the self-heal fallback re-establishes (clean degrade). A
-        // corrupt/partial field likewise safe-casts to NIL → fallback (state_data.bin itself is
-        // written atomically via tmp+rename, so partial writes do not occur).
+        // core 0.11 Signal-model restart survival: the SEALED Olm account + LIVE session
+        // pickles (no staged — see export). A pre-0.11 blob lacks the field → safe-cast
+        // NIL → no restore → a fresh account is lazily minted and the self-heal fallback
+        // re-establishes (clean degrade). A STRUCTURALLY corrupt field safe-casts to NIL
+        // (same fallback); content-corrupt sealed bytes are caught later by the validated
+        // commit (finding C redo below).
         es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+
             = (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
         // Finding C redo: do NOT validate or assign here — a corrupt pickle raises a
