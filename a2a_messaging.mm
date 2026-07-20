@@ -124,6 +124,12 @@ library a2a_messaging loads libraries
     // Per-contact cap on unacknowledged (no delivered-receipt yet) e2e sends retained for
     // redrive after a re-key (mirrors deferred_msgs_cap; oldest dropped first, never abort).
     unacked_cap = 50.
+    // Age before the periodic sweep re-sends a stuck unacked message (no delivered
+    // receipt). Covers a PRE-fix peer that silently rejected our sends and cannot ask
+    // us to re-key (it heals once our boot-readvertise refreshed its copy of our AD),
+    // and a lost receipt. Repeats are harmless: the receiver's delivered_wire dedup
+    // re-acks without re-depositing, and the re-ack clears our buffer.
+    redrive_min_age_seconds = 120.
 
     // 6-digit bind ceremony limits (code is generated host-side — MUFL has no
     // random source — and handed to set_proxy_pending).
@@ -3806,6 +3812,31 @@ library a2a_messaging loads libraries
             n -> n + 1.
         }
         actions (_count actions|) -> _return_data ($readvertised -> n).
+        return transaction::success actions.
+    }
+
+    // core 0.11 (session self-heal, retry leg): re-send unacked e2e messages stuck without
+    // a delivered receipt for redrive_min_age_seconds+ (see the const above). Host calls
+    // this on the boot/GC cadence next to readvertise_e2e_recovery. Mutates session state
+    // (encrypt_to advances the ratchet) → _save_state when anything was redriven.
+    trn redrive_unacked_sweep _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        now = (current_transaction_info::get_transaction_time())?.
+        actions is transaction::action::type[] = [].
+        n is int = 0.
+        sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
+        {
+            oldest is time+ = NIL.
+            sc q -- ( -> ent) { if oldest == NIL { oldest -> (ent $date). } }
+            if oldest != NIL && (_substract_seconds now (oldest?)) > redrive_min_age_seconds
+            {
+                sc redrive_unacked_actions cid -- ( -> a) { actions (_count actions|) -> a. }
+                n -> n + 1.
+            }
+        }
+        if n > 0 { actions (_count actions|) -> _save_state NIL. }
+        actions (_count actions|) -> _return_data ($redriven_contacts -> n).
         return transaction::success actions.
     }
 
