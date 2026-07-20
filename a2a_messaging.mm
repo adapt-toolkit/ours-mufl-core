@@ -130,6 +130,21 @@ library a2a_messaging loads libraries
     // and a lost receipt. Repeats are harmless: the receiver's delivered_wire dedup
     // re-acks without re-depositing, and the re-ack clears our buffer.
     redrive_min_age_seconds = 120.
+    // Data-at-rest bounds for the retained plaintext (review: a peer withholding
+    // receipts must not pin our plaintext forever): total per-contact byte budget
+    // (oldest dropped first; an entry alone above the budget is never retained),
+    // and a hard TTL — the periodic sweep purges expired entries.
+    unacked_max_bytes = 8388608.
+    unacked_ttl_seconds = 172800.
+    // Per-ENTRY byte ceiling for retained FILES ("f") — a large file body would bloat
+    // the exported blob (data-at-rest) and one entry could evict the whole message
+    // window. An oversized file is simply not retained (not auto-redriven; surfaced
+    // by the send notify as usual — the app owns re-sending it after a heal).
+    unacked_file_entry_max_bytes = 2097152.
+    // Responder-side re-key throttle: minimum seconds between session rotations
+    // served to one cid (see handle_e2e_rekey_request — requester-side rate-limit
+    // alone does not bound a misbehaving authenticated contact).
+    rekey_min_interval_seconds = 30.
 
     // 6-digit bind ceremony limits (code is generated host-side — MUFL has no
     // random source — and handed to set_proxy_pending).
@@ -255,15 +270,28 @@ library a2a_messaging loads libraries
     // material (INV-4 untouched — no session pickle here). Bounded (unacked_cap,
     // oldest-first drop); entries clear on delivered/read receipt; EXPORTED so a
     // sender-side restart (offline-pair case) does not lose undelivered messages.
-    metadef unacked_entry_t: ($wire_id -> str, $inner -> bin, $date -> time).
+    // $kind: "m" (message, redriven as receive_e2e_message_tx) | "f" (file,
+    // redriven as receive_e2e_file_tx) — files silently lost on restart are the
+    // owner's primary case too, so BOTH app payload kinds retain (review fix).
+    metadef unacked_entry_t: ($kind -> str, $wire_id -> str, $inner -> bin, $date -> time).
     unacked_e2e is (global_id ->> unacked_entry_t[]) = (,).
+    // Responder-side re-key ledger, keyed STRICTLY by cid (review: never key the
+    // budget by attacker-controlled fields like the claimed session id). $attempts
+    // caps total served rotations between successful decodes from that cid (the
+    // ledger clears when the pair provably healed); $updated drives the cooldown.
+    // Transient, not exported — worst case after restart is one extra rotation.
+    metadef rekey_served_t: ($attempts -> int, $updated -> time).
+    rekey_served is (global_id ->> rekey_served_t) = (,).
+    rekey_served_max = 5.
     // Recently DELIVERED inbound wire_ids per contact (ring, delivered_wire_cap) — the
     // receive-side dedup for the at-least-once redrive: a re-delivered wire_id re-acks
     // (delivered receipt, so the sender's buffer clears) but never re-deposits into the
     // inbox. EXPORTED (tiny): the inbox it guards is persisted too, so the guard must
     // survive the same restarts. Ring > unacked_cap so it always covers a full redrive.
     delivered_wire is (global_id ->> str[]) = (,).
-    delivered_wire_cap = 64.
+    // Review: strictly larger than unacked_cap with headroom — an old wire_id must not
+    // evict from the ring before its (possibly receipt-lost, sweep-redriven) retry lands.
+    delivered_wire_cap = 256.
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -889,20 +917,41 @@ library a2a_messaging loads libraries
         return code == "no_session" || code == "session_mismatch" || code == "tampered".
     }
     // Retain an outbound e2e app send until its delivered/read receipt (redrive source).
-    // Oldest-first drop at unacked_cap — retention is best-effort, never an abort.
-    fn unacked_note (cid: global_id, wire_id: str, inner: bin, date: time) -> nil
+    // Bounded three ways, never an abort: entry count (unacked_cap, oldest first),
+    // per-contact bytes (unacked_max_bytes — an entry alone above the budget is not
+    // retained at all), and age (unacked_ttl_seconds, purged by the periodic sweep).
+    fn unacked_note (cid: global_id, kind: str, wire_id: str, inner: bin, date: time) -> nil
     {
-        q0 = unacked_e2e cid.
-        q is unacked_entry_t[] = [].
-        if q0 != NIL
+        new_len = _binlen inner.
+        entry_cap is int = unacked_max_bytes.
+        if kind == "f" { entry_cap -> unacked_file_entry_max_bytes. }
+        if new_len <= entry_cap
         {
-            start is int = 0.
-            if (_count (q0?)|) >= unacked_cap { start -> (_count (q0?)|) - unacked_cap + 1. }
-            i is int = 0.
-            sc q0? -- ( -> ent) { if i >= start { q (_count q|) -> ent. }  i -> i + 1. }
+            q0 = unacked_e2e cid.
+            kept is unacked_entry_t[] = [].
+            if q0 != NIL
+            {
+                // Totals INCLUDING the new entry, then shed oldest-first until both
+                // budgets (count, bytes) hold; copy the surviving suffix in order.
+                total is int = new_len.
+                cnt is int = 1.
+                sc q0? -- ( -> ent) { total -> total + (_binlen (ent $inner)).  cnt -> cnt + 1. }
+                drop is int = 0.
+                sc q0? -- ( -> ent)
+                {
+                    if cnt > unacked_cap || total > unacked_max_bytes
+                    {
+                        total -> total - (_binlen (ent $inner)).
+                        cnt -> cnt - 1.
+                        drop -> drop + 1.
+                    }
+                }
+                i is int = 0.
+                sc q0? -- ( -> ent) { if i >= drop { kept (_count kept|) -> ent. }  i -> i + 1. }
+            }
+            kept (_count kept|) -> ($kind -> kind, $wire_id -> wire_id, $inner -> inner, $date -> date).
+            unacked_e2e cid -> kept.
         }
-        q (_count q|) -> ($wire_id -> wire_id, $inner -> inner, $date -> date).
-        unacked_e2e cid -> q.
     }
     // Receive-side dedup ring (see delivered_wire above): membership probe + bounded note.
     fn wire_seen (cid: global_id, wire_id: str) -> bool
@@ -964,7 +1013,7 @@ library a2a_messaging loads libraries
         {
             eenv = e2e::encrypt_to cid (ent $inner) epb.
             acts (_count acts|) -> encrypted_channel::send_encrypted_tx cid (
-                $name -> receive_e2e_message_tx,
+                $name -> ((ent $kind) == "f" ?? receive_e2e_file_tx ; receive_e2e_message_tx),
                 $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ).
             acts (_count acts|) -> _notify_agent ( $event -> $e2e_app_send, $cid -> cid,
                 $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type),
@@ -985,18 +1034,41 @@ library a2a_messaging loads libraries
         now = (current_transaction_info::get_transaction_time())?.
         rekey_pending cid -> ($session_id -> (env_sid?), $attempts -> att, $updated -> now).
         b = my_identity_bundle_fields_fresh NIL.
-        acts is transaction::action::type[] = [
-            encrypted_channel::send_encrypted_tx cid (
+        acts is transaction::action::type[] = [].
+        // Leg-5 compat gate: send the rekey control tx ONLY to a peer that advertises
+        // cap_e2e_rekey. A pre-0.11 peer (e.g. the device-sealed 0.10.1 connector) must
+        // never receive an unknown control tx — it gets a readvertise_ad instead, which
+        // it DOES handle: that refreshes its copy of MY AD, so my redriven pre-keys
+        // below verify on its establish path (its own dead-session sends heal only
+        // after its next pre-key — the pre-fix limitation the upgrade removes).
+        supports is bool = FALSE.
+        pcaps = contact_caps cid.
+        if pcaps != NIL
+        { sc pcaps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_rekey { supports -> TRUE. } } }
+        if supports
+        {
+            acts (_count acts|) -> encrypted_channel::send_encrypted_tx cid (
                 $name -> e2e_rekey_request_tx,
                 $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
                            $cp_binding -> (b $cp_binding),
                            $pv -> a2a_versions::wire_version,
                            $caps -> (a2a_capabilities::self_cap_ids NIL),
-                           $failed_session_id -> (env_sid?) ) ),
-            _notify_agent ($event -> $e2e_rekey, $cid -> cid, $role -> $requester, $session_id -> env_sid, $attempts -> att) ].
+                           $failed_session_id -> (env_sid?) ) ).
+        }
+        else
+        {
+            acts (_count acts|) -> encrypted_channel::send_encrypted_tx cid (
+                $name -> readvertise_ad_tx,
+                $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                           $cp_binding -> (b $cp_binding),
+                           $pv -> a2a_versions::wire_version,
+                           $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
+        }
+        acts (_count acts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> cid, $role -> $requester, $session_id -> env_sid, $attempts -> att, $peer_supports -> supports).
         // My own unacked sends to this cid (if any) redrive NOW: encrypt_to lazily
         // (re)establishes a fresh outbound pre-key, which the peer's establish path
-        // accepts once it holds my fresh AD — the request above carries it.
+        // accepts once it holds my fresh AD — the request/readvertise above carries it
+        // (batch order: refresh lands before the pre-keys).
         sc redrive_unacked_actions cid -- ( -> a) { acts (_count acts|) -> a. }
         acts (_count acts|) -> _save_state NIL.
         return acts.
@@ -1468,7 +1540,7 @@ library a2a_messaging loads libraries
             eenv = e2e::encrypt_to target_id einner epb.
             // core 0.11 self-heal: retain until the delivered receipt — the redrive source
             // if the peer restarted and this send lands on a dead session (silent-drop fix).
-            unacked_note target_id wire_id einner sent_date.
+            unacked_note target_id "m" wire_id einner sent_date.
             eacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_message_tx,
@@ -1547,6 +1619,9 @@ library a2a_messaging loads libraries
             fepb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
             finner = _write ( $filename -> filename, $mime -> mime_s, $data -> data, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
             fenv = e2e::encrypt_to target_id finner fepb.
+            // core 0.11 self-heal: files retain for redrive exactly like messages (review
+            // fix — a restarted receiver silently losing FILES is the owner's primary case).
+            unacked_note target_id "f" wire_id finner sent_date.
             feacts is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_file_tx,
@@ -1606,6 +1681,13 @@ library a2a_messaging loads libraries
         // every export and, on a later RE-ADD of the same peer, the boot/GC sweep
         // would silently deliver the stale queued messages.
         if (deferred_msgs target_id) != NIL { delete deferred_msgs target_id. }
+        // core 0.11 self-heal stores (review fix): unacked_e2e is EXPORTED plaintext —
+        // removal must erase it (delete semantics), and a later re-add of the same cid
+        // must never redrive removed-era messages or dedup against stale wire_ids.
+        if (unacked_e2e target_id) != NIL { delete unacked_e2e target_id. }
+        if (delivered_wire target_id) != NIL { delete delivered_wire target_id. }
+        if (rekey_pending target_id) != NIL { delete rekey_pending target_id. }
+        if (rekey_served target_id) != NIL { delete rekey_served target_id. }
         if (pending_restores target_id) != NIL { delete pending_restores target_id. }
         if (pending_restore_keys target_id) != NIL { delete pending_restore_keys target_id. }
         if (pending_restore_replies target_id) != NIL { delete pending_restore_replies target_id. }
@@ -2943,8 +3025,10 @@ library a2a_messaging loads libraries
     {
         acts is transaction::action::type[] = [].
         // core 0.11 self-heal: a successful decode from this cid means the pair converged —
-        // reset the re-key budget so a FUTURE desync (new dead session) gets a fresh one.
+        // reset BOTH re-key budgets (requester + responder ledgers) so a FUTURE genuine
+        // desync gets a fresh one.
         if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+        if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
         // Record the delivery for the at-least-once redrive dedup (no-op on ""). Rides the
         // same tx as the deposit, so guard and inbox commit or roll back together.
         delivered_note sender_id wire_id.
@@ -3359,6 +3443,13 @@ library a2a_messaging loads libraries
         if (contacts sender_id) == NIL { return transaction::success []. }
         // Verify + ingest the refreshed AD (cid-bind + PoP; forgery aborts). Caller writes peer_ads.
         vb = verify_identity_bundle (args as any) sender_id.
+        // F187 anti-downgrade (core 0.11): a KNOWN-e2e contact never legitimately refreshes
+        // to a bundle-less (v1, down-levelled) AD — accepting one would overwrite the v2
+        // peer_ads entry and brick the pair into downgrade_refused (state poisoning by an
+        // authenticated-but-misbehaving peer). Validate BEFORE the write; ignore otherwise.
+        ra_bundle = (((vb $ad) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        if (e2e_pinned sender_id || (contact_e2e_epoch sender_id) != NIL) && ra_bundle == NIL
+        { return transaction::success []. }
         peer_ads sender_id -> (vb $ad).
         // Learn the peer's version + caps piggyback so it becomes known-0.9 (the mig_should_trigger gate).
         pv_seen = a2a_versions::peer_pv args.
@@ -3391,9 +3482,12 @@ library a2a_messaging loads libraries
     // MY fresh AD (readvertise back) so a MUTUALLY-stale pair (both restarted) converges in
     // one exchange: both peer_ads fresh → all surviving traffic is fresh pre-keys → the
     // 0.8.0 establish path accepts them. No epoch/pin state is touched (no downgrade
-    // surface); a replayed request only re-runs an idempotent refresh+re-key (and the
-    // requester side is rate-limited per (cid, session_id)). A migration genuinely in
-    // flight owns its staged slot — never clobbered here; the sweep supersedes it.
+    // surface). Replay/spam is bounded RESPONDER-side (see the gating below): a rotation
+    // is served only for MY CURRENT session id and at most once per cooldown window —
+    // a replayed or repeated request degrades to the idempotent peer_ads refresh. The
+    // requester side is additionally rate-limited per (cid, session_id). A migration
+    // genuinely in flight owns its staged slot — never clobbered here; the sweep
+    // supersedes it.
     fn handle_e2e_rekey_request (args: any) -> transaction::results::type
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
@@ -3401,13 +3495,44 @@ library a2a_messaging loads libraries
         sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
         // Only known contacts; an unknown sender is a silent no-op (no state, no leak).
         if (contacts sender_id) == NIL { return transaction::success []. }
-        // Verify + ingest the refreshed AD (cid-bind + PoP; forgery aborts).
+        // Verify the refreshed AD (cid-bind + PoP; forgery aborts) — but VALIDATE BEFORE
+        // ANY WRITE (F187 anti-downgrade/poisoning): a known-e2e contact's refresh MUST
+        // carry an e2e_bundle. A bundle-less (v1, down-levelled) AD from an authenticated
+        // -but-misbehaving peer would otherwise overwrite the known-v2 peer_ads entry and
+        // brick the pair into downgrade_refused until the next genuine readvertise.
         vb = verify_identity_bundle (args as any) sender_id.
+        vb_bundle = (((vb $ad) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        if (e2e_pinned sender_id || (contact_e2e_epoch sender_id) != NIL) && vb_bundle == NIL
+        { return transaction::success [ _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $responder, $rejected -> $bundle_less) ]. }
         peer_ads sender_id -> (vb $ad).
         pv_seen = a2a_versions::peer_pv args.
         caps_in is str[] = ((args $caps) == NIL ?? [] ; ((args $caps) safe (str[]))).
         learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) caps_in.
         actions is transaction::action::type[] = [].
+        // RESPONDER-SIDE gating (review fix — the requester-side rate-limit alone does not
+        // bound a misbehaving AUTHENTICATED contact; every served rotation costs a fresh
+        // session + up to a full buffer redrive + a readvertise send). The BUDGET is keyed
+        // strictly by cid (never by the attacker-controlled claimed sid):
+        //  (a) attempts cap: at most rekey_served_max served rotations per cid between
+        //      successful decodes from it (the ledger clears when the pair provably heals);
+        //  (b) cooldown: at most one served rotation per cid per rekey_min_interval_seconds;
+        //  (c) sid VALIDATION (not budget): $failed_session_id is REQUIRED and must name MY
+        //      CURRENT outbound session to this cid (the envelope sid it failed to decode IS
+        //      my active session id — session ids are shared by both channel ends), or I
+        //      must hold NO session. A stale sid (I already rotated) and a replay are no-ops.
+        // The peer_ads/caps refresh above stays otherwise unconditional — idempotent, no
+        // send, and a genuinely restarted peer needs it regardless.
+        fsid is bin+ = (args $failed_session_id) safe bin.
+        active is bin+ = e2e::active_session_id sender_id.
+        sid_ok is bool = fsid != NIL && (active == NIL || (active?) == (fsid?)).
+        now = (current_transaction_info::get_transaction_time())?.
+        served = rekey_served sender_id.
+        budget_ok is bool = TRUE.
+        if served != NIL
+        {
+            if ((served?) $attempts) >= rekey_served_max { budget_ok -> FALSE. }
+            if (_substract_seconds now ((served?) $updated)) < rekey_min_interval_seconds { budget_ok -> FALSE. }
+        }
         mig_inflight is bool = FALSE.
         st = contact_migration sender_id.
         if st != NIL
@@ -3415,26 +3540,34 @@ library a2a_messaging loads libraries
             ph = (st?) $phase.
             mig_inflight -> ph == "offered" || ph == "acknowledged" || ph == "committed".
         }
-        if mig_inflight != TRUE && (peer_has_e2e_bundle sender_id)
+        if sid_ok && budget_ok && mig_inflight != TRUE && (peer_has_e2e_bundle sender_id)
         {
             epb = ((((peer_ads sender_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
             if epb != NIL
             {
+                att is int = 1.
+                if served != NIL { att -> ((served?) $attempts) + 1. }
+                rekey_served sender_id -> ($attempts -> att, $updated -> now).
+                // An ORPHANED staged slot (occupied while no migration is in flight —
+                // e.g. a stalled/abandoned rotation) is discarded, never promoted: the
+                // fresh rotation below supersedes it (spec §5.5 abandon-and-supersede).
+                if (e2e::staged_session_id sender_id) != NIL { e2e::discard_rotation sender_id. }
                 e2e::stage_outbound_rotation sender_id (epb?).
                 e2e::commit_rotation sender_id.
                 sc redrive_unacked_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }
+                // Readvertise back: the requester refreshes ITS copy of MY bundle (the
+                // convergence leg for the both-restarted case). Rides the same gate as the
+                // rotation — never an unthrottled amplification.
+                b = my_identity_bundle_fields_fresh NIL.
+                actions (_count actions|) -> encrypted_channel::send_encrypted_tx sender_id (
+                    $name -> readvertise_ad_tx,
+                    $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                               $cp_binding -> (b $cp_binding),
+                               $pv -> a2a_versions::wire_version,
+                               $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
+                actions (_count actions|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $responder, $session_id -> fsid).
             }
         }
-        // Readvertise back: the requester refreshes ITS copy of MY bundle (the convergence
-        // leg for the both-restarted case).
-        b = my_identity_bundle_fields_fresh NIL.
-        actions (_count actions|) -> encrypted_channel::send_encrypted_tx sender_id (
-            $name -> readvertise_ad_tx,
-            $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
-                       $cp_binding -> (b $cp_binding),
-                       $pv -> a2a_versions::wire_version,
-                       $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
-        actions (_count actions|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $responder, $session_id -> (args $failed_session_id)).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -3825,6 +3958,21 @@ library a2a_messaging loads libraries
         now = (current_transaction_info::get_transaction_time())?.
         actions is transaction::action::type[] = [].
         n is int = 0.
+        // TTL purge first (data-at-rest bound): entries past unacked_ttl_seconds are
+        // dropped for good — a peer withholding receipts cannot pin plaintext forever.
+        expired is global_id[] = [].
+        sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
+        {
+            live is unacked_entry_t[] = [].
+            sc q -- ( -> ent)
+            { if (_substract_seconds now (ent $date)) <= unacked_ttl_seconds { live (_count live|) -> ent. } }
+            if (_count live|) < (_count q|)
+            {
+                if (_count live|) == 0 { expired (_count expired|) -> cid. } else { unacked_e2e cid -> live. }
+                n -> n + 1.
+            }
+        }
+        sc expired -- ( -> cid) { delete unacked_e2e cid. }
         sc unacked_e2e -- (cid -> q) ?? (_count q|) > 0
         {
             oldest is time+ = NIL.
