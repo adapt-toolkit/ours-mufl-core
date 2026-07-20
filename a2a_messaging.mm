@@ -251,6 +251,13 @@ library a2a_messaging loads libraries
     // sender-side restart (offline-pair case) does not lose undelivered messages.
     metadef unacked_entry_t: ($wire_id -> str, $inner -> bin, $date -> time).
     unacked_e2e is (global_id ->> unacked_entry_t[]) = (,).
+    // Recently DELIVERED inbound wire_ids per contact (ring, delivered_wire_cap) — the
+    // receive-side dedup for the at-least-once redrive: a re-delivered wire_id re-acks
+    // (delivered receipt, so the sender's buffer clears) but never re-deposits into the
+    // inbox. EXPORTED (tiny): the inbox it guards is persisted too, so the guard must
+    // survive the same restarts. Ring > unacked_cap so it always covers a full redrive.
+    delivered_wire is (global_id ->> str[]) = (,).
+    delivered_wire_cap = 64.
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -890,6 +897,32 @@ library a2a_messaging loads libraries
         }
         q (_count q|) -> ($wire_id -> wire_id, $inner -> inner, $date -> date).
         unacked_e2e cid -> q.
+    }
+    // Receive-side dedup ring (see delivered_wire above): membership probe + bounded note.
+    fn wire_seen (cid: global_id, wire_id: str) -> bool
+    {
+        q = delivered_wire cid.
+        if q == NIL { return FALSE. }
+        hit is bool = FALSE.
+        sc q? -- ( -> w) { if w == wire_id { hit -> TRUE. } }
+        return hit.
+    }
+    fn delivered_note (cid: global_id, wire_id: str) -> nil
+    {
+        if wire_id != ""
+        {
+            q0 = delivered_wire cid.
+            q is str[] = [].
+            if q0 != NIL
+            {
+                start is int = 0.
+                if (_count (q0?)|) >= delivered_wire_cap { start -> (_count (q0?)|) - delivered_wire_cap + 1. }
+                i is int = 0.
+                sc q0? -- ( -> w) { if i >= start { q (_count q|) -> w. }  i -> i + 1. }
+            }
+            q (_count q|) -> wire_id.
+            delivered_wire cid -> q.
+        }
     }
     // Drop the entries a delivered/read receipt covers. Returns TRUE when anything cleared.
     fn unacked_clear (cid: global_id, ids: str[]) -> bool
@@ -2906,6 +2939,9 @@ library a2a_messaging loads libraries
         // core 0.11 self-heal: a successful decode from this cid means the pair converged —
         // reset the re-key budget so a FUTURE desync (new dead session) gets a fresh one.
         if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+        // Record the delivery for the at-least-once redrive dedup (no-op on ""). Rides the
+        // same tx as the deposit, so guard and inbox commit or roll back together.
+        delivered_note sender_id wire_id.
         if wire_id != ""
         { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { acts (_count acts|) -> a. } }
         acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
@@ -2988,6 +3024,19 @@ library a2a_messaging loads libraries
         if (iv $wire_id) != NIL { wire_id -> (iv $wire_id) safe str. }
         reply_to is a2a_protocol::reply_ref_t+ = NIL.
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
+
+        // core 0.11 self-heal: at-least-once redrive dedup. An already-delivered wire_id
+        // RE-ACKS (so the sender's unacked buffer clears even when the first receipt was
+        // lost) but never re-deposits into the inbox. The decode above ADVANCED the
+        // ratchet — persist it (the _save_state below), or a restart would desync again.
+        if wire_id != "" && (wire_seen sender_id wire_id)
+        {
+            dacts is transaction::action::type[] = [].
+            sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { dacts (_count dacts|) -> a. }
+            dacts (_count dacts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id, $duplicate -> TRUE).
+            dacts (_count dacts|) -> _save_state NIL.
+            return transaction::success dacts.
+        }
 
         actions is transaction::action::type[] = [].
         // do_ic: promote BEFORE deliver, SAME tx (must-fix-C rollback — see mig_e2e_promote_actions).
@@ -3877,7 +3926,8 @@ library a2a_messaging loads libraries
             // core 0.11 self-heal: unacked e2e sends (additive; app payload class, NO key
             // material — INV-4 holds). rekey_pending is deliberately NOT exported (transient
             // rate-limit ledger; a restart at worst re-sends one idempotent request).
-            $unacked_e2e        -> unacked_e2e
+            $unacked_e2e        -> unacked_e2e,
+            $delivered_wire     -> delivered_wire
         ).
     }
 
@@ -4028,6 +4078,10 @@ library a2a_messaging loads libraries
         if (data $unacked_e2e) != NIL
         {
             unacked_e2e -> (data $unacked_e2e) safe (global_id ->> unacked_entry_t[]).
+        }
+        if (data $delivered_wire) != NIL
+        {
+            delivered_wire -> (data $delivered_wire) safe (global_id ->> str[]).
         }
 
         // Re-register every peer's keys so encrypted channels keep working after
