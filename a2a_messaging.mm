@@ -1021,30 +1021,54 @@ library a2a_messaging loads libraries
         }
         return acts.
     }
-    fn rekey_request_actions (cid: global_id, env_sid: bin+) -> transaction::action::type[]
+    // A CONTENTLESS e2e pre-key ("rekey ping"): the initiator sends it to BOOTSTRAP the shared
+    // session when it has minted a fresh outbound but has no buffered app data to carry the
+    // pre-key. The peer's decode establishes the session (and its session-replace redrives its
+    // own buffer); the $rekey_ping marker suppresses any inbox deposit. Requires a live/just-
+    // minted session (caller mints first); no-op without a peer bundle.
+    fn rekey_ping_actions (cid: global_id) -> transaction::action::type[]
     {
-        if env_sid == NIL { return []. }
+        pad = peer_ads cid.
+        if pad == NIL { return []. }
+        epb = (((pad?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        if epb == NIL { return []. }
+        pinner = _write ( $rekey_ping -> TRUE, $pv -> a2a_versions::wire_version ).
+        eenv = e2e::encrypt_to cid pinner epb.
+        return [ encrypted_channel::send_encrypted_tx cid (
+                     $name -> receive_e2e_message_tx,
+                     $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ),
+                 _notify_agent ( $event -> $e2e_app_send, $cid -> cid, $rekey_ping -> TRUE,
+                     $session_id -> ((eenv $e2e_envelope) $session_id), $olm_type -> ((eenv $e2e_envelope) $olm_type) ) ].
+    }
+    // Does this peer advertise the self-heal cap (Leg-5 compat gate)? A pre-0.11 peer never
+    // receives the unknown e2e_rekey_request tx — it gets a readvertise_ad instead.
+    fn peer_supports_rekey (cid: global_id) -> bool
+    {
+        pcaps = contact_caps cid.
+        if pcaps == NIL { return FALSE. }
+        hit is bool = FALSE.
+        sc pcaps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_rekey { hit -> TRUE. } }
+        return hit.
+    }
+    // SIGNAL the peer to (re-)establish: carry my FRESH AD so it can authenticate my pre-keys,
+    // and — if it speaks the cap — ask it to re-key. fsid is ADVISORY ($failed_session_id, NIL
+    // for a proactive send-side nudge). Rate-limited per cid (attempts within a window) so a
+    // decode-fail storm or a spammer cannot amplify. Sends exactly ONE control message. Does
+    // NOT mint or redrive — the caller decides that by role (only the initiator mints).
+    fn rekey_signal_actions (cid: global_id, fsid: bin+) -> transaction::action::type[]
+    {
+        now = (current_transaction_info::get_transaction_time())?.
         st = rekey_pending cid.
         att is int = 1.
-        if st != NIL && ((st?) $session_id) == (env_sid?)
+        if st != NIL && (_substract_seconds now ((st?) $updated)) < rekey_min_interval_seconds
         {
             if ((st?) $attempts) >= rekey_max_attempts { return []. }
             att -> ((st?) $attempts) + 1.
         }
-        now = (current_transaction_info::get_transaction_time())?.
-        rekey_pending cid -> ($session_id -> (env_sid?), $attempts -> att, $updated -> now).
+        rekey_pending cid -> ($session_id -> fsid, $attempts -> att, $updated -> now).
         b = my_identity_bundle_fields_fresh NIL.
+        supports = peer_supports_rekey cid.
         acts is transaction::action::type[] = [].
-        // Leg-5 compat gate: send the rekey control tx ONLY to a peer that advertises
-        // cap_e2e_rekey. A pre-0.11 peer (e.g. the device-sealed 0.10.1 connector) must
-        // never receive an unknown control tx — it gets a readvertise_ad instead, which
-        // it DOES handle: that refreshes its copy of MY AD, so my redriven pre-keys
-        // below verify on its establish path (its own dead-session sends heal only
-        // after its next pre-key — the pre-fix limitation the upgrade removes).
-        supports is bool = FALSE.
-        pcaps = contact_caps cid.
-        if pcaps != NIL
-        { sc pcaps? -- ( -> c) { if c == a2a_capabilities::cap_e2e_rekey { supports -> TRUE. } } }
         if supports
         {
             acts (_count acts|) -> encrypted_channel::send_encrypted_tx cid (
@@ -1053,7 +1077,7 @@ library a2a_messaging loads libraries
                            $cp_binding -> (b $cp_binding),
                            $pv -> a2a_versions::wire_version,
                            $caps -> (a2a_capabilities::self_cap_ids NIL),
-                           $failed_session_id -> (env_sid?) ) ).
+                           $failed_session_id -> fsid ) ).
         }
         else
         {
@@ -1064,13 +1088,48 @@ library a2a_messaging loads libraries
                            $pv -> a2a_versions::wire_version,
                            $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
         }
-        acts (_count acts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> cid, $role -> $requester, $session_id -> env_sid, $attempts -> att, $peer_supports -> supports).
-        // My own unacked sends to this cid (if any) redrive NOW: encrypt_to lazily
-        // (re)establishes a fresh outbound pre-key, which the peer's establish path
-        // accepts once it holds my fresh AD — the request/readvertise above carries it
-        // (batch order: refresh lands before the pre-keys).
+        acts (_count acts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> cid, $role -> $requester, $session_id -> fsid, $attempts -> att, $peer_supports -> supports).
+        return acts.
+    }
+    // INITIATOR-ONLY re-establishment: mint ONE fresh outbound session (the sole new session
+    // the pair converges on) and drive a pre-key to the peer — redriving buffered sends, or a
+    // contentless ping if there is nothing to carry. Returns [] (mints nothing) unless I am the
+    // elected initiator (lower cid), the cid-keyed budget allows it, the advisory fsid is not
+    // stale, and no migration is in flight (the FSM owns re-key then). The NON-initiator never
+    // calls through here — it signals and waits for THIS side's pre-key.
+    fn maybe_init_rekey (cid: global_id, fsid: bin+) -> transaction::action::type[]
+    {
+        if (mig_initiator cid) != TRUE { return []. }
+        if (peer_has_e2e_bundle cid) != TRUE { return []. }
+        st = contact_migration cid.
+        if st != NIL
+        {
+            ph = (st?) $phase.
+            if ph == "offered" || ph == "acknowledged" || ph == "committed" { return []. }
+        }
+        now = (current_transaction_info::get_transaction_time())?.
+        active is bin+ = e2e::active_session_id cid.
+        if fsid != NIL && active != NIL && (active?) != (fsid?) { return []. }   // stale request — I already rotated
+        served = rekey_served cid.
+        if served != NIL
+        {
+            if ((served?) $attempts) >= rekey_served_max { return []. }
+            if (_substract_seconds now ((served?) $updated)) < rekey_min_interval_seconds { return []. }
+        }
+        epb = ((((peer_ads cid)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        if epb == NIL { return []. }
+        att is int = 1.
+        if served != NIL { att -> ((served?) $attempts) + 1. }
+        rekey_served cid -> ($attempts -> att, $updated -> now).
+        // Discard any orphaned staged slot (occupied outside an in-flight migration) so the
+        // fresh rotation is the SOLE promotion; then mint the new outbound session.
+        if (e2e::staged_session_id cid) != NIL { e2e::discard_rotation cid. }
+        e2e::stage_outbound_rotation cid (epb?).
+        e2e::commit_rotation cid.
+        acts is transaction::action::type[] = [].
         sc redrive_unacked_actions cid -- ( -> a) { acts (_count acts|) -> a. }
-        acts (_count acts|) -> _save_state NIL.
+        if (_count acts|) == 0 { sc rekey_ping_actions cid -- ( -> a) { acts (_count acts|) -> a. } }
+        acts (_count acts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> cid, $role -> $initiator, $session_id -> (e2e::active_session_id cid), $attempts -> att).
         return acts.
     }
 
@@ -3104,11 +3163,30 @@ library a2a_messaging loads libraries
             if (r $error) != NIL { code -> ((r $error)?) $code. }
             racts is transaction::action::type[] = mig_e2e_reject_actions sender_id env_sid code.
             if rekey_desync_code code
-            { sc rekey_request_actions sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. } }
+            {
+                // Signal the peer (carry my fresh AD; ask for re-key if it speaks the cap),
+                // then — only if I am the elected initiator — mint the fresh session myself.
+                sc rekey_signal_actions sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. }
+                sc maybe_init_rekey sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. }
+                racts (_count racts|) -> _save_state NIL.
+            }
             return transaction::success racts.
         }
         // Decrypted inner app body (mirrors send_message's einner _write shape).
         iv = key_storage::read_external ((r $plaintext)?).
+        // core 0.11 self-heal: a rekey PING (contentless bootstrap pre-key) — the decode above
+        // established/replaced our session; redrive our buffer onto it and deliver NOTHING to
+        // the inbox. Heals the pair without an app message.
+        if (iv $rekey_ping) == TRUE
+        {
+            pacts is transaction::action::type[] = [].
+            if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+            if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
+            sc redrive_unacked_actions sender_id -- ( -> a) { pacts (_count pacts|) -> a. }
+            pacts (_count pacts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $healed, $session_id -> env_sid).
+            pacts (_count pacts|) -> _save_state NIL.
+            return transaction::success pacts.
+        }
         text = (iv $text) safe str.
         wire_id is str = "".
         if (iv $wire_id) != NIL { wire_id -> (iv $wire_id) safe str. }
@@ -3207,7 +3285,11 @@ library a2a_messaging loads libraries
             if (r $error) != NIL { code -> ((r $error)?) $code. }
             racts is transaction::action::type[] = mig_e2e_reject_actions sender_id env_sid code.
             if rekey_desync_code code
-            { sc rekey_request_actions sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. } }
+            {
+                sc rekey_signal_actions sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. }
+                sc maybe_init_rekey sender_id env_sid -- ( -> a) { racts (_count racts|) -> a. }
+                racts (_count racts|) -> _save_state NIL.
+            }
             return transaction::success racts.
         }
         // Decrypted inner file body (mirrors send_file's finner _write shape).
@@ -3509,65 +3591,31 @@ library a2a_messaging loads libraries
         caps_in is str[] = ((args $caps) == NIL ?? [] ; ((args $caps) safe (str[]))).
         learn_contact_version sender_id ((pv_seen != 0 ?? pv_seen ; 9)) caps_in.
         actions is transaction::action::type[] = [].
-        // RESPONDER-SIDE gating (review fix — the requester-side rate-limit alone does not
-        // bound a misbehaving AUTHENTICATED contact; every served rotation costs a fresh
-        // session + up to a full buffer redrive + a readvertise send). The BUDGET is keyed
-        // strictly by cid (never by the attacker-controlled claimed sid):
-        //  (a) attempts cap: at most rekey_served_max served rotations per cid between
-        //      successful decodes from it (the ledger clears when the pair provably heals);
-        //  (b) cooldown: at most one served rotation per cid per rekey_min_interval_seconds;
-        //  (c) sid VALIDATION (not budget): $failed_session_id is REQUIRED and must name MY
-        //      CURRENT outbound session to this cid (the envelope sid it failed to decode IS
-        //      my active session id — session ids are shared by both channel ends), or I
-        //      must hold NO session. A stale sid (I already rotated) and a replay are no-ops.
-        // The peer_ads/caps refresh above stays otherwise unconditional — idempotent, no
-        // send, and a genuinely restarted peer needs it regardless.
         fsid is bin+ = (args $failed_session_id) safe bin.
-        active is bin+ = e2e::active_session_id sender_id.
-        sid_ok is bool = fsid != NIL && (active == NIL || (active?) == (fsid?)).
         now = (current_transaction_info::get_transaction_time())?.
         served = rekey_served sender_id.
-        budget_ok is bool = TRUE.
-        if served != NIL
+        // CONVERGENCE LEG (Dev-1 residual LOW): readvertise my fresh AD BACK — this is how the
+        // requester refreshes ITS stored copy of MY bundle when I (not it) re-minted my account.
+        // It must NOT hide behind the rotation gate (a throttled/non-initiator request would then
+        // starve the one-side-restarted case). Bounded against amplification by the cooldown
+        // ALONE (a spammer gets ≤1 readvertise per window), independent of role/attempts.
+        cool_ok is bool = served == NIL || (_substract_seconds now ((served?) $updated)) >= rekey_min_interval_seconds.
+        if cool_ok
         {
-            if ((served?) $attempts) >= rekey_served_max { budget_ok -> FALSE. }
-            if (_substract_seconds now ((served?) $updated)) < rekey_min_interval_seconds { budget_ok -> FALSE. }
+            b = my_identity_bundle_fields_fresh NIL.
+            actions (_count actions|) -> encrypted_channel::send_encrypted_tx sender_id (
+                $name -> readvertise_ad_tx,
+                $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                           $cp_binding -> (b $cp_binding),
+                           $pv -> a2a_versions::wire_version,
+                           $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
         }
-        mig_inflight is bool = FALSE.
-        st = contact_migration sender_id.
-        if st != NIL
-        {
-            ph = (st?) $phase.
-            mig_inflight -> ph == "offered" || ph == "acknowledged" || ph == "committed".
-        }
-        if sid_ok && budget_ok && mig_inflight != TRUE && (peer_has_e2e_bundle sender_id)
-        {
-            epb = ((((peer_ads sender_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
-            if epb != NIL
-            {
-                att is int = 1.
-                if served != NIL { att -> ((served?) $attempts) + 1. }
-                rekey_served sender_id -> ($attempts -> att, $updated -> now).
-                // An ORPHANED staged slot (occupied while no migration is in flight —
-                // e.g. a stalled/abandoned rotation) is discarded, never promoted: the
-                // fresh rotation below supersedes it (spec §5.5 abandon-and-supersede).
-                if (e2e::staged_session_id sender_id) != NIL { e2e::discard_rotation sender_id. }
-                e2e::stage_outbound_rotation sender_id (epb?).
-                e2e::commit_rotation sender_id.
-                sc redrive_unacked_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }
-                // Readvertise back: the requester refreshes ITS copy of MY bundle (the
-                // convergence leg for the both-restarted case). Rides the same gate as the
-                // rotation — never an unthrottled amplification.
-                b = my_identity_bundle_fields_fresh NIL.
-                actions (_count actions|) -> encrypted_channel::send_encrypted_tx sender_id (
-                    $name -> readvertise_ad_tx,
-                    $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
-                               $cp_binding -> (b $cp_binding),
-                               $pv -> a2a_versions::wire_version,
-                               $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
-                actions (_count actions|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $responder, $session_id -> fsid).
-            }
-        }
+        // SINGLE-INITIATOR re-establishment: mint the fresh session ONLY if I am the elected
+        // initiator (maybe_init_rekey enforces role + cid-keyed budget + advisory-sid + no
+        // in-flight migration). As the NON-initiator I only refreshed peer_ads + readvertised
+        // back; the initiator (the requester, here) mints on ITS side and its pre-key
+        // establishes the shared session on mine. Exactly one minter ⇒ no glare.
+        sc maybe_init_rekey sender_id fsid -- ( -> a) { actions (_count actions|) -> a. }
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -4102,6 +4150,14 @@ library a2a_messaging loads libraries
             $contact_migration  -> contact_migration,
             $contact_e2e_epoch  -> contact_e2e_epoch,
             $mig_deferred       -> mig_deferred,
+            // core 0.11 Signal-model restart survival: the pickle_key-SEALED Olm account +
+            // per-peer session + staged pickles (all opaque bin). Persisting them lets a restart
+            // RESUME the exact ratchet instead of re-minting a fresh account (the desync root
+            // cause) — self-heal then only runs on TRUE loss (reinstall/corruption). state_data.bin
+            // is LOCAL-ONLY, so this stays off any peer/broker; the sealed bytes carry no raw
+            // secretkey type. NOTE: if state_data.bin is ever repurposed as a CROSS-NODE portable
+            // blob, move this to a local sidecar (the material is local-secrecy class).
+            $e2e_sessions       -> (e2e::export_sessions NIL),
             // core 0.11 self-heal: unacked e2e sends (additive; app payload class, NO key
             // material — INV-4 holds). rekey_pending is deliberately NOT exported (transient
             // rate-limit ledger; a restart at worst re-sends one idempotent request).
@@ -4262,6 +4318,16 @@ library a2a_messaging loads libraries
         {
             delivered_wire -> (data $delivered_wire) safe (global_id ->> str[]).
         }
+        // core 0.11 Signal-model restart survival: restore the SEALED Olm account + sessions +
+        // staged pickles BEFORE anything can lazily mint a fresh account (import_core_state runs
+        // during boot import_state, before the daemon serves any send/receive that calls
+        // account()). A pre-0.11 blob lacks the field → safe-cast NIL → no restore → a fresh
+        // account is lazily minted and the self-heal fallback re-establishes (clean degrade). A
+        // corrupt/partial field likewise safe-casts to NIL → fallback (state_data.bin itself is
+        // written atomically via tmp+rename, so partial writes do not occur).
+        es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+
+            = (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
+        if es != NIL { e2e::import_sessions (es?). }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the
