@@ -4,7 +4,7 @@
 // then drives the M-legs against the pair. Scorecard semantics: an MP leg failing (or not
 // implemented) exits non-zero; NTH legs report but never gate. No leg ever silently skips.
 import { spawn } from 'node:child_process';
-import { openSync as fsOpenSync } from 'node:fs';
+import { openSync as fsOpenSync, appendFileSync as fsAppendFileSync } from 'node:fs';
 import * as readline from 'node:readline';
 import { resolve } from 'node:path';
 
@@ -35,7 +35,12 @@ function spawnPeer(dir, name, extraEnv = {}) {
     readyResolve(); // a dead peer resolves readyP; callers check peer.cid
   });
   rl.on('line', (line) => {
-    let msg; try { msg = JSON.parse(line); } catch { return; }
+    let msg; try { msg = JSON.parse(line); } catch {
+      // Non-JSON stdout (e.g. the sdk leak-detector dump on exit) must not
+      // vanish — append it to the peer's log so leak totals are auditable.
+      try { fsAppendFileSync(resolve(dir, `${name}.stderr.log`), `[stdout] ${line}\n`); } catch {}
+      return;
+    }
     if (msg.ready) { peer.cid = msg.cid; return readyResolve(); }
     if (msg.event) return void peer.events.push(msg.event);
     if (msg.fatal) { console.error(`[${name}] FATAL ${msg.fatal}`); return readyResolve(); }
