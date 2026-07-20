@@ -24,9 +24,16 @@ function spawnPeer(dir, name, extraEnv = {}) {
     cwd: dir, stdio: ['pipe', 'pipe', errLog],
     env: { ...process.env, BROKER_URL, PEER_NAME: name, PEER_SEED: `compat ${name} seed`, ...extraEnv },
   });
-  const peer = { name, dir, child, cid: '', events: [], waiters: new Map(), readyP: null };
+  const peer = { name, dir, child, cid: '', events: [], waiters: new Map(), readyP: null, exited: null };
   const rl = readline.createInterface({ input: child.stdout });
   let readyResolve; peer.readyP = new Promise((r) => { readyResolve = r; });
+  child.on('exit', (code, signal) => {
+    peer.exited = { code, signal };
+    console.log(`  [peer ${name}] exited code=${code} signal=${signal} (${peer.waiters.size} call(s) in flight)`);
+    for (const [, w] of peer.waiters) w.reject(new Error(`peer ${name} exited (code=${code} signal=${signal})`));
+    peer.waiters.clear();
+    readyResolve(); // a dead peer resolves readyP; callers check peer.cid
+  });
   rl.on('line', (line) => {
     let msg; try { msg = JSON.parse(line); } catch { return; }
     if (msg.ready) { peer.cid = msg.cid; return readyResolve(); }
@@ -38,10 +45,18 @@ function spawnPeer(dir, name, extraEnv = {}) {
   return peer;
 }
 
-function call(peer, op, fields = {}) {
+function call(peer, op, fields = {}, timeoutMs = 90000) {
   const id = nextId++;
   return new Promise((resolveP, rejectP) => {
-    peer.waiters.set(id, { resolve: resolveP, reject: rejectP });
+    if (peer.exited && op !== 'exit') return rejectP(new Error(`peer ${peer.name} already exited`));
+    const timer = setTimeout(() => {
+      peer.waiters.delete(id);
+      rejectP(new Error(`call ${op} on ${peer.name} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    peer.waiters.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolveP(v); },
+      reject: (e) => { clearTimeout(timer); rejectP(e); },
+    });
     peer.child.stdin.write(JSON.stringify({ id, op, ...fields }) + '\n');
   });
 }
@@ -208,7 +223,12 @@ const results = [];
 await ctx.oldPeer.readyP; await ctx.newPeer.readyP;
 if (!ctx.oldPeer.cid || !ctx.newPeer.cid) { console.error('peer boot failed'); process.exit(1); }
 console.log(`peers up: old=${ctx.oldPeer.cid.slice(0, 10)} new=${ctx.newPeer.cid.slice(0, 10)}`);
+// LEG_FILTER=M7,M9 runs a subset (unlisted legs report as skipped-by-filter, never silently)
+const filter = (process.env.LEG_FILTER || '').split(',').filter(Boolean);
 for (const leg of LEGS) {
+  if (filter.length && !filter.includes(leg.id)) {
+    console.log(`  - ${leg.id} skipped by LEG_FILTER (not a verdict)`); continue;
+  }
   try { await leg.run(ctx); results.push({ leg, pass: true }); console.log(`  ✓ ${leg.id} [${leg.gate}/${leg.dod}] ${leg.name}`); }
   catch (err) { results.push({ leg, pass: false, err }); console.log(`  ✗ ${leg.id} [${leg.gate}/${leg.dod}] ${leg.name}: ${err.message}`); }
 }
