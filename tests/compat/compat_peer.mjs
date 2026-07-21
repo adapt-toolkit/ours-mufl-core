@@ -17,6 +17,10 @@ import { object_to_adapt_value } from '@adapt-toolkit/sdk/wrapper';
 const BROKER_URL = process.env.BROKER_URL || 'ws://127.0.0.1:9797';
 const SEED = process.env.PEER_SEED || `compat seed ${process.env.PEER_NAME || 'peer'}`;
 const STATE_FILE = process.env.PEER_STATE_FILE || ''; // set ⇒ import on boot if present
+// PEER_FLAVOR=messenger switches the READ verbs to the control-plane messenger
+// surface (history keyed per contact via ::actor::get_conversation). The whole
+// ::a2a_messaging:: WRITE surface (invite/redeem/send/send_file) is shared.
+const FLAVOR = process.env.PEER_FLAVOR || 'actor';
 const UNIT_DIR = resolve('.');
 const unitHash = fs.readdirSync(UNIT_DIR).find((f) => f.endsWith('.muflo')).slice(0, -'.muflo'.length);
 const UNIT = new Uint8Array(fs.readFileSync(resolve(UNIT_DIR, `${unitHash}.muflo`)));
@@ -113,8 +117,19 @@ rl.on('line', async (line) => {
         return out({ id, ok: true, value: m.Reduce('wire_id').Visualize() });
       }
       case 'contacts': return out({ id, ok: true, value: ro('::a2a_messaging::list_contacts', undefined).Visualize() });
-      case 'inbox': return out({ id, ok: true, value: ro('::actor::list_incoming_messages', undefined).Visualize() });
-      case 'files': return out({ id, ok: true, value: ro('::actor::list_incoming_files', undefined).Visualize() });
+      case 'inbox': {
+        if (FLAVOR === 'messenger') {
+          return out({ id, ok: true, value: ro('::actor::get_conversation', { contact: cmd.cid }).Visualize() });
+        }
+        return out({ id, ok: true, value: ro('::actor::list_incoming_messages', undefined).Visualize() });
+      }
+      case 'files': {
+        if (FLAVOR === 'messenger') {
+          // messenger file receipts land as history entries carrying $filename
+          return out({ id, ok: true, value: ro('::actor::get_conversation', { contact: cmd.cid }).Visualize() });
+        }
+        return out({ id, ok: true, value: ro('::actor::list_incoming_files', undefined).Visualize() });
+      }
       case 'export_state': {
         const exported = ro('::actor::export_state', undefined);
         fs.writeFileSync(cmd.file, Buffer.from(exported.Serialize()));

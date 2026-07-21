@@ -55,3 +55,28 @@ of M5/M1; this harness generalizes them across runtimes.
 OLD_ADAPT_TOOLKIT=... OLD_SDK_NM=... ADAPT_TOOLKIT=... OURS_SDK_NODE_MODULES=... \
 DEV_BROKER=... bash tests/compat/run_compat.sh
 ```
+
+## M12 — control-plane NEW ↔ mcp OLD (owner's named leg) — GREEN 2026-07-21
+
+Reuses this orchestrator with per-side flavors (`NEW_PEER_FLAVOR=messenger` switches the
+READ verbs to `::actor::get_conversation`; the whole `::a2a_messaging::` write surface is
+shared). Peers: NEW = the control-plane DR unit (dev5/dr-e2e-integration, sdk 0.10.10,
+core v0.8.0) · OLD = the REAL mcp actor (`packages/core/mufl_code/actor.mu`) at its
+deployed pins (core `faa2b52` = v0.2.0/OSP) compiled+run under published sdk/mufl 0.9.1.
+Result: M1–M6 all green (invites both ways, first-contact, steady both ways, files both
+ways, both restart-restore legs).
+
+```
+# build dirs: old = mcp actor + 0.9.1 stage; new = cp unit + its node_modules
+OLD_BUILD_DIR=<mcp-old> NEW_BUILD_DIR=<cp-new> NEW_PEER_FLAVOR=messenger \
+  LEG_FILTER=M1,M2,M3,M4,M5,M6 node tests/compat/compat.mjs
+```
+
+## U3 — control-plane upgrade path — GREEN 2026-07-21
+
+Under the fresh-address ruling (unpublished app, zero clients) the npm-bump leg's
+meaningful nucleus is the control-plane's own blob-import gate: main-era unit sources
+(messenger + core 0.7.1) compiled with the CURRENT toolchain → real state → import under
+the DR unit → same seed ⇒ same cid, history/contacts preserved, zero rejects, re-export
+round-trips. Run via the cp repo's tests/run-blob-import.sh with OLD_UNIT pointed at the
+main-era build.

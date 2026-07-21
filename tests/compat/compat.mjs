@@ -22,7 +22,9 @@ function spawnPeer(dir, name, extraEnv = {}) {
   const errLog = fsOpenSync(resolve(dir, `${name}.stderr.log`), 'a');
   const child = spawn(process.execPath, [resolve(dir, 'compat_peer.mjs')], {
     cwd: dir, stdio: ['pipe', 'pipe', errLog],
-    env: { ...process.env, BROKER_URL, PEER_NAME: name, PEER_SEED: `compat ${name} seed`, ...extraEnv },
+    env: { ...process.env, BROKER_URL, PEER_NAME: name, PEER_SEED: `compat ${name} seed`,
+      PEER_FLAVOR: dir === NEW_DIR ? (process.env.NEW_PEER_FLAVOR || 'actor') : (process.env.OLD_PEER_FLAVOR || 'actor'),
+      ...extraEnv },
   });
   const peer = { name, dir, child, cid: '', events: [], waiters: new Map(), readyP: null, exited: null };
   const rl = readline.createInterface({ input: child.stdout });
@@ -91,7 +93,7 @@ async function roundTrip(from, to, text, expectRoute) {
     throw new Error(`route mismatch: expected ${expectRoute}, got ${sent?.route} for "${text}"`);
   }
   await sleep(2500);
-  const inbox = await call(to, 'inbox');
+  const inbox = await call(to, 'inbox', { cid: from.cid });
   if (!String(inbox).includes(text)) throw new Error(`message not delivered: "${text}"`);
   return sent;
 }
@@ -124,8 +126,8 @@ const LEGS = [
       await call(ctx.oldPeer, 'send_file', { cid: ctx.newPeer.cid, filename: 'from-old.txt', data_b64 });
       await call(ctx.newPeer, 'send_file', { cid: ctx.oldPeer.cid, filename: 'from-new.txt', data_b64 });
       await sleep(3000);
-      const fNew = String(await call(ctx.newPeer, 'files'));
-      const fOld = String(await call(ctx.oldPeer, 'files'));
+      const fNew = String(await call(ctx.newPeer, 'files', { cid: ctx.oldPeer.cid }));
+      const fOld = String(await call(ctx.oldPeer, 'files', { cid: ctx.newPeer.cid }));
       if (!fNew.includes('from-old.txt')) throw new Error('old→new file not received');
       if (!fOld.includes('from-new.txt')) throw new Error('new→old file not received'); } },
   { id: 'M5', gate: 'MP', dod: 'D1,D2', name: 'OLD restart: v0-blob export→reimport, channel resumes',
