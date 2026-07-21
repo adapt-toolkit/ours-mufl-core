@@ -4608,8 +4608,18 @@ library a2a_messaging loads libraries
         // re-establishes (clean degrade). A STRUCTURALLY corrupt field safe-casts to NIL
         // (same fallback); content-corrupt sealed bytes are caught later by the validated
         // commit (finding C redo below).
-        es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+
-            = (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
+        // GUARD (pre-#137-blob fix): `safe` does NOT turn an ABSENT field into a
+        // clean NIL for record targets — meta.mm's record checker aborts on any
+        // non-dictionary input ("SAFE cast to record failed"), with no NIL
+        // branch even for nullable targets (verified identically on 0.10.10 and
+        // 0.10.12; see meta.mm record-path). Without this pre-check the WHOLE
+        // import failed for every pre-#137 blob. Same explicit `!= NIL` guard as
+        // $redrive_cursor below (the ship-review-major-4 pattern).
+        es is ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ )+ = NIL.
+        if (data $e2e_sessions) != NIL
+        {
+            es -> (data $e2e_sessions) safe ( $v -> int, $account -> bin+, $sessions -> (global_id ->> bin)+ ).
+        }
         // Finding C redo: do NOT validate or assign here — a corrupt pickle raises a
         // HARD engine error that would fail the whole boot import (contacts and inbox
         // included). Park the blob; the host drives commit_e2e_restore next (still
