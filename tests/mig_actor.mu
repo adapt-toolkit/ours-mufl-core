@@ -127,6 +127,24 @@ application actor loads libraries
         ) ].
     }
 
+    trn qa_mig_import_pre_dr _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        // A faithful PRE-0.11 / pre-stamp (v0) blob: the original-schema required
+        // fields only — NO $format_version (absent stamp == version 0 per the
+        // migration contract) and, critically, NO $e2e_sessions. This is what
+        // every deployed consumer's state_data.bin looks like before the DR
+        // upgrade. Import must SUCCEED (the #137 gap: the unguarded
+        // $e2e_sessions record-cast raised "SAFE cast to record failed" on this
+        // exact shape, failing the whole import — contacts included).
+        a2a_messaging::import_core_state ( $my_name -> "pre-dr", $contacts -> (,), $peer_ads -> (,) ).
+        exp = a2a_messaging::export_core_state NIL.
+        return transaction::success [ _return_data (
+            $imported_name  -> (exp $my_name),
+            $format_stamped -> ((exp $format_version) != NIL)
+        ) ].
+    }
+
     // ---- Phase-B staged-rotation exercise (adapt e2e §5.5) ----------------
     // Thin qa wrappers over the adapt e2e facade so a two-node driver can drive
     // establish -> stage -> commit and assert the rotate-once property. The driver
