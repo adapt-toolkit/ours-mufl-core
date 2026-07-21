@@ -1,0 +1,66 @@
+# Core test suite — fully self-contained (house rule: in-repo orchestration, no
+# committed binaries, no self-hosted runner). The toolchain and runtime come from
+# the PUBLISHED @adapt-toolkit packages; the broker is the standalone
+# @adapt-toolkit/broker bin (the sdk's embedded dev broker was removed in the
+# #137 line). The runner scripts expect an adapt-checkout layout, so a 4-symlink
+# shim over the npm mufl package provides it.
+#
+# TOOLCHAIN_VERSION pins the exact published tuple the suite runs under — bump
+# it deliberately alongside consumer pins (see the ours ecosystem VERSIONS.md
+# discipline), never with a range.
+name: tests
+
+on:
+  push:
+    branches: [main, 'fable/**', 'feat/**', 'fix/**']
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOOLCHAIN_VERSION: 0.10.12
+
+jobs:
+  suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install published toolchain (mufl + sdk + broker)
+        run: |
+          mkdir -p /tmp/toolchain && cd /tmp/toolchain
+          npm init -y > /dev/null
+          npm i --no-audit --no-fund \
+            "@adapt-toolkit/mufl@${TOOLCHAIN_VERSION}" \
+            "@adapt-toolkit/sdk@${TOOLCHAIN_VERSION}" \
+            "@adapt-toolkit/broker@${TOOLCHAIN_VERSION}"
+      - name: Build the adapt-checkout shim over the npm mufl package
+        run: |
+          M=/tmp/toolchain/node_modules/@adapt-toolkit/mufl
+          S=/tmp/tk-shim
+          mkdir -p "$S/build.linux.release"
+          ln -s "$M/prebuilds/linux-x64/mufl-compile" "$S/build.linux.release/mufl-compile"
+          for d in mufl_stdlib meta transactions; do ln -s "$M/$d" "$S/$d"; done
+      - name: Run the migration suite (incl. the v0-blob A3 gate)
+        run: |
+          export ADAPT_TOOLKIT=/tmp/tk-shim
+          export OURS_SDK_NODE_MODULES=/tmp/toolchain/node_modules
+          export DEV_BROKER=/tmp/toolchain/node_modules/@adapt-toolkit/broker/dist/cli.js
+          bash tests/run_mig.sh
+      - name: Run the core loopback suite
+        run: |
+          export ADAPT_TOOLKIT=/tmp/tk-shim
+          export OURS_SDK_NODE_MODULES=/tmp/toolchain/node_modules
+          export DEV_BROKER=/tmp/toolchain/node_modules/@adapt-toolkit/broker/dist/cli.js
+          bash tests/run.sh
+      - name: Run the notifications suite
+        run: |
+          export ADAPT_TOOLKIT=/tmp/tk-shim
+          export OURS_SDK_NODE_MODULES=/tmp/toolchain/node_modules
+          export DEV_BROKER=/tmp/toolchain/node_modules/@adapt-toolkit/broker/dist/cli.js
+          bash tests/run_notif.sh
