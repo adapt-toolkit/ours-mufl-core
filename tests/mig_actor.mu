@@ -216,6 +216,17 @@ application actor loads libraries
     trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
     trn qa_recv_set_abort _:($abort -> ab: bool) { qa_recv_abort -> ab.  return transaction::success [ _return_data ($abort -> qa_recv_abort) ]. }
 
+    // ── Full-state persistence (reload port). The host stores the WHOLE export_core_state
+    // as ONE opaque field $core (design §3) and replays it on boot; commit_e2e_restore then
+    // installs the restored $e2e_sessions. Same shape as test_actor.mu and the mcp host.
+    trn readonly export_state _ { return ($core -> (a2a_messaging::export_core_state NIL)). }
+    trn import_state data: any
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::import_core_state (data $core).
+        return transaction::success [ _return_data ($imported -> TRUE) ].
+    }
+
     // Force a LEGACY plaintext box (receive_message_tx) to a contact, BYPASSING e2e_route — lets the
     // driver deliver a legacy inbound at a receiver regardless of the sender's route, to prove the
     // §5.7 receive-side downgrade gate: refused at an EPOCH-pinned receiver, delivered at a

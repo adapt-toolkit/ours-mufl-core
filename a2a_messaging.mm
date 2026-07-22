@@ -427,6 +427,14 @@ library a2a_messaging loads libraries
         // can order/dedup. No opt-in flag — push is gated only on monitoring_proxy.
         roster_push_seq is int = 0.
 
+        // core 0.12 (2b auto-advertise): the wire_version + a fingerprint of my self cap-id
+        // set captured at the LAST reconcile_advertise. Persisted so a post-upgrade boot
+        // NOTICES a version/cap change and re-advertises to legacy peers exactly once — the
+        // core owns the trigger, so the app stops orchestrating readvertise_on_upgrade.
+        // 0/"" = never reconciled (⇒ the first reconcile after any boot advertises).
+        advertised_pv is int = 0.
+        advertised_caps is str = "".
+
         // core 3.0: per-outstanding-invite ephemeral PRIVATE keys, keyed by invite id.
         // hidden ⇒ only this library mutates it AND it is structurally invisible to the
         // export record builder, but `hidden` governs VISIBILITY, not persistence — it
@@ -4198,6 +4206,70 @@ library a2a_messaging loads libraries
         return transaction::success actions.
     }
 
+    // core 0.12 (2b): comma-joined fingerprint of my advertised cap-id set. self_cap_ids is
+    // captured at init in a stable order (supported ∪ advertise, then any runtime
+    // add_self_cap APPENDS), so this string changes iff my advertised caps change — the cheap
+    // change-detector reconcile_advertise gates the legacy upgrade push on.
+    fn caps_fingerprint (_) -> str
+    {
+        s is str = "".
+        sc (a2a_capabilities::self_cap_ids NIL) -- ( -> c) { s -> (s + c) + ",". }
+        return s.
+    }
+
+    // core 0.12 (2b): the SINGLE core-owned re-advertise entrypoint. The app declares its
+    // capabilities ONCE at init (a2a_capabilities) and calls THIS once per boot, replacing the
+    // app-orchestrated readvertise_on_upgrade + readvertise_e2e_recovery pair — the core now
+    // owns WHAT gets advertised. It ALWAYS runs the e2e self-heal recovery push (LOAD-BEARING:
+    // a re-minted account after a lost/rejected restore leaves every peer holding my stale
+    // bundle) and, when it NOTICES a wire-version or cap-set change since the last reconcile
+    // (persisted advertised_pv/advertised_caps), ALSO runs the legacy upgrade push. Idempotent:
+    // an unchanged pv+caps skips the legacy push (no redundant legacy traffic). Persists the
+    // advertised record (_save_state). A contact that becomes reachable later relearns my AD
+    // through handle_readvertise_ad once these pushes round-trip. STATELESS re-advertise
+    // semantics (readvertise_ad_tx) are unchanged, so a pre-0.10 peer ignores the tx as before.
+    trn reconcile_advertise _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        b       = my_identity_bundle_fields_fresh NIL.
+        cur_pv  = a2a_versions::wire_version.
+        cur_fp  = caps_fingerprint NIL.
+        changed is bool = (advertised_pv != cur_pv) || (cur_fp != advertised_caps).
+        actions is transaction::action::type[] = [].
+        e2e_n    is int = 0.
+        legacy_n is int = 0.
+        // ALWAYS: the e2e self-heal recovery push (the load-bearing fallback re-arm).
+        sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) != NIL || (contact_born_dr cid) == TRUE || (e2e_pinned cid) || (contact_migration cid) != NIL)
+        {
+            actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
+                $name -> readvertise_ad_tx,
+                $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                           $cp_binding -> (b $cp_binding),
+                           $pv -> a2a_versions::wire_version,
+                           $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
+            e2e_n -> e2e_n + 1.
+        }
+        // ON CHANGE ONLY: the legacy upgrade push to pre-existing legacy contacts.
+        if changed
+        {
+            sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) == NIL && (contact_born_dr cid) != TRUE && (contact_migration cid) == NIL)
+            {
+                actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
+                    $name -> readvertise_ad_tx,
+                    $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
+                               $cp_binding -> (b $cp_binding),
+                               $pv -> a2a_versions::wire_version,
+                               $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
+                legacy_n -> legacy_n + 1.
+            }
+        }
+        advertised_pv   -> cur_pv.
+        advertised_caps -> cur_fp.
+        actions (_count actions|) -> _return_data ($changed -> changed, $e2e_readvertised -> e2e_n, $legacy_readvertised -> legacy_n).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
     // core 0.11 (session self-heal, retry leg): re-send unacked e2e messages stuck without
     // a delivered receipt for redrive_min_age_seconds+ (see the const above). Host calls
     // this on the boot/GC cadence next to readvertise_e2e_recovery. Mutates session state
@@ -4427,7 +4499,11 @@ library a2a_messaging loads libraries
             $delivered_wire     -> delivered_wire,
             // Ship-review major-4: the sweep resume cursor survives restarts, else a
             // boot-sweep-only lifecycle re-scans the same prefix forever (tail starves).
-            $redrive_cursor     -> redrive_sweep_cursor
+            $redrive_cursor     -> redrive_sweep_cursor,
+            // core 0.12 (2b): the pv + cap-set fingerprint of my last self-advertise
+            // reconcile, so a post-upgrade boot detects the change and re-advertises once.
+            $advertised_pv      -> advertised_pv,
+            $advertised_caps    -> advertised_caps
         ).
     }
 
@@ -4628,6 +4704,11 @@ library a2a_messaging loads libraries
         // Ship-review major-4: restore the sweep resume cursor (absent in older blobs).
         if (data $redrive_cursor) != NIL
         { redrive_sweep_cursor -> (data $redrive_cursor) safe global_id. }
+        // core 0.12 (2b): restore the last-advertised pv + cap fingerprint (absent in older
+        // blobs → stays 0/"" → the first reconcile_advertise after upgrade sees a change and
+        // re-advertises, which is exactly the desired post-upgrade behavior).
+        if (data $advertised_pv) != NIL { advertised_pv -> (data $advertised_pv) safe int. }
+        if (data $advertised_caps) != NIL { advertised_caps -> (data $advertised_caps) safe str. }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the

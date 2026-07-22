@@ -670,6 +670,95 @@ async function main() {
     const lSt2 = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
     ok(sweep2.Reduce('initiated').Visualize() === '0' && lSt2.Reduce('phase').Visualize() === 'active' && hex(getBin(lSt2, 'epoch')) === epoch0, '★ C-path IDEMPOTENCY: a second sweep does NOT re-offer the ACTIVE contact (phase + epoch unchanged; the never-cleared contact_migration gate)'); }
 
+  // ═══ 2b AUTO-ADVERTISE — core-owned reconcile_advertise + version/cap change detection ═══
+  // The app declares its caps once at init and calls reconcile_advertise once per boot; the
+  // core owns the re-advertise (replacing app-orchestrated readvertise_on_upgrade/e2e_recovery)
+  // and NOTICES a persisted wire-version/cap-set change to gate the legacy upgrade push.
+  console.log('=== mig: 2b reconcile_advertise — core-owned re-advertise + change detection ===');
+  {
+    const CA = await mkNode('mig-adv-A', 'CAA');
+    const CB = await mkNode('mig-adv-B', 'CBB'); await sleep(1000);
+    const cinv = await mutate(CA, '::a2a_messaging::generate_invite', { name: 'CBB' });
+    await mutate(CB, '::a2a_messaging::add_contact', { invite: binv(CB, Buffer.from(cinv.Reduce('invite').GetBinary())), name: 'CAA' });
+    await sleep(6000);   // invite redeem round-trips (CA gains a contact)
+
+    // First reconcile: the advertised record is empty (pv=0) → CHANGED → advertises.
+    const r1 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(T(r1.Reduce('changed').Visualize()), '2b: first reconcile_advertise reports changed (fresh/never-advertised record)');
+    ok(+r1.Reduce('legacy_readvertised').Visualize() + +r1.Reduce('e2e_readvertised').Visualize() >= 1, '2b: first reconcile re-advertised to the contact');
+
+    // Second reconcile: no pv/cap change → NOT changed → legacy upgrade push SKIPPED (idempotent).
+    const r2 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(!T(r2.Reduce('changed').Visualize()), '2b: second reconcile is idempotent (unchanged pv+caps → not changed)');
+    ok(+r2.Reduce('legacy_readvertised').Visualize() === 0, '2b: idempotent reconcile skips the legacy upgrade push');
+
+    // Capability change: add cap_e2e_migrate at runtime → reconcile NOTICES the new cap.
+    await mutate(CA, '::a2a_messaging::advertise_migrate', {});
+    const r3 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(T(r3.Reduce('changed').Visualize()), '2b: reconcile_advertise NOTICES a new capability (advertise_migrate added cap_e2e_migrate → cap fingerprint changed)');
+  }
+
+  // ═══ RELOAD PORT (design §3 acceptance) — page-reload DR message-loss, now GREEN ═══
+  // Ports ours-control-plane test/dr-reload-session-loss (commit 86c0c93) onto the core:
+  // two born-DR peers hold a LIVE e2e session; A is RELOADED — export the whole $core →
+  // remove the packet → recreate from the SAME seed → import_state → commit_e2e_restore —
+  // then B, still on the pre-reload session, sends in the GAP (before A sends anything).
+  // Pre-b608 the session was NOT in the export, so the recreated packet started a fresh
+  // ratchet and B's in-gap message was LOST (RED). Persist-primary restores the SAME
+  // session, so it decrypts (GREEN). Non-vacuous: we assert the freshly-recreated packet
+  // has NO session, and that commit restores the SAME session id (not a fresh ratchet).
+  console.log('\n=== mig: RELOAD port — DR session survives packet recreate, in-gap message decrypts ===');
+  {
+    const RA = await mkNode('mig-reload-A', 'RLA');
+    const RB = await mkNode('mig-reload-B', 'RLB'); await sleep(1000);
+    const rinv = await mutate(RA, '::a2a_messaging::generate_invite', { name: 'RLB' });
+    await mutate(RB, '::a2a_messaging::add_contact', { invite: binv(RB, Buffer.from(rinv.Reduce('invite').GetBinary())), name: 'RLA' });
+    await sleep(6000);   // invite redeem round-trips (contacts + peer_ads incl. e2e bundle)
+    await mutate(RA, '::actor::qa_learn_peer', { cid: RB.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(RB, '::actor::qa_learn_peer', { cid: RA.cid, pv: 9, caps: ['core.e2e'] });
+    ok(ro(RA, '::actor::qa_e2e_route', { cid: RB.cid }).Reduce('route').Visualize() === 'e2e', 'reload: the pair is on the e2e route (double ratchet)');
+
+    // Establish + advance the live session BOTH ways.
+    await mutate(RB, '::actor::qa_recv_reset', {});
+    await mutate(RA, '::a2a_messaging::send_message', { contact: 'RLB', text: 'reload-a1' });
+    await sleep(3000);
+    ok(ro(RB, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'reload-a1', 'reload: pre-reload A→B delivered (live e2e session established)');
+    await mutate(RA, '::actor::qa_recv_reset', {});
+    await mutate(RB, '::a2a_messaging::send_message', { contact: 'RLA', text: 'reload-b1' });
+    await sleep(3000);
+    ok(ro(RA, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'reload-b1', 'reload: pre-reload B→A delivered (ratchet advanced both ways)');
+
+    const sidBefore = hex(getBin(ro(RA, '::actor::qa_e2e_active', { cid: RB.cid }), 'sid'));
+    ok(sidBefore.length > 0, 'reload: A holds a live e2e session id before the reload');
+
+    // Persist the WHOLE $core (includes $e2e_sessions), exactly as a host does.
+    const savedCore = Buffer.from(ro(RA, '::actor::export_state', {}).Serialize());
+
+    // PAGE RELOAD: the old packet (+ its in-memory session) is gone; recreate from the SAME seed.
+    wrapper.packet_manager.remove_packet(RA.cid);
+    await sleep(800);
+    const RA2 = await mkNode('mig-reload-A', 'RLA'); await sleep(500);
+    ok(RA2.cid === RA.cid, 'reload: recreated packet keeps the same identity (same container id, so the broker routes here)');
+
+    // Non-vacuity: the freshly recreated packet has NO session — the reload really lost it.
+    const sidFresh = hex(getBin(ro(RA2, '::actor::qa_e2e_active', { cid: RB.cid }), 'sid'));
+    ok(sidFresh.length === 0, 'reload: the freshly recreated packet has NO e2e session (confirms the reload discards it)');
+
+    // Restore: import_state stages the persisted sessions, commit_e2e_restore installs them.
+    await mutate(RA2, '::actor::import_state', RA2.pw.packet.ParseValue(new Uint8Array(savedCore)));
+    const cr = await mutate(RA2, '::a2a_messaging::commit_e2e_restore', {});
+    ok(cr.Reduce('status').Visualize() === 'ok', 'reload: commit_e2e_restore installed the persisted sessions');
+    const sidAfter = hex(getBin(ro(RA2, '::actor::qa_e2e_active', { cid: RB.cid }), 'sid'));
+    ok(sidAfter === sidBefore, 'reload: the SAME e2e session id is restored (not a fresh ratchet)');
+
+    // THE GAP: B — still on the pre-reload session — sends BEFORE A2 sends anything.
+    await mutate(RA2, '::actor::qa_recv_reset', {});
+    await mutate(RB, '::a2a_messaging::send_message', { contact: 'RLA', text: 'reload-in-gap' });
+    await sleep(4000);
+    ok(ro(RA2, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'reload-in-gap',
+       'reload: the reloaded packet DECRYPTS B\'s in-gap message on the restored session (page-reload message-loss FIXED)');
+  }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
