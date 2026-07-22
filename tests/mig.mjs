@@ -86,6 +86,21 @@ async function main() {
   ok(T(g2('epoch_absent')), 'pre-0.9 blob import: contact_e2e_epoch stays empty');
   ok(T(g2('deferred_absent')), 'pre-0.9 blob import: mig_deferred stays empty');
 
+  // ---- A3: PRE-0.11 / v0 blob (no format_version, no e2e_sessions) ----------
+  // The #137 migration gap: replay-after-restore was covered, the OLD-blob
+  // upgrade path was not. Without the $e2e_sessions NIL-guard this import
+  // raises "SAFE cast to record failed" (meta.mm record-path aborts on NIL —
+  // verified identical on 0.10.10 and 0.10.12) and the WHOLE import fails.
+  console.log('=== mig: pre-0.11 v0 blob import → succeeds, sessions degrade clean ===');
+  try {
+    const r3 = await mutate(A, '::actor::qa_mig_import_pre_dr', {});
+    const g3 = (k) => r3.Reduce(k).Visualize();
+    ok(g3('imported_name') === 'pre-dr', `v0 blob import succeeds and carries my_name (got ${g3('imported_name')})`);
+    ok(T(g3('format_stamped')), 're-export is format-stamped after v0 import');
+  } catch (err) {
+    ok(false, `v0 blob import RAISED (the #137 e2e_sessions guard gap): ${String(err).split('\n')[0]}`);
+  }
+
   console.log('=== mig: rotate-once (two peers stage a fresh session, commit, converge) ===');
   const B = await mkNode('mig-gate-B', 'B'); await sleep(800);
   const aCid = A.cid, bCid = B.cid;

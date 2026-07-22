@@ -104,6 +104,14 @@ library a2a_capabilities loads libraries
     // continues untouched (so the receipts-style id PAIR is not needed here).
     cap_e2e_migrate = "core.e2e.migrate".
 
+    // core 0.11 — e2e session self-heal (a2a_messaging e2e_rekey_request + unacked
+    // redrive). PROTOCOL-surface id with NO control verbs, $advertise-carried:
+    // "on a decode failure you may send me e2e_rekey_request and I serve a gated
+    // re-key". Gates the REQUESTER's send (a peer that never advertises it gets
+    // the readvertise_ad fallback instead — a pre-0.11 daemon must never receive
+    // an unknown control tx); never authz (REG-6).
+    cap_e2e_rekey = "core.e2e.rekey".
+
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
     // these sentinels, and writes interpret them. "$needs_reentry" is the
