@@ -499,6 +499,10 @@ library a2a_messaging loads libraries
         //   (peer, wire_id) on unknown < sent < delivered < read — duplicates
         //   and out-of-order arrivals collapse to no-ops.
         on_receipt_received is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { return []. }
+        // Optional core middleware at the successful message-send choke point.
+        // Integration modules install it without coupling messaging to them.
+        // Default no-op preserves every existing consumer.
+        post_send_middleware is (any -> transaction::action::type[]) = fn (_: any) -> transaction::action::type[] { return []. }
     }
 
     init = fn (_:(
@@ -532,6 +536,13 @@ library a2a_messaging loads libraries
             ph = (st?) $phase.
             return ph == "offered" || ph == "acknowledged" || ph == "committed".
         }).
+    }
+
+    // Separate from init so an integration importing a2a_messaging can install
+    // after the consumer has wired its ordinary storage hooks.
+    fn set_post_send_middleware (cb: (any -> transaction::action::type[])) -> nil
+    {
+        post_send_middleware -> cb.
     }
 
     // ---- shared action builders -------------------------------------------
@@ -1706,6 +1717,7 @@ library a2a_messaging loads libraries
                     $name -> receive_e2e_message_tx,
                     $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
             sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
+            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
             sc monitor_copy_actions "out" target_id sent_date text -- ( -> a) { eacts (_count eacts|) -> a. }
             // §4 observability: source $session_id from the ACTUAL envelope (NOT a re-read of
             // active_session_id — that would make the #1867 "session_id==pin" assertion CIRCULAR;
@@ -1724,6 +1736,10 @@ library a2a_messaging loads libraries
                 )
             ].
             sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
+            {
+                actions (_count actions|) -> a.
+            }
+            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
             {
                 actions (_count actions|) -> a.
             }
@@ -2939,6 +2955,10 @@ library a2a_messaging loads libraries
                     $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $pv -> a2a_versions::wire_version)
                 ).
                 sc on_message_sent ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
+                {
+                    actions (_count actions|) -> a.
+                }
+                sc post_send_middleware ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
                 {
                     actions (_count actions|) -> a.
                 }

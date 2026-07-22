@@ -18,6 +18,7 @@ config script
                 $a2a_protocol -> #"a2a_protocol.mm",
                 $a2a_messaging -> #"a2a_messaging.mm",
                 $a2a_notifications -> #"a2a_notifications.mm",
+                $a2a_notification_integration -> #"a2a_notification_integration.mm",
                 $a2a_cluster -> #"a2a_cluster.mm",
                 $a2a_monitoring -> #"a2a_monitoring.mm",
                 $a2a_control -> #"a2a_control.mm"

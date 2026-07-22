@@ -516,7 +516,7 @@ library a2a_notifications loads libraries
     // my_notify_contact_tokens (i.e. a confirm after notify_issue_tokens has
     // landed). Distribution is out of protocol — it rides ordinary
     // send_message/send_file or the messenger's distribution engine.
-    trn readonly export_notify_address _:($service -> service_ref: str, $contact -> contact_ref: str)
+    fn build_notify_address (service_ref: str, contact_ref: str) -> bin
     {
         target_id = a2a_messaging::resolve_contact service_ref.
         reg = my_notify_registrations target_id.
@@ -532,7 +532,13 @@ library a2a_notifications loads libraries
             $service_name -> (reg? $service_name),
             $token        -> tok?
         ).
-        return ($blob -> (_write addr), $service_cid -> (_str (reg? $service_cid))).
+        return _write addr.
+    }
+
+    trn readonly export_notify_address _:($service -> service_ref: str, $contact -> contact_ref: str)
+    {
+        blob = build_notify_address service_ref contact_ref.
+        return ($blob -> blob, $service_cid -> (_str (a2a_messaging::resolve_contact service_ref))).
     }
 
     // THE parallel of send_message, against a handout instead of a contact:
@@ -542,25 +548,44 @@ library a2a_notifications loads libraries
     // the service; the token is the sole authorization) and deliberately NO
     // monitoring copy (D-4: the forced-monitoring contract covers messages;
     // notifications are wake-up signals). Fire-and-forget: no response leg.
+    // Parse and structurally validate a handout. The notification service is
+    // the final authorization authority (live token index + exact stored token
+    // + sender scope); a sender intentionally need not be its contact and thus
+    // does not necessarily possess service keys for local signature checking.
+    fn decode_notify_address (address_blob: bin) -> notify_address_t
+    {
+        addr = (_read_or_abort address_blob) safe notify_address_t.
+        abort "Unsupported notify address version." when (addr $version) != 1.
+        abort "Unsupported notify token version." when (addr $token $c $version) != 1.
+        abort "Notify address service does not match its token." when (addr $service_cid) != (addr $token $c $service_cid).
+        return addr.
+    }
+
+    // Reusable fire-and-forget builder. The caller supplies wire_id so a post
+    // produced by send_message carries that message's actual stable id.
+    fn notification_send_action (address_blob: bin, payload: str, wire_id: str) -> transaction::action::type
+    {
+        addr = decode_notify_address address_blob.
+        abort "Notification payload exceeds " + (_str payload_max_bytes) + " bytes." when (_strlen payload) > payload_max_bytes.
+        return transaction::action::send (addr $service_cid) (
+            $name -> post_notification_tx,
+            $targ -> (
+                $token   -> (addr $token),
+                $payload -> payload,
+                $wire_id -> wire_id,
+                $pv -> a2a_versions::wire_version
+            )
+        ).
+    }
+
     trn send_notification _:($address -> address_blob: bin, $payload -> payload: str)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
-        addr = (_read_or_abort address_blob) safe notify_address_t.
-        abort "Unsupported notify address version." when (addr $version) != 1.
-        abort "Notification payload exceeds " + (_str payload_max_bytes) + " bytes." when (_strlen payload) > payload_max_bytes.
-
         wire_id = _str (_new_id "ours notification").
+        addr = decode_notify_address address_blob.
         return transaction::success [
-            transaction::action::send (addr $service_cid) (
-                $name -> post_notification_tx,
-                $targ -> (
-                    $token   -> (addr $token),
-                    $payload -> payload,
-                    $wire_id -> wire_id,
-                    $pv -> a2a_versions::wire_version
-                )
-            ),
+            notification_send_action address_blob payload wire_id,
             _return_data ($sent_to -> (addr $service_cid), $wire_id -> wire_id)
         ].
     }

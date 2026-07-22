@@ -88,6 +88,65 @@ async function main() {
   ok(new RegExp(nbob.cid).test(n2s), `sender_cid recorded from the signed envelope`);
   ok(/push\.example/.test(n2s.split('notif_log')[1] || ''), `hook received the recipient's current bindings`);
 
+  // ---------- NI1 core-owned handout + post-send middleware ----------
+  CUR = 'NI1-core-integration';
+  console.log('\n=== NI1 core-owned notification integration ===');
+  // Alice and Bob become ordinary messaging contacts. Alice's scoped handout
+  // above is already bound to (recipient=Alice, scope=Bob).
+  {
+    const im = await mutate(alice, '::a2a_messaging::generate_invite', { name: 'Bob' });
+    const iblob = Buffer.from(im.Reduce('invite').GetBinary());
+    await mutate(nbob, '::a2a_messaging::add_contact', { invite: binv(nbob, iblob), name: 'alice' });
+    await sleep(5000);
+  }
+  await mutate(alice, '::a2a_notification_integration::send_notify_address',
+    { service: 'svc', contact: nbob.cid });
+  await sleep(2000);
+  ok(new RegExp(alice.cid).test(ro(nbob, '::actor::qa_notify_addr_store', undefined).Visualize()),
+    `new library route validates and stores Alice's handout on Bob`);
+
+  const ni1Before = nst(nsvc);
+  const ni1Sent = await mutate(nbob, '::a2a_messaging::send_message',
+    { contact: alice.cid, text: 'core-notify-message' });
+  const ni1Wire = ni1Sent.Reduce('wire_id').Visualize();
+  await sleep(3000);
+  const ni1After = nst(nsvc);
+  ok(/core-notify-message/.test(ro(alice, '::actor::list_incoming_messages', undefined).Visualize()),
+    `ordinary message still reaches Alice`);
+  ok(ni1After !== ni1Before && ni1After.includes(ni1Wire),
+    `post-send middleware posts a notification carrying the actual message wire_id`);
+  ok(ni1After.includes(nbob.cid) && /kind.*message/.test(ni1After),
+    `notification payload carries sender metadata and kind=message`);
+
+  // A NIL handout is the mute/delete signal. It must suppress only the wake,
+  // never the accepted message.
+  await mutate(alice, '::a2a_notification_integration::delete_notify_address',
+    { contact: nbob.cid });
+  await sleep(1500);
+  const ni1MutedBefore = nst(nsvc);
+  await mutate(nbob, '::a2a_messaging::send_message',
+    { contact: alice.cid, text: 'muted-but-delivered' });
+  await sleep(3000);
+  ok(/muted-but-delivered/.test(ro(alice, '::actor::list_incoming_messages', undefined).Visualize()),
+    `address deletion does not affect message delivery`);
+  ok(nst(nsvc) === ni1MutedBefore, `address deletion suppresses the notification post`);
+
+  // Restore through the deployed ::actor::* compatibility shim and prove the
+  // same core-owned state/middleware path resumes.
+  await mutate(alice, '::actor::qa_send_notify_address',
+    { target: nbob.cid, address: binv(alice, naddr), legacy: true });
+  await sleep(1500);
+  const ni1LegacyBefore = nst(nsvc);
+  const ni1LegacySent = await mutate(nbob, '::a2a_messaging::send_message',
+    { contact: alice.cid, text: 'legacy-handout-message' });
+  const ni1LegacyWire = ni1LegacySent.Reduce('wire_id').Visualize();
+  await sleep(3000);
+  ok(nst(nsvc) !== ni1LegacyBefore && nst(nsvc).includes(ni1LegacyWire),
+    `legacy ::actor::receive_notify_address shim feeds the new middleware`);
+  const ni1Export = ro(nbob, '::actor::export_state', undefined).Visualize();
+  ok(/notify_integration/.test(ni1Export) && new RegExp(alice.cid).test(ni1Export),
+    `notification handout is included in the composed actor export`);
+
   // ---------- N3 token rejection matrix + E9 (zero state change each) ----------
   CUR = 'N3-rejections';
   console.log('\n=== N3 rejection matrix ===');
@@ -105,6 +164,13 @@ async function main() {
     await mutate(neve, '::a2a_messaging::add_contact', { invite: binv(neve, iblob), name: 'alice-target' });
     await sleep(5000);
   }
+  const neveRejectsBeforeBinding = neve.rejects.length;
+  await mutate(alice, '::actor::qa_send_notify_address',
+    { target: neve.cid, address: binv(alice, naddr), legacy: false });
+  await sleep(2000);
+  ok(neve.rejects.slice(neveRejectsBeforeBinding).some((x) => /scoped to this sender/.test(x)) &&
+     !new RegExp(alice.cid).test(ro(neve, '::actor::qa_notify_addr_store', undefined).Visualize()),
+    `handout scoped to Bob is rejected when Alice sends it to Eve`);
   const aBefore = nst(alice);
   const aRejx = alice.rejects.length;
   await mutate(neve, '::actor::qa_send_fake_confirm', { target: alice.cid });

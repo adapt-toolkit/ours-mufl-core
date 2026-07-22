@@ -35,6 +35,7 @@ application actor loads libraries
     a2a_protocol,
     a2a_messaging,
     a2a_notifications,
+    a2a_notification_integration,
     current_transaction_info,
     protocol_container,
     version
@@ -107,13 +108,9 @@ application actor loads libraries
         unregs_log is any[] = [].
         regconfirm_log is any[] = [].
 
-        // Deployed-messenger emulation (LEGACY receive_notify_address): stores
-        // the blob, counts receipts, sends NO ack — exactly the pre-engine peer
-        // shape. Feeds the control-plane engine rig's byte-compat + retry-cap
-        // tests.
-        notify_addr_store is (global_id ->> bin) = (,).
-        notify_addr_recv_count is int = 0.
-
+        // The integration supplies ordinary client defaults; this dual-role
+        // test actor then overrides them with observable service/client hooks.
+        a2a_notification_integration::init ($_read_or_abort -> _read_or_abort).
         a2a_notifications::init (
             $_read_or_abort -> _read_or_abort,
             $on_notification_posted -> fn (arg: any) -> transaction::action::type[]
@@ -150,12 +147,19 @@ application actor loads libraries
     // core+notify round-trip lives here (test_actor keeps only the core half).
     // The "both halves coexist in one blob and both restore" coverage (N7/N16)
     // is asserted against these.
-    trn readonly export_state _ { return ($core -> (a2a_messaging::export_core_state NIL), $notify -> (a2a_notifications::export_notify_state NIL)). }
+    trn readonly export_state _ {
+        return (
+            $core -> (a2a_messaging::export_core_state NIL),
+            $notify -> (a2a_notifications::export_notify_state NIL),
+            $notify_integration -> (a2a_notification_integration::export_state NIL)
+        ).
+    }
     trn import_state data: any
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         a2a_messaging::import_core_state (data $core).
         if (data $notify) != NIL { a2a_notifications::import_notify_state (data $notify). }
+        if (data $notify_integration) != NIL { a2a_notification_integration::import_state (data $notify_integration). }
         return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
     }
 
@@ -170,36 +174,24 @@ application actor loads libraries
 
     // ================= NOTIFICATION TEST PROBES =================
 
-    // LEGACY notify-address receiver — byte-for-byte the DEPLOYED messenger
-    // targ shape ($address only, required bin). Stores + counts, never acks.
-    // An engine sender's additive $gen field must route here unchanged
-    // (byte-compat obligation). Feeds the control-plane engine rig (no driver
-    // in notif.mjs exercises it, but it is notification-plane surface).
-    trn receive_notify_address _:($address -> blob: bin)
-    {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
-        encrypted_channel::check_encrypted_or_abort ().
-
-        from = current_transaction_info::get_external_envelope_or_abort() $from.
-        notify_addr_store from -> blob.
-        notify_addr_recv_count -> notify_addr_recv_count + 1.
-        return transaction::success [ _save_state NIL ].
-    }
+    // Deployed-peer compatibility shim: old senders still address ::actor::*;
+    // state and validation are owned by the integration library.
+    trn receive_notify_address args: any { return a2a_notification_integration::handle_receive_notify_address args. }
     trn readonly qa_notify_addr_store _
     {
-        return ($store -> notify_addr_store, $count -> notify_addr_recv_count).
+        return ($store -> a2a_notification_integration::received_notify_addresses).
     }
-    // LEGACY notify-address SENDER — byte-for-byte the deployed fan-out targ
-    // shape ($address only, no $gen). Lets the engine rig prove a pre-engine
-    // peer's handout still lands at a v2 messenger (which must store it and
-    // send no ack).
-    trn qa_send_legacy_notify_address _:($target -> tgt: global_id, $address -> blob: bin)
+    // Send either the new library-routed handout or the deployed ::actor::*
+    // shape. Nullable address deletes the receiver's stored handout.
+    trn qa_send_notify_address _:($target -> tgt: global_id, $address -> blob: bin+, $legacy -> legacy: bool)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            tx_name is str = "::a2a_notification_integration::receive_notify_address".
+            if legacy { tx_name -> "::actor::receive_notify_address". }
             return transaction::success [
                 encrypted_channel::send_encrypted_tx tgt (
-                    $name -> "::actor::receive_notify_address",
+                    $name -> tx_name,
                     $targ -> ($address -> blob)
                 ),
                 _return_data ($sent_to -> tgt)
