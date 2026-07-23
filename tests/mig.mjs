@@ -670,32 +670,69 @@ async function main() {
     const lSt2 = ro(lo, '::actor::qa_mig_state', { cid: hi.cid });
     ok(sweep2.Reduce('initiated').Visualize() === '0' && lSt2.Reduce('phase').Visualize() === 'active' && hex(getBin(lSt2, 'epoch')) === epoch0, '★ C-path IDEMPOTENCY: a second sweep does NOT re-offer the ACTIVE contact (phase + epoch unchanged; the never-cleared contact_migration gate)'); }
 
-  // ═══ 2b AUTO-ADVERTISE — core-owned reconcile_advertise + version/cap change detection ═══
-  // The app declares its caps once at init and calls reconcile_advertise once per boot; the
-  // core owns the re-advertise (replacing app-orchestrated readvertise_on_upgrade/e2e_recovery)
-  // and NOTICES a persisted wire-version/cap-set change to gate the legacy upgrade push.
-  console.log('=== mig: 2b reconcile_advertise — core-owned re-advertise + change detection ===');
+  // ═══ 2b GENERIC CAPABILITY RE-ADVERTISEMENT — persisted per-contact ACK state ═══
+  console.log('=== mig: 2b generic capability advertise/ack reconciliation ===');
   {
-    const CA = await mkNode('mig-adv-A', 'CAA');
+    let CA = await mkNode('mig-adv-A', 'CAA');
     const CB = await mkNode('mig-adv-B', 'CBB'); await sleep(1000);
     const cinv = await mutate(CA, '::a2a_messaging::generate_invite', { name: 'CBB' });
     await mutate(CB, '::a2a_messaging::add_contact', { invite: binv(CB, Buffer.from(cinv.Reduce('invite').GetBinary())), name: 'CAA' });
     await sleep(6000);   // invite redeem round-trips (CA gains a contact)
 
-    // First reconcile: the advertised record is empty (pv=0) → CHANGED → advertises.
-    const r1 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
-    ok(T(r1.Reduce('changed').Visualize()), '2b: first reconcile_advertise reports changed (fresh/never-advertised record)');
-    ok(+r1.Reduce('legacy_readvertised').Visualize() + +r1.Reduce('e2e_readvertised').Visualize() >= 1, '2b: first reconcile re-advertised to the contact');
+    // Stable-era baseline: both packets are already connected and ACK the old cap
+    // lists. Persist A, destroy the live packet, and restore the same identity.
+    await mutate(CA, '::actor::qa_init_caps', { advertise: ['core.e2e'] });
+    await mutate(CB, '::actor::qa_init_caps', { advertise: ['core.e2e', 'core.receipts.receive'] });
+    await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    await mutate(CB, '::a2a_messaging::reconcile_advertise', {});
+    await sleep(2500);
+    const persistedA = Buffer.from(ro(CA, '::actor::export_state', {}).Serialize());
+    wrapper.packet_manager.remove_packet(CA.cid);
+    await sleep(300);
+    CA = await mkNode('mig-adv-A', 'CAA');
+    await mutate(CA, '::actor::import_state', CA.pw.packet.ParseValue(new Uint8Array(persistedA)));
+    await mutate(CA, '::a2a_messaging::commit_e2e_restore', {});
+    // "Upgraded code" defines A+notifications+receipts at one-time init.
+    await mutate(CA, '::actor::qa_init_caps', { advertise: ['core.e2e', 'core.notifications', 'core.receipts.emit'] });
 
-    // Second reconcile: no pv/cap change → NOT changed → legacy upgrade push SKIPPED (idempotent).
+    // First reconcile sends a generic capability snapshot. The receiver replaces its
+    // cached list, ACKs the fingerprint, and the sender persists that per-contact ACK.
+    const r1 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(T(r1.Reduce('changed').Visualize()), '2b: persisted global fingerprint notices the code-defined capability list');
+    ok(+r1.Reduce('capability_advertised').Visualize() === 1, '2b: first reconcile sends one generic capability snapshot');
+    await sleep(2500);
+    const learned1 = ro(CB, '::actor::qa_cap_state', { cid: CA.cid });
+    ok(learned1.Reduce('caps').Visualize().includes('core.receipts.emit'), '2b: existing peer learns newly-added receipts capability without app traffic');
+    ok(learned1.Reduce('caps').Visualize().includes('core.notifications'), '2b: existing peer learns newly-added notifications capability without app traffic');
+    ok(T(ro(CA, '::actor::qa_receipt_gate', { cid: CB.cid }).Reduce('enabled').Visualize()), '2b: restored upgraded sender has its receipt gate enabled from reconciled peer capabilities');
+    const acked1 = ro(CA, '::actor::qa_cap_state', { cid: CB.cid });
+    ok(acked1.Reduce('confirmed').Visualize() === acked1.Reduce('current').Visualize(), '2b: ACK persists the peer-confirmed current fingerprint');
+    ok(T(acked1.Reduce('confirmed_persisted').Visualize()), '2b: per-contact ACK fingerprint is present in export_core_state');
+
+    // ACK-confirmed peers are not spammed on the next boot/cadence reconciliation.
     const r2 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
     ok(!T(r2.Reduce('changed').Visualize()), '2b: second reconcile is idempotent (unchanged pv+caps → not changed)');
-    ok(+r2.Reduce('legacy_readvertised').Visualize() === 0, '2b: idempotent reconcile skips the legacy upgrade push');
+    ok(+r2.Reduce('capability_advertised').Visualize() === 0, '2b: ACK-confirmed contact is not re-spammed');
 
-    // Capability change: add cap_e2e_migrate at runtime → reconcile NOTICES the new cap.
-    await mutate(CA, '::a2a_messaging::advertise_migrate', {});
+    // Model a lost ACK/offline attempt by removing only the confirmed ledger entry:
+    // global previous-list state is still unchanged, but the per-contact retry must fire.
+    await mutate(CA, '::actor::qa_clear_cap_ack', { cid: CB.cid });
+    const retry = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(!T(retry.Reduce('changed').Visualize()) && +retry.Reduce('capability_advertised').Visualize() === 1, '2b: missing per-contact ACK retries even when global fingerprint is unchanged');
+    await sleep(2500);
+    const retryDone = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
+    ok(+retryDone.Reduce('capability_advertised').Visualize() === 0, '2b: retry converges after ACK and does not re-spam');
+
+    // Removal is an exact replacement, not the old non-empty-only merge behavior.
+    // The monotonic E2E pin must survive even if a later snapshot removes core.e2e.
+    await mutate(CA, '::actor::qa_init_caps', { advertise: ['core.notifications'] });
     const r3 = await mutate(CA, '::a2a_messaging::reconcile_advertise', {});
-    ok(T(r3.Reduce('changed').Visualize()), '2b: reconcile_advertise NOTICES a new capability (advertise_migrate added cap_e2e_migrate → cap fingerprint changed)');
+    ok(T(r3.Reduce('changed').Visualize()) && +r3.Reduce('capability_advertised').Visualize() === 1, '2b: changed capability set re-advertises exactly once');
+    await sleep(2500);
+    const learned2 = ro(CB, '::actor::qa_cap_state', { cid: CA.cid });
+    const caps2 = learned2.Reduce('caps').Visualize();
+    ok(caps2.includes('core.notifications') && !caps2.includes('core.receipts.emit') && !caps2.includes('core.e2e'), '2b: receiver exact-replaces additions and removals');
+    ok(T(learned2.Reduce('pinned').Visualize()), '2b: capability removal cannot clear the monotonic E2E downgrade pin');
   }
 
   // ═══ RELOAD PORT (design §3 acceptance) — page-reload DR message-loss, now GREEN ═══

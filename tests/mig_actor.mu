@@ -265,7 +265,9 @@ application actor loads libraries
             { return ($version -> 1, $app_id -> "mig.actor", $name -> "actor", $description -> "", $monitoring_status -> "off", $capabilities -> (,)). },
             $supported -> [], $handlers -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
-            $authorizer -> NIL, $advertise -> adv ).
+            $authorizer -> NIL, $advertise -> adv,
+            $on_advertise -> a2a_messaging::handle_capability_advertise,
+            $on_advertise_ack -> a2a_messaging::handle_capability_advertise_ack ).
         return transaction::success [ _return_data ($set -> TRUE) ].
     }
     trn qa_learn_peer _:($cid -> cid: global_id, $pv -> pv: int, $caps -> caps: str[])
@@ -274,6 +276,27 @@ application actor loads libraries
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
     trn readonly qa_mig_should_trigger _:($cid -> cid: global_id) { return ($fire -> (a2a_messaging::mig_should_trigger cid)). }
+    trn readonly qa_cap_state _:($cid -> cid: global_id)
+    {
+        pc = a2a_messaging::contact_caps cid.
+        confirmed = a2a_messaging::contact_advertised_caps cid.
+        exported = (a2a_messaging::export_core_state NIL) $contact_advertised_caps cid.
+        return (
+            $caps -> (pc == NIL ?? [] ; pc?),
+            $confirmed -> (confirmed == NIL ?? "" ; confirmed?),
+            $confirmed_persisted -> (exported != NIL && exported? == (confirmed == NIL ?? "" ; confirmed?)),
+            $current -> (a2a_messaging::caps_fingerprint NIL),
+            $pinned -> (a2a_messaging::e2e_pinned cid)
+        ).
+    }
+    trn qa_clear_cap_ack _:($cid -> cid: global_id)
+    {
+        if (a2a_messaging::contact_advertised_caps cid) != NIL
+        { delete a2a_messaging::contact_advertised_caps cid. }
+        return transaction::success [ _return_data ($cleared -> TRUE) ].
+    }
+    trn readonly qa_receipt_gate _:($cid -> cid: global_id)
+    { return ($enabled -> (a2a_messaging::receipt_gate cid)). }
 
     // core 0.10 born-DR probe/override. A pair established through a real invite handshake presents a
     // v2 (bundle-carrying) AD, so core marks it born-DR (contact_born_dr=TRUE) — correctly INELIGIBLE

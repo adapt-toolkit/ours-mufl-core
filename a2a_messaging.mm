@@ -83,6 +83,8 @@ library a2a_messaging loads libraries
     // core 0.10 (B1): stateless AD re-advertise pushed to pre-existing legacy contacts on
     // upgrade, so an idle legacy pair learns both sides are now v2 and the migration FSM fires.
     readvertise_ad_tx          = "::a2a_messaging::readvertise_ad".
+    capability_advertise_tx    = "::a2a_capabilities::advertise".
+    capability_advertise_ack_tx = "::a2a_capabilities::advertise_ack".
     // core 0.9.0 boxed APP-E2E (Option B): app data over the MIGRATED session rides these named
     // boxes ($targ = the e2e_signed_message). DISTINCT from legacy receive_message_tx so the wire
     // separates e2e-carrying box from legacy box (an attacker cannot confuse them).
@@ -188,6 +190,9 @@ library a2a_messaging loads libraries
     // guarded on import (pre-0.5 exports import unchanged).
     contact_pv is (global_id ->> int) = (,).
     contact_caps is (global_id ->> str[]) = (,).
+    // ACK-confirmed capability fingerprint per contact. A missing/stale entry
+    // is retried by reconcile_advertise; only the encrypted ACK advances it.
+    contact_advertised_caps is (global_id ->> str) = (,).
     // core 0.8.0: monotonic E2E anti-downgrade pin (SPEC §4). Positive-evidence,
     // set TRUE the first time a peer advertises core.e2e and NEVER cleared — it
     // CANNOT be derived from contact_caps (which is last-seen-wins, so a later
@@ -1854,6 +1859,9 @@ library a2a_messaging loads libraries
         delete contacts target_id.
         if peer_ads target_id != NIL { delete peer_ads target_id. }
         if contact_roots target_id != NIL { delete contact_roots target_id. }
+        if contact_pv target_id != NIL { delete contact_pv target_id. }
+        if contact_caps target_id != NIL { delete contact_caps target_id. }
+        if contact_advertised_caps target_id != NIL { delete contact_advertised_caps target_id. }
 
         // Contact-restore stores too: an orphaned deferred queue would persist in
         // every export and, on a later RE-ADD of the same peer, the boot/GC sweep
@@ -4237,41 +4245,95 @@ library a2a_messaging loads libraries
         return s.
     }
 
-    // core 0.12 (2b): the SINGLE core-owned re-advertise entrypoint. The app declares its
-    // capabilities ONCE at init (a2a_capabilities) and calls THIS once per boot, replacing the
-    // app-orchestrated readvertise_on_upgrade + readvertise_e2e_recovery pair — the core now
-    // owns WHAT gets advertised. It ALWAYS runs the e2e self-heal recovery push (LOAD-BEARING:
-    // a re-minted account after a lost/rejected restore leaves every peer holding my stale
-    // bundle) and, when it NOTICES a wire-version or cap-set change since the last reconcile
-    // (persisted advertised_pv/advertised_caps), ALSO runs the legacy upgrade push. Idempotent:
-    // an unchanged pv+caps skips the legacy push (no redundant legacy traffic). Persists the
-    // advertised record (_save_state). A contact that becomes reachable later relearns my AD
-    // through handle_readvertise_ad once these pushes round-trip. STATELESS re-advertise
-    // semantics (readvertise_ad_tx) are unchanged, so a pre-0.10 peer ignores the tx as before.
+    fn fingerprint_caps (caps: str[]) -> str
+    {
+        s is str = "".
+        sc caps -- ( -> c) { s -> (s + c) + ",". }
+        return s.
+    }
+
+    // Generic capability snapshot receiver. Exact replacement is intentional:
+    // removals must propagate. The E2E pin remains monotonic, so an advertised
+    // removal cannot reopen plaintext routing. Duplicate snapshots still ACK,
+    // which repairs a lost ACK without duplicating delta-side effects.
+    fn handle_capability_advertise (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        if (contacts sender_id) == NIL { return transaction::success []. }
+        caps is str[] = ((args $caps) safe (str[])).
+        fp = (args $fingerprint) safe str.
+        abort "Capability advertisement fingerprint mismatch." when fp != fingerprint_caps caps.
+        pv = (args $pv) safe int.
+        prev = contact_caps sender_id.
+        prev_fp is str = "".
+        if prev != NIL { prev_fp -> fingerprint_caps prev?. }
+        contact_caps sender_id -> caps.
+        contact_pv sender_id -> pv.
+        note_e2e_seen sender_id caps.
+        actions is transaction::action::type[] = [
+            encrypted_channel::send_encrypted_tx sender_id (
+                $name -> capability_advertise_ack_tx,
+                $targ -> ($fingerprint -> fp)
+            )
+        ].
+        if prev_fp != fp
+        {
+            actions (_count actions|) -> _notify_agent (
+                $event -> $peer_capabilities_changed, $cid -> sender_id,
+                $previous_fingerprint -> prev_fp, $fingerprint -> fp, $caps -> caps
+            ).
+            // DR migration is a subscriber/special-case of the generic delta:
+            // all eligibility, election, born-DR and epoch gates remain inside
+            // the existing trigger unchanged.
+            sc mig_trigger_actions sender_id -- ( -> a) { actions (_count actions|) -> a. }
+        }
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    fn handle_capability_advertise_ack (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+        if (contacts sender_id) == NIL { return transaction::success []. }
+        fp = (args $fingerprint) safe str.
+        // A stale/replayed ACK cannot suppress a newer capability snapshot.
+        if fp != caps_fingerprint NIL { return transaction::success []. }
+        contact_advertised_caps sender_id -> fp.
+        return transaction::success [ _save_state NIL ].
+    }
+
+    // Part C: the SINGLE generic capability re-advertise entrypoint. The app declares
+    // capabilities once at init and calls this on boot/GC. A persisted global fingerprint
+    // detects code-defined changes; a persisted per-contact ACK ledger prevents repeat sends
+    // while retrying offline/lost-ACK contacts. On a global change, the legacy full-AD push
+    // remains a migration bootstrap subscriber/special-case. E2E account/session recovery is
+    // intentionally still the separate readvertise_e2e_recovery daemon sweep.
     trn reconcile_advertise _
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
-        b       = my_identity_bundle_fields_fresh NIL.
         cur_pv  = a2a_versions::wire_version.
         cur_fp  = caps_fingerprint NIL.
         changed is bool = (advertised_pv != cur_pv) || (cur_fp != advertised_caps).
         actions is transaction::action::type[] = [].
-        e2e_n    is int = 0.
+        cap_n    is int = 0.
         legacy_n is int = 0.
-        // ALWAYS: the e2e self-heal recovery push (the load-bearing fallback re-arm).
-        sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) != NIL || (contact_born_dr cid) == TRUE || (e2e_pinned cid) || (contact_migration cid) != NIL)
+        // Per-contact ACK ledger: retry missing/stale peers on the next cadence,
+        // but never re-spam a peer that confirmed this exact capability set.
+        sc contacts -- (cid -> ) ?? ((contact_advertised_caps cid) != cur_fp)
         {
             actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
-                $name -> readvertise_ad_tx,
-                $targ -> ( $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
-                           $cp_binding -> (b $cp_binding),
-                           $pv -> a2a_versions::wire_version,
-                           $caps -> (a2a_capabilities::self_cap_ids NIL) ) ).
-            e2e_n -> e2e_n + 1.
+                $name -> capability_advertise_tx,
+                $targ -> ($pv -> cur_pv, $caps -> (a2a_capabilities::self_cap_ids NIL), $fingerprint -> cur_fp) ).
+            cap_n -> cap_n + 1.
         }
         // ON CHANGE ONLY: the legacy upgrade push to pre-existing legacy contacts.
         if changed
         {
+            b = my_identity_bundle_fields_fresh NIL.
             sc contacts -- (cid -> ) ?? ((contact_e2e_epoch cid) == NIL && (contact_born_dr cid) != TRUE && (contact_migration cid) == NIL)
             {
                 actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
@@ -4285,7 +4347,10 @@ library a2a_messaging loads libraries
         }
         advertised_pv   -> cur_pv.
         advertised_caps -> cur_fp.
-        actions (_count actions|) -> _return_data ($changed -> changed, $e2e_readvertised -> e2e_n, $legacy_readvertised -> legacy_n).
+        actions (_count actions|) -> _return_data (
+            $changed -> changed, $capability_advertised -> cap_n,
+            $e2e_readvertised -> 0, $legacy_readvertised -> legacy_n
+        ).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -4493,6 +4558,7 @@ library a2a_messaging loads libraries
             $deferred_msgs   -> deferred_msgs,
             $contact_pv      -> contact_pv,
             $contact_caps    -> contact_caps,
+            $contact_advertised_caps -> contact_advertised_caps,
             $contact_e2e_seen -> contact_e2e_seen,
             $contact_born_dr -> contact_born_dr,
             // core 0.9.0 migration FSM metadata — additive, all keyed by cid. Only
@@ -4729,6 +4795,8 @@ library a2a_messaging loads libraries
         // re-advertises, which is exactly the desired post-upgrade behavior).
         if (data $advertised_pv) != NIL { advertised_pv -> (data $advertised_pv) safe int. }
         if (data $advertised_caps) != NIL { advertised_caps -> (data $advertised_caps) safe str. }
+        if (data $contact_advertised_caps) != NIL
+        { contact_advertised_caps -> (data $contact_advertised_caps) safe (global_id ->> str). }
 
         // Re-register every peer's keys so encrypted channels keep working after
         // the upgrade — no handshake needed (my own keys are unchanged, and the

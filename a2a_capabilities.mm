@@ -200,6 +200,13 @@ library a2a_capabilities loads libraries
         // an app never wires capabilities, and the piggyback must degrade to
         // "advertises nothing" there, never abort an invite/restore leg.
         self_caps is str[] = [].
+        // Part C: transport routes stay in this low-level capability namespace,
+        // while the messaging layer owns contact state, encryption checks, retry,
+        // and migration subscription. Optional for backwards-compatible actors.
+        on_advertise is (any -> transaction::results::type) =
+            fn (_: any) -> transaction::results::type { return transaction::success []. }.
+        on_advertise_ack is (any -> transaction::results::type) =
+            fn (_: any) -> transaction::results::type { return transaction::success []. }.
     }
 
     // FAIL-FAST: $supported is the static list of capability ids this app
@@ -221,13 +228,17 @@ library a2a_capabilities loads libraries
         // handlers (e.g. core.receipts.*). $supported keeps its declared-implies-
         // implemented handler guard; $advertise is for ids that gate peer
         // traffic shaping only and never route through dispatch.
-        $advertise  -> advertise_list: str[]+
+        $advertise  -> advertise_list: str[]+,
+        $on_advertise -> advertise_cb: (any -> transaction::results::type)+,
+        $on_advertise_ack -> advertise_ack_cb: (any -> transaction::results::type)+
     ))
     {
         describe -> describe_cb.
         handlers -> handler_map.
         on_unknown -> fallback.
         if authorizer_cb != NIL { authorizer -> authorizer_cb. }
+        if advertise_cb != NIL { on_advertise -> advertise_cb?. }
+        if advertise_ack_cb != NIL { on_advertise_ack -> advertise_ack_cb?. }
         merged is str[] = [].
         sc supported_caps -- ( -> cap) { merged (_count merged|) -> cap. }
         if advertise_list != NIL
@@ -272,6 +283,11 @@ library a2a_capabilities loads libraries
     {
         if (self_advertises cap) != TRUE { self_caps (_count self_caps|) -> cap. }
     }
+
+    // Thin, callback-routed wire transactions. a2a_capabilities intentionally
+    // owns no contact or retry state; consumers register the orchestration hooks.
+    trn advertise args: any { return on_advertise args. }
+    trn advertise_ack args: any { return on_advertise_ack args. }
 
     // ---- manifest helpers -------------------------------------------------
     fn has_capability (_:($manifest -> m: app_manifest_t, $cap -> cap: str)) -> bool
