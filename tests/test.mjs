@@ -700,6 +700,47 @@ async function main() {
       'RC10: expectation = unknown toward a pv-5 peer');
   }
 
+  // ---------- CN contact naming after an AD introduction ----------
+  CUR = 'CN contact naming';
+  console.log('\n=== CN AD introduction adopts only a CID fallback name ===');
+  {
+    const N = mk('N'); const C = mk('C'); const P = mk('P');
+    await mkPacket(N, 'name-node-01');
+    await mkPacket(C, 'name-controller-02');
+    await mkPacket(P, 'name-peer-03');
+    await sleep(1200);
+    await setName(N, 'Node');
+    await setName(C, 'ControllerSelf');
+    await setName(P, 'PeerReal');
+
+    const ni = await mutate(N, '::a2a_messaging::generate_invite', { name: 'ControllerAlias' });
+    await mutate(C, '::a2a_messaging::add_contact',
+      { invite: binv(C, Buffer.from(ni.Reduce('invite').GetBinary())), name: 'NodeAlias' });
+    await sleep(5000);
+    await mutate(N, '::actor::qa_init_connect', {});
+    await mutate(N, '::a2a_messaging::set_proxy_pending', { code: '123456', proxy: C.cid });
+    await mutate(N, '::a2a_messaging::verify_proxy_code', { code: '123456', sender: C.cid });
+
+    const pAd = adBlob(P);
+    await mutate(C, '::actor::qa_send_ingest_descriptor',
+      { target: N.cid, peer_ad: binv(C, pAd), peer_name: '' });
+    await sleep(1800);
+    ok(new RegExp(`\"name\"->\"${P.cid}\"`).test(lc(N)),
+      'CN1: nameless introduction initially uses the peer CID fallback');
+
+    await mutate(C, '::actor::qa_send_ingest_descriptor',
+      { target: N.cid, peer_ad: binv(C, pAd), peer_name: 'PeerReal' });
+    await sleep(1800);
+    ok(/"name"->"PeerReal"/.test(lc(N)),
+      'CN2: later AD introduction replaces the CID fallback with the real peer name');
+
+    await mutate(C, '::actor::qa_send_ingest_descriptor',
+      { target: N.cid, peer_ad: binv(C, adBlob(C)), peer_name: 'ControllerSelf' });
+    await sleep(1800);
+    ok(/"name"->"ControllerAlias"/.test(lc(N)) && !/"name"->"ControllerSelf"/.test(lc(N)),
+      'CN3: an explicit invite name is preserved on re-introduction');
+  }
+
   console.log('\n================ SCORECARD ================');
   if (scorecard.length === 0) console.log('ALL TESTS PASSED');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

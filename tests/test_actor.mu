@@ -438,6 +438,50 @@ application actor loads libraries
         ).
         return transaction::success [ _return_data ($set -> TRUE) ].
     }
+
+    // Contact-naming regression plumbing: advertise core.connect on the receiver,
+    // then let its already-bound CP relay a real signed peer AD + display label.
+    trn qa_init_connect _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        hs is (str ->> (any -> transaction::action::type[])) = (,).
+        hs a2a_capabilities::cap_connect -> fn (_: any) -> transaction::action::type[] { return []. }.
+        a2a_capabilities::init (
+            $describe -> fn (_: any) -> a2a_capabilities::app_manifest_t
+            {
+                caps is (str ->> a2a_capabilities::capability_t) = (,).
+                caps a2a_capabilities::cap_connect -> (
+                    $cap -> a2a_capabilities::cap_connect,
+                    $version -> 1,
+                    $params -> "",
+                    $secrets -> (,)
+                ).
+                return ($version -> 1, $app_id -> "test.actor", $name -> "actor",
+                        $description -> "", $monitoring_status -> "off", $capabilities -> caps).
+            },
+            $supported -> [a2a_capabilities::cap_connect],
+            $handlers -> hs,
+            $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
+            $authorizer -> NIL,
+            $advertise -> []
+        ).
+        return transaction::success [ _return_data ($set -> TRUE) ].
+    }
+
+    trn qa_send_ingest_descriptor _:($target -> tgt: global_id, $peer_ad -> ad_blob: bin, $peer_name -> peer_name: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        ad = (_read_or_abort ad_blob) safe address_document_types::t_address_document.
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::a2a_messaging::ingest_connect_descriptor",
+                    $targ -> ($peer_ad -> ad, $peer_name -> peer_name, $pv -> a2a_versions::wire_version)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
     // Consumer read-path emission (the get/mark-read moment): appends the core
     // read_receipt_actions for ids just transitioned unread->read.
     trn qa_mark_read _:($contact -> cid: global_id, $wire_ids -> wids: str[])
