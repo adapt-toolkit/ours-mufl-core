@@ -2320,10 +2320,20 @@ library a2a_messaging loads libraries
         // can never be silently overwritten with a different keyset).
         address_document::process_address_document peer_ad TRUE.
 
-        // Idempotent re-introduction: if peer_cid is already a contact, just refresh the
-        // stored AD and keep the existing name — never clobber it or re-notify as new.
+        peer_name is str = "".
+        if (args $peer_name) != NIL { peer_name -> (args $peer_name) safe str. }
+
+        // Idempotent re-introduction: refresh the stored AD. A contact created from a
+        // nameless/legacy introduction may still be labelled by its CID; in that one
+        // case adopt the now-available peer label. Any better name (including an
+        // explicit invite alias) remains authoritative and is never overwritten.
         if (contacts peer_cid) != NIL
         {
+            existing = (contacts peer_cid)?.
+            if peer_name != "" && (existing $name) == (_str peer_cid)
+            {
+                contacts peer_cid -> ($name -> peer_name, $container_id -> peer_cid).
+            }
             peer_ads peer_cid -> peer_ad.
             return transaction::success [
                 _notify_agent ($event -> $reintroduced, $container_id -> peer_cid, $by_cp -> sender_id),
@@ -2332,8 +2342,6 @@ library a2a_messaging loads libraries
         }
 
         // New contact: register under the CP-supplied display name (cid as last resort).
-        peer_name is str = "".
-        if (args $peer_name) != NIL { peer_name -> (args $peer_name) safe str. }
         contact_label is str = (peer_name == "" ?? (_str peer_cid) ; peer_name).
         contacts peer_cid -> ($name -> contact_label, $container_id -> peer_cid).
         peer_ads peer_cid -> peer_ad.
