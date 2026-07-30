@@ -738,15 +738,43 @@ library a2a_messaging loads libraries
 
     // Resolve a contact reference (a display name or stringified container id)
     // to a container id; aborts if no contact matches.
+    //
+    // A container-id reference is unambiguous BY CONSTRUCTION (container ids
+    // are the map key) and returns immediately — it is the one addressing mode
+    // that can never misfire on any book. A display name must match exactly ONE
+    // contact: when two or more share the name (a pre-uniqueness book, or a
+    // stale predecessor beside its live replacement), first-match-wins would
+    // let MUFL map iteration order silently pick the recipient — the incident
+    // class this guard exists for — so it aborts, listing every candidate's
+    // container id instead.
+    //
+    // The ambiguity message must NEVER contain the "Unknown contact" substring:
+    // the daemon's send_message matches /Unknown contact/ to fall through to
+    // sibling/local-book auto-connect, and an ambiguity error taking that path
+    // would register a THIRD same-named contact.
     fn resolve_contact (ref: str) -> global_id
     {
-        found is global_id+ = NIL.
-        sc contacts -- (cid -> c) ?? found == NIL && ((c $name) == ref || (_str cid) == ref)
+        cid_match is global_id+ = NIL.
+        matches is global_id[] = [].
+        sc contacts -- (cid -> c)
         {
-            found -> cid.
+            if (_str cid) == ref { cid_match -> cid. break. }
+            if (c $name) == ref { matches (_count matches|) -> cid. }
         }
-        abort "Unknown contact: " + ref when found == NIL.
-        return found?.
+        if cid_match != NIL { return cid_match?. }
+        n = _count matches|.
+        abort "Unknown contact: " + ref when n == 0.
+        if n > 1
+        {
+            listing is str = "".
+            sc matches -- ( -> m)
+            {
+                if listing != "" { listing -> listing + ", ". }
+                listing -> listing + (_str m).
+            }
+            abort "Contact name \"" + ref + "\" is ambiguous - " + (_str n) + " contacts share it: " + listing + ". Address the intended one by container id, or give it a unique name with rename_contact." when TRUE.
+        }
+        return (matches 0)?.
     }
 
     // ---- user transactions --------------------------------------------------
