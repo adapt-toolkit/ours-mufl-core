@@ -682,6 +682,79 @@ library a2a_messaging loads libraries
         return transaction::success [ _return_data ($ok -> TRUE), _save_state NIL ].
     }
 
+    // ---- contact-name uniqueness: THE registration gate ---------------------
+    // Allocate a display name for `self_cid`: `want` when no OTHER contact holds
+    // it, else the lowest free ordinal suffix ("want 1", "want 2", … — an
+    // existing literal "want 1" contact is skipped, never clobbered). $taken_by
+    // is the holder that forced the suffix (NIL when `want` was free). The
+    // ordinal scan is driven by the contacts map itself: fewer contacts than
+    // candidates means a free ordinal always exists within the scan (pigeonhole),
+    // with a defensive fallback past the last scanned candidate.
+    fn allocate_contact_name (want: str, self_cid: global_id) -> ($name -> str, $taken_by -> global_id+)
+    {
+        taken_by is global_id+ = NIL.
+        sc contacts -- (ocid -> c) ?? taken_by == NIL && ocid != self_cid && (c $name) == want
+        {
+            taken_by -> ocid.
+        }
+        if taken_by == NIL { return ($name -> want, $taken_by -> NIL). }
+        assigned is str = "".
+        n is int = 1.
+        sc contacts -- ( -> ) ?? assigned == ""
+        {
+            cand = want + " " + (_str n).
+            cand_taken is bool = FALSE.
+            sc contacts -- (ocid2 -> c2) ?? cand_taken == FALSE && ocid2 != self_cid && (c2 $name) == cand
+            {
+                cand_taken -> TRUE.
+            }
+            if cand_taken == FALSE { assigned -> cand. }
+            n -> n + 1.
+        }
+        if assigned == "" { assigned -> want + " " + (_str n). }
+        return ($name -> assigned, $taken_by -> taken_by).
+    }
+
+    // The collision warning every registration that took a suffix must emit:
+    // both container ids and the repair tool, so an operator can move the name
+    // where it belongs (D3: the clean name stays with the first arrival).
+    fn collision_actions (cid: global_id, want: str, assigned: str, taken_by: global_id) -> transaction::action::type[]
+    {
+        return [
+            _notify_agent (
+                $event -> $contact_name_collision,
+                $desired -> want,
+                $assigned -> assigned,
+                $existing_container_id -> taken_by,
+                $container_id -> cid,
+                $message -> "Contact name \"" + want + "\" is already held by contact " + (_str taken_by) + "; the new contact " + (_str cid) + " was registered as \"" + assigned + "\". Rename either with rename_contact (it accepts container ids)."
+            )
+        ].
+    }
+
+    // THE one gate every contact registration goes through (D1/D2/D3): every
+    // write site routes here, so a name check cannot be bypassed — a new write
+    // site must call this to write at all. Idempotent on a known container id
+    // (re-registration NEVER renames and never duplicates; the existing name is
+    // returned). A fresh container id gets `desired` (falling back to the cid
+    // string, unique by construction) or, on a collision, the lowest free
+    // ordinal suffix — NEVER a refusal: by the time an invite collision is
+    // visible the remote invite is already consumed, so refusing loses a
+    // connection (and possibly a first message), not a name. Returns the
+    // registered $name and the warning $actions to append (empty when clean).
+    // The CALLER still emits _save_state.
+    fn register_contact (cid: global_id, desired: str) -> ($name -> str, $actions -> transaction::action::type[])
+    {
+        none is transaction::action::type[] = [].
+        existing = contacts cid.
+        if existing != NIL { return ($name -> (existing? $name), $actions -> none). }
+        want is str = (desired == "" ?? (_str cid) ; desired).
+        alloc = allocate_contact_name want cid.
+        contacts cid -> ($name -> (alloc $name), $container_id -> cid).
+        if (alloc $taken_by) == NIL { return ($name -> (alloc $name), $actions -> none). }
+        return ($name -> (alloc $name), $actions -> collision_actions cid want (alloc $name) ((alloc $taken_by)?)).
+    }
+
     // Host-mediated delivery of the cluster CP as a CONTACT to a CHILD packet
     // (origin::user, host-fired), so per-child monitoring can RESOLVE and FORWARD to
     // the CP. Why host-mediated, not a network introduce: the child's introduction
@@ -700,10 +773,14 @@ library a2a_messaging loads libraries
         address_document::process_address_document cp_ad TRUE.
         cp_cid = cp_ad $identity $container_id.
         peer_ads cp_cid -> cp_ad.
-        if (contacts cp_cid) == NIL { contacts cp_cid -> ($name -> "control-plane", $container_id -> cp_cid). }
+        reg = register_contact cp_cid "control-plane".
         // Trivial ack so the daemon's mutatingTx await resolves immediately (save-only
         // → no $data → await blocks to timeout under the root lock).
-        return transaction::success [ _return_data ($ok -> TRUE), _save_state NIL ].
+        actions is transaction::action::type[] = [].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _return_data ($ok -> TRUE).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     // Authorize an introduction relay (core.connect) — ADDITIVE successor to
@@ -2200,14 +2277,15 @@ library a2a_messaging loads libraries
 
         // New cluster child: register under the verified role label (root_name/role_id
         // are advisory display strings; the AD self-signature is the only trusted id).
-        contacts child_cid -> ($name -> (child_root $root_name) + "/" + (child_root $role_id), $container_id -> child_cid).
+        reg = register_contact child_cid ((child_root $root_name) + "/" + (child_root $role_id)).
         peer_ads child_cid -> child_ad.
         contact_roots child_cid -> child_root.
 
-        return transaction::success [
-            _notify_agent ($event -> $enrolled, $container_id -> child_cid, $root_cid -> enroll_root_cid),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _notify_agent ($event -> $enrolled, $container_id -> child_cid, $root_cid -> enroll_root_cid).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     trn enroll_delegated_node args: any
@@ -2387,26 +2465,35 @@ library a2a_messaging loads libraries
         if (contacts peer_cid) != NIL
         {
             existing = (contacts peer_cid)?.
+            actions is transaction::action::type[] = [].
             if peer_name != "" && (existing $name) == (_str peer_cid)
             {
-                contacts peer_cid -> ($name -> peer_name, $container_id -> peer_cid).
+                // Upgrading a cid-labelled contact to its now-available display
+                // name is a RENAME of an existing entry, so it allocates through
+                // the same collision rule as a fresh registration (the name is
+                // remote-supplied — D1: suffix, never refuse).
+                alloc = allocate_contact_name peer_name peer_cid.
+                contacts peer_cid -> ($name -> (alloc $name), $container_id -> peer_cid).
+                if (alloc $taken_by) != NIL
+                {
+                    sc collision_actions peer_cid peer_name (alloc $name) ((alloc $taken_by)?) -- ( -> a) { actions (_count actions|) -> a. }
+                }
             }
             peer_ads peer_cid -> peer_ad.
-            return transaction::success [
-                _notify_agent ($event -> $reintroduced, $container_id -> peer_cid, $by_cp -> sender_id),
-                _save_state NIL
-            ].
+            actions (_count actions|) -> _notify_agent ($event -> $reintroduced, $container_id -> peer_cid, $by_cp -> sender_id).
+            actions (_count actions|) -> _save_state NIL.
+            return transaction::success actions.
         }
 
         // New contact: register under the CP-supplied display name (cid as last resort).
-        contact_label is str = (peer_name == "" ?? (_str peer_cid) ; peer_name).
-        contacts peer_cid -> ($name -> contact_label, $container_id -> peer_cid).
+        reg = register_contact peer_cid peer_name.
         peer_ads peer_cid -> peer_ad.
 
-        return transaction::success [
-            _notify_agent ($event -> $introduced, $container_id -> peer_cid, $name -> contact_label, $by_cp -> sender_id),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _notify_agent ($event -> $introduced, $container_id -> peer_cid, $name -> (reg $name), $by_cp -> sender_id).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     trn ingest_connect_descriptor args: any
@@ -2509,7 +2596,7 @@ library a2a_messaging loads libraries
             }
         }
 
-        contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        reg = register_contact sender_id contact_name.
         // Passive version learning: this legacy surface never carries $pv or
         // $caps — record the shape-inferred dialect (2 or 3).
         learn_contact_version sender_id (a2a_versions::acc_version_of args) [].
@@ -2521,10 +2608,11 @@ library a2a_messaging loads libraries
         }
         delete pending_invites invite_id.
 
-        return transaction::success [
-            _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _notify_agent ($event -> $contact_accepted, $name -> (reg $name), $container_id -> sender_id).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     trn accept_contact args: any
@@ -2602,7 +2690,8 @@ library a2a_messaging loads libraries
             joiner_name is str = a2a_versions::sir_joiner_name narrowed.
             contact_name -> (joiner_name == "" ?? (_str sender_id) ; joiner_name).
         }
-        contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        reg = register_contact sender_id contact_name.
+        contact_name -> (reg $name).
         // Passive version learning (SPEC §3): dialect + piggybacked caps.
         learn_contact_version sender_id (a2a_versions::sir_version_of payload) (a2a_versions::sir_caps narrowed).
         peer_ads sender_id -> (vb $ad).
@@ -2640,7 +2729,7 @@ library a2a_messaging loads libraries
             $caps -> (a2a_capabilities::self_cap_ids NIL)
         ).
         leg3_data = _crypto_encrypt_message (kpi $secret_key) epk_r leg3_payload.
-        return transaction::success [
+        actions is transaction::action::type[] = [
             transaction::action::send sender_id (
                 $name -> complete_invite_tx,
                 $targ -> (
@@ -2650,10 +2739,12 @@ library a2a_messaging loads libraries
                     $data -> leg3_data,
                     $pv -> a2a_versions::wire_version
                 )
-            ),
-            _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id),
-            _save_state NIL
+            )
         ].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     // core 3.0 LEG 3 (responder): the inviter completed the exchange. It is a BARE
@@ -2711,7 +2802,8 @@ library a2a_messaging loads libraries
         contact_name is str = (pend?) $custom_name.
         if contact_name == "" { contact_name -> (pend?) $inviter_name. }
         if contact_name == "" { contact_name -> (_str sender_id). }
-        contacts sender_id -> ($name -> contact_name, $container_id -> sender_id).
+        reg = register_contact sender_id contact_name.
+        contact_name -> (reg $name).
         learn_contact_version sender_id (a2a_versions::cin_version_of payload) (a2a_versions::cin_caps narrowed).
         peer_ads sender_id -> (vb $ad).
         // Born-on-DR iff the peer presented a v2 (bundle-carrying) AD at first contact.
@@ -2721,10 +2813,11 @@ library a2a_messaging loads libraries
         delete pending_redemptions invite_id.
         delete pending_redemption_keys invite_id.
 
-        return transaction::success [
-            _notify_agent ($event -> $contact_added, $name -> contact_name, $container_id -> sender_id),
-            _save_state NIL
-        ].
+        actions is transaction::action::type[] = [].
+        sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
+        actions (_count actions|) -> _notify_agent ($event -> $contact_added, $name -> contact_name, $container_id -> sender_id).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
     }
 
     // Inbound trn stubs (declared AFTER their handlers — mufl requires
