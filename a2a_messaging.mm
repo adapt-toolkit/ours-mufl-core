@@ -182,6 +182,12 @@ library a2a_messaging loads libraries
     my_persona is str = "".
     // Known contacts, keyed by their container id.
     contacts is (global_id ->> a2a_protocol::contact_t) = (,).
+    // Contacts the import dedup sweep renamed (cid -> the shared name it held
+    // before the sweep). Purely advisory bookkeeping so the client can MARK the
+    // entry until an operator settles the name: cleared by rename_contact (the
+    // operator decided) and remove_contact. Additive in the export blob;
+    // pre-sweep exports import unchanged.
+    import_renames is (global_id ->> str) = (,).
     // core 0.5.0: passively learned peer wire dialects + capability ids
     // (SPEC §3/§4). Written on every inbound that carries version evidence
     // (last-seen wins); absent = nothing learned, 0 = pre-0.5 peer. $pv is
@@ -1962,6 +1968,7 @@ library a2a_messaging loads libraries
         removed_name = removed? $name.
 
         delete contacts target_id.
+        if (import_renames target_id) != NIL { delete import_renames target_id. }
         if peer_ads target_id != NIL { delete peer_ads target_id. }
         if contact_roots target_id != NIL { delete contact_roots target_id. }
         if contact_pv target_id != NIL { delete contact_pv target_id. }
@@ -2017,6 +2024,8 @@ library a2a_messaging loads libraries
 
         old_name = ((contacts target_id)?) $name.
         contacts target_id -> ($name -> new_name, $container_id -> target_id).
+        // The operator has settled this contact's name — clear the import-sweep mark.
+        if (import_renames target_id) != NIL { delete import_renames target_id. }
         return transaction::success [
             _return_data ($renamed -> old_name, $name -> new_name, $container_id -> target_id),
             _save_state NIL
@@ -2026,6 +2035,13 @@ library a2a_messaging loads libraries
     trn readonly list_contacts _
     {
         return contacts.
+    }
+
+    // Contacts the boot-time import sweep renamed (cid -> pre-sweep shared
+    // name), so a client can mark them until the operator settles the names.
+    trn readonly list_import_renames _
+    {
+        return import_renames.
     }
 
     trn readonly list_contact_roots _
@@ -4697,6 +4713,7 @@ library a2a_messaging loads libraries
         return (
             $my_name         -> my_name,
             $contacts        -> contacts,
+            $import_renames  -> import_renames,
             $pending_invites -> pending_invites,
             $peer_ads        -> peer_ads,
             $my_bio          -> my_bio,
@@ -4775,6 +4792,64 @@ library a2a_messaging loads libraries
         // export upgrades, never resets).
         my_name         -> (data $my_name) safe str.
         contacts        -> (data $contacts) safe (global_id ->> a2a_protocol::contact_t).
+        // Persisted marks from earlier sweeps (additive field; absent in old blobs).
+        import_renames  -> (,).
+        if (data $import_renames) != NIL
+        {
+            import_renames -> (data $import_renames) safe (global_id ->> str).
+        }
+        // ---- contact-name dedup sweep (uniqueness Phase 4) -------------------
+        // Runs UNCONDITIONALLY on every import — import_core_state runs on every
+        // daemon boot via restoreIdentity, so books written before the ordinal
+        // rule heal on the next restart with no migration tool. Content-only:
+        // core_format_version stays 1 (its comment permits a bump only for a
+        // blob-SHAPE change). Group contacts by name; the LOWEST container id by
+        // byte order keeps the bare name (contact_t carries no arrival order, so
+        // no better tie-break exists — WHICH duplicate keeps the clean name is
+        // arbitrary with respect to which one is alive; see the operator
+        // procedure in SPEC.md), the others take the lowest free ordinal under
+        // the same rule as register_contact. Nothing is deleted: both contacts,
+        // their peer_ads and channels survive; every rename is recorded in
+        // import_renames so the client can mark it.
+        deduped is (global_id ->> a2a_protocol::contact_t) = (,).
+        remaining is (global_id ->> a2a_protocol::contact_t) = (,).
+        sc contacts -- (cid -> c)
+        {
+            lower_exists is bool = FALSE.
+            sc contacts -- (ocid -> oc) ?? lower_exists == FALSE && ocid != cid && (oc $name) == (c $name) && (_str ocid) < (_str cid)
+            {
+                lower_exists -> TRUE.
+            }
+            if lower_exists == FALSE { deduped cid -> c. }
+            else { remaining cid -> c. }
+        }
+        // Non-keepers in ascending cid order (deterministic ⇒ repeated imports
+        // are stable); each takes the lowest ordinal free among the names
+        // already placed — so a literal "X 1" keeper is skipped, not clobbered.
+        sc contacts -- ( -> )
+        {
+            if (_count remaining|) > 0
+            {
+                low is global_id+ = NIL.
+                sc remaining -- (rcid -> ) { if low == NIL || (_str rcid) < (_str low?) { low -> rcid. } }
+                base = ((remaining low?)?) $name.
+                assigned is str = "".
+                n is int = 1.
+                sc contacts -- ( -> ) ?? assigned == ""
+                {
+                    cand = base + " " + (_str n).
+                    cand_taken is bool = FALSE.
+                    sc deduped -- ( -> dc) ?? cand_taken == FALSE && (dc $name) == cand { cand_taken -> TRUE. }
+                    if cand_taken == FALSE { assigned -> cand. }
+                    n -> n + 1.
+                }
+                if assigned == "" { assigned -> base + " " + (_str n). }
+                deduped low? -> ($name -> assigned, $container_id -> low?).
+                import_renames low? -> base.
+                delete remaining low?.
+            }
+        }
+        contacts -> deduped.
         // core 3.0 migration: pending_invites changed shape (pre-3.0 (global_id ->>
         // str) → (global_id ->> pending_invite_t)). It is reset to EMPTY on import,
         // unconditionally and for BOTH shapes: a pre-3.0 str-map is incompatible (so
