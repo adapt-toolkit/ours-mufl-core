@@ -1889,6 +1889,35 @@ library a2a_messaging loads libraries
         return transaction::success actions.
     }
 
+    // Rename a contact in place. The reference resolves like every contact ref
+    // (display name or container id), so a collision-ambiguous name can always
+    // be bypassed by addressing the container id directly. Rejects a name that
+    // another contact already holds — this transaction is the ONE mechanism
+    // that puts a name on a specific, intended contact, so it must never create
+    // the ambiguity it exists to repair. Only $name is rewritten: peer_ads,
+    // contact_roots and the encrypted channel are container-id-keyed, so an
+    // established session survives the rename untouched.
+    trn rename_contact _:($contact -> contact_ref: str, $name -> new_name: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        abort "Contact name cannot be empty." when new_name == "".
+
+        target_id = resolve_contact contact_ref.
+        taken_by is global_id+ = NIL.
+        sc contacts -- (cid -> c) ?? taken_by == NIL && cid != target_id && (c $name) == new_name
+        {
+            taken_by -> cid.
+        }
+        abort "Contact name \"" + new_name + "\" is already held by contact " + (_str taken_by?) + " — pick a different name, or rename that contact first (rename_contact accepts a container id)." when taken_by != NIL.
+
+        old_name = ((contacts target_id)?) $name.
+        contacts target_id -> ($name -> new_name, $container_id -> target_id).
+        return transaction::success [
+            _return_data ($renamed -> old_name, $name -> new_name, $container_id -> target_id),
+            _save_state NIL
+        ].
+    }
+
     trn readonly list_contacts _
     {
         return contacts.
