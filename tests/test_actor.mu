@@ -384,6 +384,18 @@ application actor loads libraries
         return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
     }
 
+    // Force a contact's stored display name, bypassing register_contact —
+    // simulates a pre-uniqueness book (or a hypothetical write site that skips
+    // the helper) so the resolver's ambiguity abort can be exercised against
+    // REAL contacts with live channels, which no public surface can produce
+    // once ordinal suffixing is in place.
+    trn qa_force_contact_name _:($cid -> cid: global_id, $name -> name: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::contacts cid -> ($name -> name, $container_id -> cid).
+        return transaction::success [ _return_data ($forced -> name), _save_state NIL ].
+    }
+
     // Inject a learned dialect for a contact — arranges the "peer was v2 at
     // invite time" precondition of the upgrade scenario (V7) on a pair that
     // has a live encrypted channel (V1 proves the real v2 leg-1 learns 2).
