@@ -215,6 +215,34 @@ self-heal, since caps refresh only on invite/restore legs). A pre-0.13 client is
 never sent a transaction it cannot parse. The **receive** side is ungated and unconditional,
 so a peer that declines to advertise still gets removed when *it* removes *me*.
 
+**§5.6 control-leg carve-out, ROUTED — the notice is NOT exempt from the app-data
+barrier.** `contact_removal_notice_actions` consults `e2e_route` exactly as `send_message`
+does: an **epoch-pinned (migrated)** peer is told over the **e2e session** (an inner
+`$contact_removal` marker carried by `receive_e2e_message`, reusing the proven `$rekey_ping`
+contentless-marker pattern — same envelope, same authenticated session, no new wire
+surface); an unmigrated pair uses the plain `crm` transaction; and `downgrade_refused` /
+`migrating` send **nothing at all** (`$notified` FALSE, local removal still proceeds — an
+un-notified removal is honest, a downgraded one is not).
+
+**Receive-side §5.7 refusal.** A **legacy** `crm` from an **epoch-pinned** contact is a
+downgrade attempt and is refused: nothing is purged, no pin is touched, and a
+`$downgrade_refused` notify (`$context -> $contact_removal`) is surfaced. It is a
+`transaction::success`, not an abort — a hostile sender must not learn more from a failure
+than from a success. Both halves must agree: routing emission to e2e without this barrier
+(or vice-versa) would leave exactly the hole it closes.
+
+**Bound control plane — atomic inbound transition.** The outbound trn still **refuses** to
+remove the bound CP (a dangling `monitoring_proxy` bricks messaging: the next send's forced
+copy fires `send_encrypted_tx` at an unregistered peer and aborts the user's send, and
+`disable_monitoring` is CP-only so there is no recovery). Inbound cannot refuse the same way
+— the CP has already dropped us, so staying bound would keep monitoring copies flowing to a
+peer that is no longer a contact. So an authenticated `crm` **from the bound CP** clears the
+binding via `do_disable_monitoring` **first, in the same transaction**, before the purge.
+This grants the CP no new power (the notice is authenticated as coming from that CP, and
+`disable_monitoring` is already CP-only) and leaves a recoverable state rather than an
+unrecoverable one. Both inbound routes funnel through one `apply_peer_removal_actions`, so
+this guard and the pin policy cannot drift between the legacy and e2e surfaces.
+
 **Delivery is best-effort and is NOT retried.** The notice is fire-and-forget over the relay,
 and unlike ordinary traffic it cannot be redriven — the redrive buffer is keyed by contact
 and the contact is gone. `remove_contact` returns `$notified` (a notice was *queued*, not
@@ -225,22 +253,37 @@ removed you". Local removal always succeeds regardless.
 absent". Duplicates, replays, and notices from a non-contact all converge on the same state
 and return success, so no replay ledger exists. A crossed removal is two no-ops.
 
-**Hard purge, explicit drop-list.** `purge_contact_state(cid)` names every store literally —
-it is deliberately NOT derived from a `contacts` keep-list, which would also delete peers
-legitimately mid-handshake (pending redemptions, in-flight restores, FSM entries for a
-not-yet-registered contact). It additionally clears the e2e pins `contact_e2e_seen` /
-`contact_e2e_epoch` / `contact_born_dr` / `contact_migration` / `mig_deferred`, which their
-declarations describe as "never cleared": removal *ends* the connection those pins protect,
-and leaving them makes a later re-add fail closed forever (epoch-pinned, no live session ⇒
-`downgrade_refused`). A re-added peer re-earns them from its fresh AD — a deliberate re-TOFU.
-The primitive is factored out so a future room-close can call it per participant; that
-caller does not exist yet.
+**Scope of the purge — contact-layer state and queued plaintext ONLY.** This is **not** a
+hard purge and does **not** leave "no residue"; do not describe it as either.
+`purge_contact_state(cid)` names every store literally — deliberately NOT derived from a
+`contacts` keep-list, which would also delete peers legitimately mid-handshake (pending
+redemptions, in-flight restores, FSM entries for a not-yet-registered contact). It clears
+contact/AD/caps/pv state, the restore stores, the plaintext queues (`deferred_msgs`,
+`unacked_e2e`, `mig_deferred`), `delivered_wire`, `contact_origin`, and the transient
+`contact_migration` FSM entry.
+
+**The anti-downgrade pins are RETAINED** — `contact_e2e_seen`, `contact_e2e_epoch`,
+`contact_born_dr`. They are irreversible, monotone evidence that this cid once proved it
+speaks e2e, and removal is **peer-triggerable**: clearing them on the inbound path would let
+a peer that can reach the legacy channel erase the very evidence that forbids the legacy
+channel. An earlier revision cleared them, justified by "retaining them bricks a re-add
+(epoch-pinned with no live session ⇒ `downgrade_refused` forever)". **That justification is
+false and is retracted:** `e2e_route`'s epoch branch is
+`if peer_has_e2e_bundle cid { return "e2e". } return "downgrade_refused".`, and
+`peer_has_e2e_bundle` reads `peer_ads[cid]`, which a re-add restores from the fresh
+handshake AD — so a re-added v2 peer routes `"e2e"` with the pin intact. `downgrade_refused`
+fires only for a peer presenting no e2e bundle, which is exactly when refusing is correct.
+There is no brick, so there was never anything to trade the pins for.
+
+**Consequence for room-close:** the primitive is factored out so a future room-close can call
+it per participant (that caller does not exist yet), but what it guarantees is removal of
+contact-layer state and queued plaintext — **not** the absence of cryptographic residue.
 
 **Known residual:** the adapt `e2e` library exposes no per-cid session drop (only
 `discard_rotation`, which clears the STAGED slot), so the live Olm ratchet for a removed peer
 survives in packet state and in the exported `$e2e_sessions`. Consistent with the
 long-standing "contacts-layer forget, NOT a key wipe" contract; a true key wipe needs an
-upstream toolkit addition.
+upstream toolkit addition. Surfaced as `$key_material_retained`.
 
 ## Invite modes (core 0.13) — class-A, default-preserving
 

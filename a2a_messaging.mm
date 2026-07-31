@@ -2064,33 +2064,59 @@ library a2a_messaging loads libraries
         return pv != NIL && pv? >= 9.
     }
 
-    // THE removal primitive. Purges every per-contact store for `target_id` and
-    // returns the actions to append; the CALLER decides whether to also emit the
-    // peer notice and what to return/notify. Split out of the remove_contact trn
-    // deliberately so a future room-close can invoke it once per participant and
-    // leave no residue — that caller does NOT exist yet and is NOT implemented here.
+    // Clear the monitoring binding if `sid` IS the bound proxy. Shared by the
+    // core.monitoring `disable` verb handler AND by apply_peer_removal_actions (a
+    // bound control plane that removes ME must not stay bound). Returns TRUE iff
+    // disabled. Defined here rather than beside the other proxy-ceremony fns purely
+    // because mufl requires define-before-use.
+    fn do_disable_monitoring (sid: global_id) -> bool
+    {
+        if monitoring_proxy == NIL { return FALSE. }
+        if sid != (monitoring_proxy? $proxy_cid) { return FALSE. }
+        monitoring_proxy -> NIL.
+        proxy_pending -> NIL.
+        return TRUE.
+    }
+
+    // THE removal primitive: drop the CONTACT-LAYER state and the queued PLAINTEXT
+    // for `target_id`. The CALLER decides whether to also emit the peer notice and
+    // what to return/notify. Split out of the remove_contact trn deliberately so a
+    // future room-close can invoke it once per participant — that caller does NOT
+    // exist yet and is NOT implemented here.
     //
-    // HARD PURGE, EXPLICIT DROP-LIST (Architect-verified): every store below is
-    // named literally. It is NOT derived by iterating `contacts` and keeping what
-    // matches, because such a keep-list would also delete the entries of peers who
-    // are legitimately mid-handshake (pending redemptions, in-flight restores,
-    // migration FSM entries for a contact not yet registered) — those are keyed by
-    // cid but are NOT contacts yet.
+    // THIS IS NOT A HARD PURGE AND DOES NOT LEAVE "NO RESIDUE". Two classes of
+    // cryptographic material deliberately or unavoidably survive; see below. Callers
+    // and docs must not claim otherwise.
     //
-    // The e2e ANTI-DOWNGRADE PINS (contact_e2e_seen / contact_e2e_epoch /
-    // contact_born_dr / contact_migration) are cleared here even though they are
-    // documented at their declarations as "NEVER cleared". That is intentional and
-    // is the one deliberate semantic change in this primitive: those pins exist to
-    // stop a downgrade WITHIN the life of a connection, and a removal ENDS the
-    // connection. Leaving them behind is exactly the "room contact residue" a later
-    // room-close must not leave, and it also makes a re-add of the same cid fail
-    // closed forever (epoch-pinned with no live session ⇒ downgrade_refused on
-    // every send). CONSEQUENCE, stated honestly: a peer removed and later re-added
-    // is re-established from its FRESH address document, so the pins are re-earned
-    // from that new evidence rather than inherited — a deliberate re-TOFU, not a
-    // silent downgrade of a live session.
+    // EXPLICIT DROP-LIST: every store below is named literally. It is NOT derived by
+    // iterating `contacts` and keeping what matches, because such a keep-list would
+    // also delete the entries of peers who are legitimately mid-handshake (pending
+    // redemptions, in-flight restores, migration FSM entries for a contact not yet
+    // registered) — those are keyed by cid but are NOT contacts yet.
     //
-    // NOT purged (documented residual, NOT a regression): the cid-keyed Olm session
+    // RETAINED ON PURPOSE — the e2e ANTI-DOWNGRADE PINS (contact_e2e_seen,
+    // contact_e2e_epoch, contact_born_dr). These are irreversible, monotone evidence
+    // that this cid once proved it speaks e2e, and they are what stops a later
+    // silent downgrade. Removal must NOT clear them, because removal is triggerable
+    // by the PEER (receive_contact_removal): clearing them there would let a peer
+    // that can reach the legacy channel erase the very evidence that forbids the
+    // legacy channel. An EARLIER revision of this function cleared them, justified by
+    // "retaining them bricks a re-add (epoch-pinned with no live session ⇒
+    // downgrade_refused forever)". THAT JUSTIFICATION IS FALSE and the claim is
+    // retracted here: e2e_route's epoch branch is
+    //     if peer_has_e2e_bundle cid { return "e2e". } return "downgrade_refused".
+    // and peer_has_e2e_bundle reads peer_ads[cid], which a re-add RESTORES from the
+    // fresh handshake AD. So a re-added v2 peer routes "e2e" with the pin intact;
+    // "downgrade_refused" fires only for a peer presenting no e2e bundle, which is
+    // exactly when refusing is correct. There is no brick, so there was never
+    // anything to trade the pins for.
+    //
+    // CLEARED — mig_deferred (queued PLAINTEXT app data, the same class as
+    // deferred_msgs / unacked_e2e, which the pre-existing code already cleared) and
+    // contact_migration (transient FSM; the migration sweep iterates `contacts`, so
+    // an entry for a non-contact is inert either way — this is cleanup, not security).
+    //
+    // NOT purged (unavoidable residual, NOT a regression): the cid-keyed Olm session
     // pickle inside the adapt `e2e` library. That library exposes no per-cid session
     // drop (only discard_rotation, which clears the STAGED slot), so the live
     // ratchet for a removed peer survives in packet state and in the exported
@@ -2124,11 +2150,10 @@ library a2a_messaging loads libraries
         if (pending_restore_keys target_id) != NIL { delete pending_restore_keys target_id. }
         if (pending_restore_replies target_id) != NIL { delete pending_restore_replies target_id. }
         if (pending_restore_reply_keys target_id) != NIL { delete pending_restore_reply_keys target_id. }
-        // core 0.13 hard-purge drop-list: e2e pins + FSM + migration queue.
-        if (contact_e2e_seen target_id) != NIL { delete contact_e2e_seen target_id. }
-        if (contact_born_dr target_id) != NIL { delete contact_born_dr target_id. }
+        // core 0.13: transient migration FSM + its queued PLAINTEXT. The
+        // anti-downgrade pins (contact_e2e_seen / contact_e2e_epoch /
+        // contact_born_dr) are deliberately NOT touched — see the header.
         if (contact_migration target_id) != NIL { delete contact_migration target_id. }
-        if (contact_e2e_epoch target_id) != NIL { delete contact_e2e_epoch target_id. }
         if (mig_deferred target_id) != NIL { delete mig_deferred target_id. }
         // Provenance dies with the contact: keeping it would let a re-added peer
         // inherit a trust marking earned by a DIFFERENT admission decision.
@@ -2140,16 +2165,84 @@ library a2a_messaging loads libraries
     }
 
     // The peer-facing half: "I removed you, drop me too." Returns [] when the gate
-    // says the peer cannot parse it, so callers append blindly. Fire-and-forget over
-    // the established encrypted channel — this MUST be built BEFORE purge_contact_state
-    // runs, because send_encrypted_tx resolves the peer's address document.
+    // says the peer cannot parse it, so callers append blindly. Fire-and-forget —
+    // this MUST be built BEFORE purge_contact_state runs, because both routes below
+    // resolve the peer's address document.
+    //
+    // §5.6 CONTROL-LEG CARVE-OUT, ROUTED. The removal notice is control traffic, but
+    // it is NOT exempt from the app-data barrier: an epoch-pinned (migrated) peer
+    // MUST be told over the e2e session, never over the legacy box. Sending it legacy
+    // would hand an attacker who can reach the legacy channel a lever on the
+    // receiver's contact state — which is exactly the hole the receive-side barrier
+    // in handle_receive_contact_removal closes, and the two halves must agree.
+    // So the route is consulted, exactly as send_message does:
+    //   "e2e"                -> e2e-boxed inner carrying the $contact_removal marker,
+    //                           over receive_e2e_message_tx (the proven $rekey_ping
+    //                           contentless-marker pattern — same envelope, same
+    //                           authenticated session, no new wire surface).
+    //   "legacy"             -> the plain crm transaction (unmigrated pair).
+    //   "downgrade_refused" / "migrating" -> NOTHING. We cannot notify safely: legacy
+    //                           is prohibited for this peer and no committed e2e
+    //                           session is available. The caller reports $notified
+    //                           FALSE and the local removal still proceeds — an
+    //                           un-notified removal is honest, a downgraded one is not.
     fn contact_removal_notice_actions (target_id: global_id, reason: str) -> transaction::action::type[]
     {
         if (contact_removal_gate target_id) != TRUE { return []. }
-        if (peer_ads target_id) == NIL { return []. }
+        pad = peer_ads target_id.
+        if pad == NIL { return []. }
+        route = e2e_route target_id.
+        if route == "e2e"
+        {
+            epb = (((pad?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+            if epb == NIL { return []. }
+            rinner = _write ( $contact_removal -> TRUE, $reason -> reason, $pv -> a2a_versions::wire_version ).
+            eenv = e2e::encrypt_to target_id rinner epb.
+            return [ encrypted_channel::send_encrypted_tx target_id (
+                         $name -> receive_e2e_message_tx,
+                         $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
+        }
+        if route != "legacy" { return []. }
         return [ encrypted_channel::send_encrypted_tx target_id (
                      $name -> receive_contact_removal_tx,
                      $targ -> ( $reason -> reason, $pv -> a2a_versions::wire_version ) ) ].
+    }
+
+    // SHARED apply half, used by BOTH inbound removal routes (the legacy crm surface
+    // and the e2e $contact_removal marker). Single implementation on purpose: the
+    // bound-control-plane transition and the pin policy must not be able to drift
+    // between the two surfaces — a guard that exists on only one of them is the same
+    // class of hole as having no guard at all.
+    //
+    // BOUND CONTROL PLANE, ATOMIC TRANSITION. The outbound trn REFUSES to remove the
+    // bound CP, because a dangling monitoring_proxy bricks messaging (the next send's
+    // forced copy fires send_encrypted_tx at an unregistered peer and aborts the
+    // user's send, and disable_monitoring is CP-only so there is no recovery).
+    // Inbound we cannot refuse the same way — the CP has ALREADY dropped us, so
+    // keeping it bound would leave monitoring copies flowing to a peer that is no
+    // longer a contact. Instead the binding is cleared FIRST, in the same
+    // transaction, so no copy can be emitted for the removed CP afterwards. This
+    // grants the CP no new power: the notice is authenticated as coming FROM that CP,
+    // and disable_monitoring is already a CP-only operation, so this is the CP
+    // exercising authority it already had — and it leaves a recoverable state (no
+    // proxy bound) rather than an unrecoverable one.
+    // Returns the actions; the CALLER appends its own notify/save (the notice $reason is
+    // the caller's to surface — it is diagnostics, never an input to this transition).
+    fn apply_peer_removal_actions (sender_id: global_id) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        was_cp = monitoring_proxy != NIL && sender_id == (monitoring_proxy? $proxy_cid).
+        if was_cp
+        {
+            do_disable_monitoring sender_id.
+            acts (_count acts|) -> _notify_agent ($event -> $monitoring_disabled, $cid -> sender_id, $cause -> $control_plane_removed_contact).
+        }
+        purge_contact_state sender_id.
+        sc on_contact_removed ($container_id -> sender_id) -- ( -> a)
+        {
+            acts (_count acts|) -> a.
+        }
+        return acts.
     }
 
     trn remove_contact _:($contact -> contact_ref: str)
@@ -2264,6 +2357,25 @@ library a2a_messaging loads libraries
             return transaction::success [].
         }
         reason is str = a2a_versions::opt_str (args $reason) "".
+
+        // §5.7 RECEIVE-SIDE DOWNGRADE REFUSAL — the same barrier handle_receive_message
+        // applies to legacy app data, and it matters MORE here. This surface deletes
+        // contact state; without the barrier, anyone able to reach the LEGACY channel of
+        // an already-migrated pair could evict themselves back out of the peer's book and
+        // (in the earlier revision that also cleared the pins) erase the very evidence
+        // that forbids the legacy channel. A migrated peer's removal notice MUST arrive
+        // over the e2e session (contact_removal_notice_actions routes it there), so a
+        // legacy one from an EPOCH-PINNED contact is a downgrade attempt: refuse it,
+        // purge NOTHING, touch NO pins, and surface it. NOT an abort — a hostile sender
+        // must not learn more from a failure than from a success.
+        // NOTE the pins are also no longer cleared on the success path at all, so this
+        // barrier is defence in depth rather than the only thing standing between a
+        // legacy forgery and the anti-downgrade evidence.
+        if (contact_e2e_epoch sender_id) != NIL
+        {
+            return transaction::success [ _notify_agent ($event -> $downgrade_refused, $cid -> sender_id, $context -> $contact_removal) ].
+        }
+
         // NOTE there is deliberately no learn_contact_version here: the very next
         // thing this handler does on the success path is purge contact_pv/caps for
         // this sender, so learning the dialect would be written and immediately
@@ -2277,13 +2389,8 @@ library a2a_messaging loads libraries
             return transaction::success [].
         }
         removed_name = existing? $name.
-        purge_contact_state sender_id.
 
-        actions is transaction::action::type[] = [].
-        sc on_contact_removed ($container_id -> sender_id) -- ( -> a)
-        {
-            actions (_count actions|) -> a.
-        }
+        actions is transaction::action::type[] = apply_peer_removal_actions sender_id.
         actions (_count actions|) -> _notify_agent (
             $event -> $contact_removed_by_peer,
             $name -> removed_name,
@@ -2322,6 +2429,29 @@ library a2a_messaging loads libraries
     trn readonly list_contact_origins _
     {
         return contact_origin.
+    }
+
+    // core 0.13: per-contact E2E ANTI-DOWNGRADE PIN state (readonly diagnostics).
+    // PRESENCE BOOLEANS ONLY — the epoch/session-id BYTES are deliberately not
+    // returned; a caller needs to know THAT a peer is pinned, never the canonical
+    // bytes. Exists so an operator (and the removal regression suite) can prove the
+    // pins survived an event that must not clear them.
+    trn readonly list_e2e_pins _
+    {
+        out is (global_id ->> ($seen -> bool, $born_dr -> bool, $epoch -> bool, $migrating -> bool)) = (,).
+        sc contact_e2e_seen -- (cid -> )
+        {
+            out cid -> ($seen -> TRUE, $born_dr -> ((contact_born_dr cid) == TRUE), $epoch -> ((contact_e2e_epoch cid) != NIL), $migrating -> ((contact_migration cid) != NIL)).
+        }
+        sc contact_e2e_epoch -- (cid -> )
+        {
+            out cid -> ($seen -> ((contact_e2e_seen cid) == TRUE), $born_dr -> ((contact_born_dr cid) == TRUE), $epoch -> TRUE, $migrating -> ((contact_migration cid) != NIL)).
+        }
+        sc contact_born_dr -- (cid -> )
+        {
+            out cid -> ($seen -> ((contact_e2e_seen cid) == TRUE), $born_dr -> TRUE, $epoch -> ((contact_e2e_epoch cid) != NIL), $migrating -> ((contact_migration cid) != NIL)).
+        }
+        return out.
     }
 
     // ---- monitoring bind ceremony (writes hidden gate state) -----------------
@@ -2394,16 +2524,10 @@ library a2a_messaging loads libraries
         return ($verified -> TRUE, $reason -> "ok", $attempts_left -> 0).
     }
 
-    // Clear the monitoring binding if `sid` IS the bound proxy. Shared by the
-    // core.monitoring `disable` verb handler. Returns TRUE iff disabled.
-    fn do_disable_monitoring (sid: global_id) -> bool
-    {
-        if monitoring_proxy == NIL { return FALSE. }
-        if sid != (monitoring_proxy? $proxy_cid) { return FALSE. }
-        monitoring_proxy -> NIL.
-        proxy_pending -> NIL.
-        return TRUE.
-    }
+    // (do_disable_monitoring was MOVED UP, above the contact-removal section — mufl
+    // requires define-before-use and apply_peer_removal_actions calls it to clear a
+    // removing control plane's binding atomically. It is unchanged; see its new home
+    // just before purge_contact_state.)
 
     trn verify_proxy_code _:($code -> code: str, $sender -> sender_ref: str)
     {
@@ -3827,6 +3951,34 @@ library a2a_messaging loads libraries
             pacts (_count pacts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $healed, $session_id -> env_sid).
             pacts (_count pacts|) -> _save_state NIL.
             return transaction::success pacts.
+        }
+        // core 0.13 bilateral removal over the MIGRATED session — the correct route for
+        // an epoch-pinned pair (the legacy crm surface refuses them, §5.7). Arriving
+        // here means the notice was carried by the authenticated, decrypted e2e session,
+        // which is strictly stronger evidence than the legacy channel could give.
+        // Authorization is still the envelope and only the envelope: the removed party
+        // is `sender_id`, there is no target field, so this cannot evict a third party.
+        // Delivers NOTHING to the inbox and emits no receipt — it is control traffic.
+        if (iv $contact_removal) == TRUE
+        {
+            rm_reason is str = a2a_versions::opt_str (iv $reason) "".
+            rex = contacts sender_id.
+            if rex == NIL
+            {
+                // Idempotent: already gone (or never a contact). Success, no writes.
+                return transaction::success [].
+            }
+            rm_name = rex? $name.
+            racts2 is transaction::action::type[] = apply_peer_removal_actions sender_id.
+            racts2 (_count racts2|) -> _notify_agent (
+                $event -> $contact_removed_by_peer,
+                $name -> rm_name,
+                $container_id -> sender_id,
+                $reason -> rm_reason,
+                $route -> $e2e
+            ).
+            racts2 (_count racts2|) -> _save_state NIL.
+            return transaction::success racts2.
         }
         text = (iv $text) safe str.
         wire_id is str = "".

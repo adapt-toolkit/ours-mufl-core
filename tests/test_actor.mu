@@ -424,6 +424,64 @@ application actor loads libraries
         }).
     }
 
+    // ---- core 0.13 bilateral-removal QA (security regressions) ----
+    // ARRANGE an epoch pin for `cid`, standing in for a completed migration. Same
+    // pattern the V7 series already uses to arrange v2-era state (qa_set_contact_pv /
+    // qa_set_contact_caps): driving the full migration FSM between two born-DR nodes
+    // is not reachable in a fixture (mig_should_trigger refuses born-DR contacts by
+    // design), and what the barrier under test keys off is precisely the presence of
+    // contact_e2e_epoch. The BYTES are arbitrary — nothing in the barrier reads them.
+    trn qa_set_e2e_epoch _:($cid -> cid: global_id, $epoch -> ep: bin, $session_id -> sid: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::contact_e2e_epoch cid -> ($epoch -> ep, $session_id -> sid).
+        a2a_messaging::contact_e2e_seen cid -> TRUE.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    // THE DOWNGRADE ATTACK: push a contact-removal notice over the LEGACY encrypted
+    // channel. Against a peer that is epoch-pinned to me this must be refused —
+    // purging nothing and clearing no pin.
+    trn qa_send_legacy_crm _:($target -> tgt: global_id, $reason -> reason: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::a2a_messaging::receive_contact_removal",
+                    $targ -> ($reason -> reason, $pv -> 9)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
+    // FORGERY: the same notice as a BARE, UNENCRYPTED send. check_encrypted_or_abort
+    // must reject it before any state is touched.
+    trn qa_send_bare_crm _:($target -> tgt: global_id, $reason -> reason: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return transaction::success [
+            transaction::action::send tgt (
+                $name -> "::a2a_messaging::receive_contact_removal",
+                $targ -> ($reason -> reason, $pv -> 9)
+            ),
+            _return_data ($sent -> TRUE)
+        ].
+    }
+
+    // Mint an invite carrying an UNKNOWN/future mode int, to prove normalize_invite_mode
+    // degrades to one-time (restrictive) rather than treating it as reusable.
+    trn qa_mint_mode_invite _:($mode -> mode: int)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        minted = a2a_messaging::mint_eph_invite "" mode.
+        return transaction::success [
+            _return_data ($invite -> (minted $blob), $invite_id -> (minted $invite_id)),
+            _save_state NIL
+        ].
+    }
+
     // ---- core 0.7.0 receipts QA (RC-series) ----
     trn readonly qa_receipts_log _ { return ($log -> receipts_log). }
     trn readonly qa_receipt_expectation _:($cid -> cid: global_id)
