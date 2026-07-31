@@ -67,6 +67,10 @@ application actor loads libraries
         // Receipt consumer log (core 0.7.0) — the driver's RC-series probe.
         receipts_log is any[] = [].
 
+        // core 0.13 TEST-ONLY probe ephemerals (cross-redeemer leg-1 isolation).
+        // Hidden and fixture-local: never exported, never reachable from production.
+        qa_leg1_keys is (str ->> secretkey_encrypt) = (,).
+
         // Storage hooks: deposit inbound messages; send/remove are no-ops.
         a2a_messaging::init (
             $_read_or_abort -> _read_or_abort,
@@ -480,6 +484,104 @@ application actor loads libraries
             _return_data ($invite -> (minted $blob), $invite_id -> (minted $invite_id)),
             _save_state NIL
         ].
+    }
+
+    // ---- core 0.13 cross-redeemer leg-1 confidentiality QA ----
+    // TEST-ONLY, AND DELIBERATELY ONLY HERE. These probes hand back raw leg-1
+    // ciphertext and attempt decryption with a CHOSEN ephemeral. They exist to produce
+    // NEGATIVE evidence (a wrong-key open must FAIL) and are confined to this QA
+    // fixture: actor.mu, the production unit, defines none of them, they are not
+    // reachable from any advertised capability or MCP tool, and the driver asserts
+    // that invoking them on a production packet fails.
+    //
+    // WHY THE PROBE KEYS STAND IN FOR pending_redemption_keys: that store is `hidden`
+    // in a2a_messaging, so only that library can read it. Exposing a peek would put a
+    // secret-reading accessor into the PRODUCTION core purely for a test — a strictly
+    // worse trade than this. The property under test is unaffected: each redeemer
+    // boxes with an INDEPENDENT ephemeral of its own, so "B's ephemeral cannot open
+    // A's box" is a property of the key pairing, not of which store holds the key.
+    // The boxes are built against the REAL published invite's ephemeral pubkey.
+
+    // Mint a probe ephemeral under `tag`; returns only its PUBLIC half.
+    trn qa_mint_probe_key _:($tag -> tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        kp = _crypto_construct_encryption_keypair (_crypto_default_scheme_id()).
+        qa_leg1_keys tag -> (kp $secret_key).
+        return transaction::success [ _return_data ($pub -> (kp $public_key)), _save_state NIL ].
+    }
+
+    // Build a leg-1-shaped box to `to_pub` with a FRESH sender ephemeral, exactly as
+    // add_contact boxes its identity bundle to the invite's ephemeral pubkey. Returns
+    // what travels on the wire ($epk + $data). Nothing is sent: the isolation property
+    // is a property of the box, not of delivery.
+    trn qa_leg1_box _:($to_pub -> to_pub: publickey_encrypt, $tag -> tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        kp = _crypto_construct_encryption_keypair (_crypto_default_scheme_id()).
+        payload = _write ($probe -> tag).
+        data = _crypto_encrypt_message (kp $secret_key) to_pub payload.
+        return transaction::success [
+            _return_data ($epk -> (kp $public_key), $data -> data),
+            _save_state NIL
+        ].
+    }
+
+    // Attempt to open `data` with the ephemeral stored under `key_tag`.
+    // _crypto_decrypt_message ABORTS on a wrong key, so a failed open surfaces to the
+    // driver as a REJECTED transaction — which is the negative evidence being sought.
+    // A successful open resolves and echoes the probe marker, proving it really opened
+    // the intended plaintext rather than merely not crashing.
+    trn qa_try_open_leg1 _:($epk -> epk: publickey_encrypt, $data -> data: crypto_message, $key_tag -> key_tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        sk = qa_leg1_keys key_tag abort "qa_try_open_leg1: no such probe key" WHEN IS NIL.
+        pt = _crypto_decrypt_message sk? epk data.
+        iv2 = key_storage::read_external pt.
+        marker is str = "".
+        if (iv2 $probe) != NIL { marker -> (iv2 $probe) safe str. }
+        return transaction::success [ _return_data ($opened -> TRUE, $marker -> marker) ].
+    }
+
+    // Report what a published invite blob actually carries, so the driver can assert
+    // it exposes only the PUBLIC ephemeral half — nothing able to open a leg-1 box.
+    trn readonly qa_invite_fields _:($invite -> blob: bin)
+    {
+        inv = (_read_or_abort blob) safe a2a_protocol::invite_eph_t.
+        return ($has_pub -> ((inv $k) != NIL), $eph_pub -> (inv $k), $mode -> (inv $m), $raw -> (_read_or_abort blob)).
+    }
+
+    // ---- core 0.13 contact_origin export/import QA ----
+    // Import a MINIMAL legacy-shaped core blob that has NO $contact_origin at all —
+    // the pre-0.13 case. Everything import_core_state treats as mandatory is present.
+    trn qa_import_legacy_core _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::import_core_state (
+            $my_name -> "LegacyImported",
+            $contacts -> (,),
+            $peer_ads -> (,)
+        ).
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
+    }
+
+    // Import a core blob whose $contact_origin is HOSTILE: a wrong-typed $via on one
+    // entry, an unknown extra field on another, and one well-formed entry. The import
+    // must not abort, and the well-formed entry must survive.
+    trn qa_import_hostile_origin _:($good_cid -> good: global_id, $bad_cid -> bad: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        now = (current_transaction_info::get_transaction_time())?.
+        a2a_messaging::import_core_state (
+            $my_name -> "HostileImported",
+            $contacts -> (,),
+            $peer_ads -> (,),
+            $contact_origin -> (
+                bad  -> ($via -> 12345, $at -> now),
+                good -> ($via -> "invite_public", $at -> now, $unknown_extra -> "ignored-by-the-rebuild")
+            )
+        ).
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
     }
 
     // ---- core 0.7.0 receipts QA (RC-series) ----

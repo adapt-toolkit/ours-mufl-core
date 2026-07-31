@@ -5445,9 +5445,48 @@ library a2a_messaging loads libraries
         {
             contact_e2e_seen -> (data $contact_e2e_seen) safe (global_id ->> bool).
         }
+        // core 0.13 provenance. ENTRY-BY-ENTRY and shape-guarded, NOT a whole-map
+        // `safe` cast. A blanket cast aborts the ENTIRE import on one malformed entry,
+        // which would violate this function's own contract ("NEVER let an incompatible
+        // optional field abort the whole import — degrade, don't reset") and would turn
+        // a corrupt provenance record into total state loss for an identity. Since
+        // mufl has no try/catch, the guard is the M1 `_typeof` idiom the version
+        // registry already uses: pre-check every field the cast will read, DROP the
+        // entries that fail, and keep the rest well-formed. Provenance is advisory
+        // metadata that nothing in this core reads, so losing a bad entry costs
+        // nothing; losing the identity's contacts would cost everything.
+        // An absent field (every pre-0.13 blob) simply leaves the map empty.
         if (data $contact_origin) != NIL
         {
-            contact_origin -> (data $contact_origin) safe (global_id ->> a2a_protocol::contact_origin_t).
+            src = data $contact_origin.
+            if (_typeof src) == "IMMUTABLE_DICTIONARY"
+            {
+                rebuilt is (global_id ->> a2a_protocol::contact_origin_t) = (,).
+                sc src -- (ocid -> orec)
+                {
+                    if orec != NIL && (a2a_versions::is_str (orec $via)) && (orec $at) != NIL
+                    {
+                        // $invite_id is nullable; a present-but-wrong-typed one would
+                        // still abort the per-entry cast, so it is checked too.
+                        iid = orec $invite_id.
+                        if iid == NIL || (a2a_versions::is_str iid)
+                        {
+                            oid is global_id+ = NIL.
+                            if iid != NIL { oid -> iid safe global_id. }
+                            // The KEY is cast here (the iteration yields `any`).
+                            // Residual, matching the one COMPATIBILITY.md already
+                            // documents for the registry: `safe global_id` also
+                            // hex-validates, so a STRING key that is not valid hex
+                            // still aborts. This blob is LOCAL state, not
+                            // peer-supplied, so producing one requires write access
+                            // to state_data.bin — at which point the attacker has
+                            // strictly better options than a corrupt provenance key.
+                            rebuilt (ocid safe global_id) -> ($via -> ((orec $via) safe str), $invite_id -> oid, $at -> ((orec $at) safe time)).
+                        }
+                    }
+                }
+                contact_origin -> rebuilt.
+            }
         }
         if (data $contact_born_dr) != NIL
         {
