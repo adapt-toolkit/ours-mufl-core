@@ -97,14 +97,59 @@ library a2a_protocol loads library
     //       - invite_eph_t changing shape such that an older decoder cannot consume it;
     //       - the address-document format moving to an incompatible version (the
     //         v1->v2 $e2e_bundle bump) so a v1 peer would reject a v2 AD.
+    //   $m invite MODE (NULLABLE, core 0.13). One of invite_mode_* below. NIL means
+    //     the inviter predates explicit modes ⇒ the redeemer treats it as ONE-TIME,
+    //     which is what every pre-0.10 invite actually was. Class-A addition: an
+    //     older decoder ignores the extra member and a newer decoder reads a missing
+    //     one as NIL (name-keyed metadefs + nullable), exactly as $iv documents — so
+    //     this does NOT bump $iv, because neither direction needs to know the peer's
+    //     version to interoperate.
+    //     ADVISORY ON THE WIRE, BY DESIGN: the mode that actually governs whether a
+    //     redemption consumes the invite is the one in the INVITER's own
+    //     pending_invites record (a2a_messaging::pending_invite_t $mode). This field
+    //     exists so the REDEEMER can see how it was let in — the symmetric half of
+    //     the provenance the inviter records in contact_origin — and so a client can
+    //     warn "this is a public invite" before redeeming. Nothing authorizes off it.
     metadef invite_eph_t: (
         $d -> global_id,
         $c -> global_id,
         $n -> str,
         $k -> publickey_encrypt,
         $v -> int,
-        $iv -> int+
+        $iv -> int+,
+        $m -> int+
     ).
+
+    // ---- invite modes (core 0.13) ---------------------------------------
+    // ONE-TIME (the historical and DEFAULT behaviour): the first valid redemption
+    // consumes the invite; a second redeemer gets "Unknown or already-redeemed
+    // invite." Suitable for handing to one named peer out of band.
+    invite_mode_one_time = 1.
+    // PUBLIC / reusable: the invite survives redemption and may be redeemed by
+    // many distinct peers — the mode you post openly. Each redemption still runs
+    // the full leg-1/2/3 handshake and yields its OWN authenticated session; see
+    // a2a_messaging::handle_submit_invite_response for why no secret or session
+    // state is shared between redeemers. A public invite has no expiry, so
+    // revocation (a2a_messaging::revoke_invite) is the ONLY way to close it —
+    // that is why revocation ships together with this mode, not after it.
+    invite_mode_public = 2.
+    // Normalize an arbitrary wire/state int into a KNOWN mode, defaulting to
+    // one-time. Fail-safe by construction: an unrecognized (future) mode
+    // degrades to the RESTRICTIVE option rather than the permissive one.
+    fn normalize_invite_mode (m: int+) -> int
+    {
+        return (m == NIL ?? invite_mode_one_time ; (m? == invite_mode_public ?? invite_mode_public ; invite_mode_one_time)).
+    }
+
+    // ---- contact provenance (core 0.13) ---------------------------------
+    // How a contact entered the book. Recorded at first registration and never
+    // rewritten, so it stays a fact about the ORIGINAL admission decision.
+    // Consumed by nothing in this core today: it is the substrate a future trust
+    // level needs, captured now because it cannot be reconstructed later.
+    origin_invite_one_time = "invite_one_time".  // redeemed a one-time invite I minted
+    origin_invite_public   = "invite_public".    // walked in through a PUBLICLY POSTED reusable invite
+    origin_invite_redeemed = "invite_redeemed".  // I redeemed THEIR invite (responder side)
+    metadef contact_origin_t: ($via -> str, $invite_id -> global_id+, $at -> time).
 
     // A reply pointer carried on a message: the stable wire id of the message
     // being replied to, plus an optional 1-based sentence index into that

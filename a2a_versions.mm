@@ -44,7 +44,13 @@ library a2a_versions
     // learned dialect is >= 8 is KNOWN to parse the E2E signed-message envelope,
     // the belt to the core.e2e-cap suspenders for send-side routing (mirrors the
     // receipts -> 7 precedent). Additive; no existing >= 7 gate changes (8 >= 7).
-    wire_version = 8.
+    // 9: the crm surface (receive_contact_removal) registered in 0.13 — a peer
+    // whose learned dialect is >= 9 is KNOWN to parse the bilateral contact-removal
+    // notice. Used ONLY as the caps-silent fallback half of the removal gate
+    // (a2a_messaging::contact_removal_gate), exactly like receipts -> 7; the
+    // primary evidence stays the positive core.contact.removal cap. Every existing
+    // gate is a `>=` threshold (7/8), so the bump is monotone and changes none.
+    wire_version = 9.
     // The version floor: OSP (oldest supported peer) = core 0.2.0 -> 2.
     // Raising this = an owner decision recorded in COMPATIBILITY.md (drop the
     // v2 types from the unions + prune the corpus — a visible, reviewed act).
@@ -651,6 +657,39 @@ library a2a_versions
     {
         ids = raw $wire_ids.
         return is_str (raw $kind) && ids != NIL && (_typeof ids) == "IMMUTABLE_DICTIONARY".
+    }
+
+    // receive_contact_removal $targ (core 0.13, class-B new surface — single
+    // version). The bilateral half of remove_contact: "I removed you; drop me too."
+    //
+    // DELIBERATELY CARRIES NO TARGET ID. The receiver removes the CHANNEL-
+    // AUTHENTICATED envelope $from and nothing else, so this surface cannot be
+    // aimed: a contact can only ever remove ITSELF from my book, never a third
+    // party. That property is why the payload is (almost) empty — anything
+    // cid-shaped here would be an authorization decision made from attacker-
+    // supplied data. $reason is metadata only (diagnostics/UX), never a gate.
+    metadef crm_targ_v1_t: (
+        $reason -> str+,     // free-text/enum hint, e.g. "user" | "room_close"; NEVER load-bearing
+        $pv     -> int+      // wire dialect stamp; nullable so a future unstamped sender degrades
+    ).
+    metadef crm_targ_t: crm_targ_v1_t.
+    // Introduction dialect 9 — this surface cannot predate 0.10 (cf. rcp -> 7,
+    // e2e -> 8): an unstamped body is treated as the introducing dialect rather
+    // than a pre-0.5 peer, because no pre-0.10 sender emits this transaction at all.
+    fn crm_version_of (raw: any) -> int
+    {
+        pv = peer_pv raw.
+        return (pv != 0 ?? pv ; 9).
+    }
+    // Abort-free classification (M1). Every field of crm_targ_v1_t is NULLABLE,
+    // so the exact cast has nothing that can abort on absence — an empty $targ is
+    // a VALID removal notice (the sender identity is the whole payload). This
+    // stays a fn (not `return TRUE` inlined at the call site) so a future added
+    // non-nullable field gets its shape check in the one place REG-4 expects it.
+    fn crm_shape_ok (raw: any) -> bool
+    {
+        r = raw $reason.
+        return (r == NIL || is_str r) && ((raw $pv) == NIL || is_int (raw $pv)).
     }
 
     // receive_file $targ (v5 adds only the $pv stamp — same shape).

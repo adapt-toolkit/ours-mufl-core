@@ -539,8 +539,8 @@ async function main() {
     await sleep(2500);
     ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(R, I.cid) === '8', `responder learned contact_pv=8 (wire-8 leg-3 + stamped messages)`);
-    ok(pvOf(I, R.cid) === '8', `inviter learned contact_pv=8 (real current-build leg-1)`);
+    ok(pvOf(R, I.cid) === '9', `responder learned contact_pv=9 (wire-9 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '9', `inviter learned contact_pv=9 (real current-build leg-1)`);
   }
 
   // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
@@ -562,14 +562,14 @@ async function main() {
     await sleep(2500);
     ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `post-upgrade stamped message delivered`);
-    ok(pvOf(I, R.cid) === '8', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→8 (ongoing learning)`);
+    ok(pvOf(I, R.cid) === '9', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→9 (ongoing learning)`);
     // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
     await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
     await sleep(2500);
     ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `legacy (pre-wire_id, unstamped) message still delivers`);
-    ok(pvOf(I, R.cid) === '8', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(pvOf(I, R.cid) === '9', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
     ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
       `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
   }

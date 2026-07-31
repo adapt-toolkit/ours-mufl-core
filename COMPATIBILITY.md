@@ -22,11 +22,13 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
 
 ## The wire version id (`$pv`)
 
-- `wire_version = 8` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
+- `wire_version = 9` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
   rcp/receipts surface registered in 0.7 warranted the bump; the initial 0.7.0 under-bump left
   pre-receipts contacts permanently receipt-gated, the fixed single-tick bug; 0.8.0 stamps `8` —
-  the **e2e** signed-message surface registered in 0.8). Monotone; bump **only** when a wire
-  surface registers a new versioned type — not on every release.
+  the **e2e** signed-message surface registered in 0.8; 0.13 stamps `9` — the **crm**
+  contact-removal surface registered in 0.13). Monotone; bump **only** when a wire
+  surface registers a new versioned type — not on every release. Every consumer of a
+  learned `$pv` is a `>=` threshold, so a bump never changes an existing gate.
 - Stamped on every core-originated send: cleartext `$targ` envelopes **and** inside the
   boxed identity-bundle payloads (invite legs 1/3, restore legs 1/2).
 - Absence ⇒ pre-0.5 peer; the registry's per-surface **shape-inference rule** applies.
@@ -127,6 +129,7 @@ hand-crafted box, which is the malformed/tamper class where an abort is correct.
 | `receive_message` `$targ` | **rmsg** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
 | `receive_file` `$targ` | **rfil** | single version (+`$pv` stamp in 0.5.0) | `$pv`; else 2 |
 | `receive_receipt` `$targ` (0.7.0) | **rcp** | single version (v1: `$kind`, `$wire_ids`, `$date+`, `$pv+`) | `$pv`; else 7 (surface cannot predate 0.7). Reachable only behind positive `core.receipts.*` caps |
+| `receive_contact_removal` `$targ` (0.13) | **crm** | single version (v1: `$reason+`, `$pv+`) | `$pv`; else 9 (surface cannot predate 0.13). Reachable only behind the positive `core.contact.removal` cap (or the caps-silent `pv >= 9` fallback). Payload carries NO target id — the removed party is the channel-authenticated envelope `$from`, so the surface cannot be aimed at a third party |
 | `e2e_signed_message` variant (0.8.0) | **e2e** | single version (v1: `$e2e_envelope` = `t_e2e_envelope`(`$session_id`,`$olm_type`,`$ciphertext`,`$pv+`), `$emsignature`) | inner `$e2e_envelope.$pv`; else 8 (surface cannot predate 0.8). Reachable only behind the `core.e2e` cap + AD v2 bundle; decode branch keys on the `$e2e_envelope` marker |
 
 **Deferred surfaces** (tolerant field-by-field readers today; register on their first shape
@@ -193,6 +196,91 @@ dropped abort-free (rcp M1 checks incl. the list-domain guard), unknown senders 
 success, and no receipt is ever emitted for a receipt. Consumer hook
 (`on_receipt_received`, optional, default no-op) contract: application is MONOTONIC per
 (peer, wire_id) on `unknown < sent < delivered < read`.
+
+## Bilateral contact removal (core 0.13) — capability-gated, fail-closed
+
+`remove_contact` now has a remote half: one new class-B transaction
+`::a2a_messaging::receive_contact_removal` (`$reason+`, `$pv+`).
+
+**Authorization is the envelope.** The payload deliberately carries **no target id**. The
+receiver removes the channel-authenticated envelope `$from` and nothing else, so a peer can
+only ever make me forget *it* — never a third party. `check_encrypted_or_abort` keeps the
+notice on the established channel. This is what makes it a protocol operation rather than an
+unauthenticated hint.
+
+**Gate (sender side, receipts polarity — fail CLOSED):** emit iff self advertises
+`core.contact.removal` **and** the peer positively advertises it in learned `contact_caps`;
+a caps-**silent** peer with learned `contact_pv >= 9` also qualifies (the stale-caps
+self-heal, since caps refresh only on invite/restore legs). A pre-0.13 client is therefore
+never sent a transaction it cannot parse. The **receive** side is ungated and unconditional,
+so a peer that declines to advertise still gets removed when *it* removes *me*.
+
+**Delivery is best-effort and is NOT retried.** The notice is fire-and-forget over the relay,
+and unlike ordinary traffic it cannot be redriven — the redrive buffer is keyed by contact
+and the contact is gone. `remove_contact` returns `$notified` (a notice was *queued*, not
+acknowledged) and `$key_material_retained`; consumers MUST NOT render either as "the peer
+removed you". Local removal always succeeds regardless.
+
+**Idempotent / replay-safe by construction:** the operation is "ensure this sender is
+absent". Duplicates, replays, and notices from a non-contact all converge on the same state
+and return success, so no replay ledger exists. A crossed removal is two no-ops.
+
+**Hard purge, explicit drop-list.** `purge_contact_state(cid)` names every store literally —
+it is deliberately NOT derived from a `contacts` keep-list, which would also delete peers
+legitimately mid-handshake (pending redemptions, in-flight restores, FSM entries for a
+not-yet-registered contact). It additionally clears the e2e pins `contact_e2e_seen` /
+`contact_e2e_epoch` / `contact_born_dr` / `contact_migration` / `mig_deferred`, which their
+declarations describe as "never cleared": removal *ends* the connection those pins protect,
+and leaving them makes a later re-add fail closed forever (epoch-pinned, no live session ⇒
+`downgrade_refused`). A re-added peer re-earns them from its fresh AD — a deliberate re-TOFU.
+The primitive is factored out so a future room-close can call it per participant; that
+caller does not exist yet.
+
+**Known residual:** the adapt `e2e` library exposes no per-cid session drop (only
+`discard_rotation`, which clears the STAGED slot), so the live Olm ratchet for a removed peer
+survives in packet state and in the exported `$e2e_sessions`. Consistent with the
+long-standing "contacts-layer forget, NOT a key wipe" contract; a true key wipe needs an
+upstream toolkit addition.
+
+## Invite modes (core 0.13) — class-A, default-preserving
+
+`invite_eph_t` gains a nullable `$m` (mode). Class-A by taxonomy: an older decoder ignores the
+extra member, a newer decoder reads a missing one as NIL. `$iv` is **not** bumped — neither
+direction needs to know the peer's version to interoperate.
+
+- `invite_mode_one_time = 1` — the historical behaviour and the **default** for an absent
+  mode, on the wire and in state. Every existing caller keeps minting exactly what it minted
+  before, and an unrecognized future mode normalizes *down* to one-time (fail-safe).
+- `invite_mode_public = 2` — reusable; leg 2 does not consume `pending_invites` /
+  `pending_invite_keys`.
+
+**The wire `$m` is advisory.** The mode that decides consumption is the one in the
+**inviter's own** `pending_invite_t.$mode`, so a redeemer cannot promote a one-time invite by
+editing its copy.
+
+**Why reuse does not share secrets.** What is retained is the *inviter's* ephemeral keypair,
+used only to OPEN leg-1 boxes addressed to it. Each redeemer boxes with its own fresh
+ephemeral, so redeemer B cannot open redeemer A's leg 1; leg 3 already mints a fresh inviter
+ephemeral per redemption; all resulting session state is cid-keyed. A public invite is many
+independent two-party handshakes that happen to start from one published pubkey.
+
+**Replay:** for a public invite a replayed leg 1 from the same authenticated sender
+re-registers that sender — idempotent, and semantically what the mode means. It also means
+re-redemption can re-add a previously removed peer. `revoke_invite` is the control, which is
+why it ships with the mode rather than after it.
+
+**Known limitation:** `import_core_state` still resets `pending_invites` to empty, so a public
+invite does not survive a daemon restart and must be re-published. The blocker is INV-4 — the
+invite's ephemeral private key cannot ride the export blob. Making a public invite genuinely
+perpetual requires either a local-only secret sidecar the host re-injects at boot, or a
+secret-free public leg 1; that is an owner-level security decision and is deliberately not
+taken here. `generate_invite` and the MCP tool text state the limitation rather than implying
+durability the code does not provide.
+
+**Provenance:** `contact_origin` (cid → `$via`/`$invite_id`/`$at`, exported additively,
+readable via `list_contact_origins`) records how each contact was admitted, so a future trust
+level can mark public-invite entrants. Nothing in this core reads it; the trust UI/policy is
+deliberately not implemented.
 
 ## Golden-wire corpus (release gate)
 

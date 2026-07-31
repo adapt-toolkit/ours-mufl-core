@@ -112,6 +112,19 @@ library a2a_capabilities loads libraries
     // an unknown control tx); never authz (REG-6).
     cap_e2e_rekey = "core.e2e.rekey".
 
+    // core 0.13 — bilateral contact removal (a2a_messaging receive_contact_removal).
+    // PROTOCOL-surface id with NO control verbs, $advertise-carried: "I understand
+    // the removal notice and will drop you from my book when you remove me."
+    // Gates the SENDER (a2a_messaging::contact_removal_gate) fail-CLOSED, the
+    // receipts polarity: a pre-0.10 daemon must never be sent an unknown control
+    // transaction. Never authz (REG-6) — the RECEIVE side is unconditional and
+    // authorizes strictly off the channel-authenticated envelope $from, so a peer
+    // that declines to advertise this still gets removed when IT removes ME.
+    // SINGLE id, like cap_e2e_migrate: removal has no opt-out semantics (a peer
+    // that does not want it simply never advertises, and the initiator's local
+    // removal proceeds regardless — it is only the NOTICE that is withheld).
+    cap_contact_removal = "core.contact.removal".
+
     // ---- secret-field sentinels (config dialect, core.configuration) ------
     // A secret field's VALUE is never echoed in plaintext: reads carry one of
     // these sentinels, and writes interpret them. "$needs_reentry" is the
