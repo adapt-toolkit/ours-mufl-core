@@ -568,17 +568,35 @@ application actor loads libraries
     // Import a core blob whose $contact_origin is HOSTILE: a wrong-typed $via on one
     // entry, an unknown extra field on another, and one well-formed entry. The import
     // must not abort, and the well-formed entry must survive.
-    trn qa_import_hostile_origin _:($good_cid -> good: global_id, $bad_cid -> bad: global_id)
+    // Every malformed shape the guard must survive, in ONE blob so a single import
+    // proves the whole class degrades rather than aborting. Keys are also placed in
+    // $contacts, because the rebuild draws its keys from there (trusted) rather than
+    // from the untrusted provenance map.
+    //   good      — well-formed, PLUS an unknown extra field (must be stripped)
+    //   bad_via   — wrong-typed $via (int)                       -> entry dropped
+    //   bad_at    — wrong-typed $at (str, not a time)            -> entry dropped
+    //   bad_iid   — non-hex $invite_id (would abort `safe global_id`) -> KEPT, label dropped
+    //   no_at     — missing $at entirely                          -> entry dropped
+    trn qa_import_hostile_origin _:($good_cid -> good: global_id, $bad_cid -> bad: global_id, $at_cid -> atc: global_id, $iid_cid -> iidc: global_id, $noat_cid -> noatc: global_id)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         now = (current_transaction_info::get_transaction_time())?.
         a2a_messaging::import_core_state (
             $my_name -> "HostileImported",
-            $contacts -> (,),
+            $contacts -> (
+                good  -> ($name -> "Good",   $container_id -> good),
+                bad   -> ($name -> "BadVia", $container_id -> bad),
+                atc   -> ($name -> "BadAt",  $container_id -> atc),
+                iidc  -> ($name -> "BadIid", $container_id -> iidc),
+                noatc -> ($name -> "NoAt",   $container_id -> noatc)
+            ),
             $peer_ads -> (,),
             $contact_origin -> (
-                bad  -> ($via -> 12345, $at -> now),
-                good -> ($via -> "invite_public", $at -> now, $unknown_extra -> "ignored-by-the-rebuild")
+                bad   -> ($via -> 12345, $at -> now),
+                atc   -> ($via -> "invite_public", $at -> "not-a-time"),
+                iidc  -> ($via -> "invite_one_time", $at -> now, $invite_id -> "zzzz-not-hex-!!"),
+                noatc -> ($via -> "invite_public"),
+                good  -> ($via -> "invite_public", $at -> now, $unknown_extra -> "ignored-by-the-rebuild")
             )
         ).
         return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].

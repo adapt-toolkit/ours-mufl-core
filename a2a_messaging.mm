@@ -223,7 +223,7 @@ library a2a_messaging loads libraries
     // pending_invite_keys store (INV-4) and is consumed together on first redeem.
     // core 0.13: $mode makes the one-time-vs-public distinction EXPLICIT and
     // INVITER-SIDE-AUTHORITATIVE. It is nullable purely for import compatibility
-    // (a pre-0.10 record has no such field) and a NIL reads as one-time — the
+    // (a pre-0.13 record has no such field) and a NIL reads as one-time — the
     // safe default, because treating an unknown-mode invite as reusable would
     // silently turn every legacy invite into a bearer credential that never
     // expires. See invite_mode_one_time / invite_mode_public in a2a_protocol.
@@ -1799,7 +1799,7 @@ library a2a_messaging loads libraries
         // Remember who I am redeeming (name + expected inviter cid; no secrets) and
         // KEEP my ephemeral private key (secret store) so leg 3 can be opened.
         contact_name = (custom_name == NIL ?? "" ; custom_name?).
-        // Advisory mode from the blob (NIL on a pre-0.10 invite ⇒ one-time).
+        // Advisory mode from the blob (NIL on a pre-0.13 invite ⇒ one-time).
         redeemed_mode = a2a_protocol::normalize_invite_mode (inv $m).
         pending_redemptions invite_id -> ($inviter_cid -> inviter_cid, $inviter_name -> inviter_name, $custom_name -> contact_name, $mode -> redeemed_mode).
         pending_redemption_keys invite_id -> (kpr $secret_key).
@@ -2050,7 +2050,7 @@ library a2a_messaging loads libraries
     // learned dialect >= 9 so two upgraded peers self-heal without re-pairing
     // (contact_caps only refreshes on invite/restore legs, contact_pv on every
     // stamped message — the exact stale-caps hole the receipts single-tick bug hit).
-    // A pre-0.10 peer therefore never receives an unknown control transaction.
+    // A pre-0.13 peer therefore never receives an unknown control transaction.
     // REG-6: this gates EMISSION only, never authorization.
     fn contact_removal_gate (peer: global_id) -> bool
     {
@@ -2215,17 +2215,23 @@ library a2a_messaging loads libraries
     // class of hole as having no guard at all.
     //
     // BOUND CONTROL PLANE, ATOMIC TRANSITION. The outbound trn REFUSES to remove the
-    // bound CP, because a dangling monitoring_proxy bricks messaging (the next send's
-    // forced copy fires send_encrypted_tx at an unregistered peer and aborts the
-    // user's send, and disable_monitoring is CP-only so there is no recovery).
-    // Inbound we cannot refuse the same way — the CP has ALREADY dropped us, so
-    // keeping it bound would leave monitoring copies flowing to a peer that is no
-    // longer a contact. Instead the binding is cleared FIRST, in the same
-    // transaction, so no copy can be emitted for the removed CP afterwards. This
-    // grants the CP no new power: the notice is authenticated as coming FROM that CP,
-    // and disable_monitoring is already a CP-only operation, so this is the CP
-    // exercising authority it already had — and it leaves a recoverable state (no
-    // proxy bound) rather than an unrecoverable one.
+    // bound CP (that refusal is pre-existing and is retained). Inbound we cannot
+    // refuse the same way — the CP has ALREADY dropped us, so keeping it bound would
+    // leave monitoring copies addressed to a peer that is no longer a contact.
+    // Instead the binding is cleared FIRST, in the same transaction, so
+    // monitor_copy_actions self-gates to [] on every subsequent send: it returns
+    // early when monitoring_proxy == NIL, which is the DIRECT reason no copy can
+    // follow, and the only claim made here.
+    // NOTE (review L2): do NOT justify this by "a dangling proxy would abort the
+    // user's next send, so a send succeeding proves no copy was emitted". That
+    // inference does not hold — copy emission is a separate queued action, and its
+    // fate is not a reliable signal about the send. The load-bearing evidence is the
+    // binding being cleared plus the absence of any copy at the removed CP, and the
+    // regression asserts exactly those two things.
+    // This grants the CP no new power: the notice is authenticated as coming FROM
+    // that CP, and disable_monitoring is already a CP-only operation, so this is the
+    // CP exercising authority it already had — and it leaves a recoverable state (no
+    // proxy bound) rather than a dangling one.
     // Returns the actions; the CALLER appends its own notify/save (the notice $reason is
     // the caller's to surface — it is diagnostics, never an input to this transition).
     fn apply_peer_removal_actions (sender_id: global_id) -> transaction::action::type[]
@@ -2281,7 +2287,7 @@ library a2a_messaging loads libraries
         // contact and we just deleted the contact. If the peer is offline and the
         // broker drops the packet, the removal is local-only and nothing will retry.
         // $notified FALSE means we deliberately sent nothing: either the peer does
-        // not advertise core.contact.removal (a pre-0.10 client) or it is degraded
+        // not advertise core.contact.removal (a pre-0.13 client) or it is degraded
         // (no address document to send to). Callers MUST NOT render either case as
         // "the peer removed you".
         actions (_count actions|) -> _return_data (
@@ -5456,33 +5462,42 @@ library a2a_messaging loads libraries
         // metadata that nothing in this core reads, so losing a bad entry costs
         // nothing; losing the identity's contacts would cost everything.
         // An absent field (every pre-0.13 blob) simply leaves the map empty.
+        //
+        // KEYS COME FROM `contacts`, NOT FROM THE UNTRUSTED MAP. Iterating the blob's
+        // own keys would force `ocid safe global_id`, which hex-validates and so would
+        // abort on a corrupt key — the exact failure mode this guard exists to prevent,
+        // reintroduced one level up. `contacts` is imported ABOVE and its keys are
+        // already typed global_id, so every key used here is trusted by construction.
+        // Provenance for a cid that is not a contact is meaningless anyway (removal
+        // drops both together), so nothing of value is skipped.
+        //
+        // The `time` domain is derived at RUNTIME from a real transaction time rather
+        // than hardcoded: the toolkit exposes no stable literal for it, and a
+        // hardcoded guess would silently start dropping every entry if the domain
+        // string ever changed.
         if (data $contact_origin) != NIL
         {
             src = data $contact_origin.
             if (_typeof src) == "IMMUTABLE_DICTIONARY"
             {
+                td_time = _typeof ((current_transaction_info::get_transaction_time())?).
                 rebuilt is (global_id ->> a2a_protocol::contact_origin_t) = (,).
-                sc src -- (ocid -> orec)
+                sc contacts -- (ocid -> )
                 {
-                    if orec != NIL && (a2a_versions::is_str (orec $via)) && (orec $at) != NIL
+                    orec = src ocid.
+                    if orec != NIL
+                        && (a2a_versions::is_str (orec $via))
+                        && (orec $at) != NIL
+                        && (_typeof (orec $at)) == td_time
                     {
-                        // $invite_id is nullable; a present-but-wrong-typed one would
-                        // still abort the per-entry cast, so it is checked too.
+                        // $invite_id is nullable and str+ (see contact_origin_t): a
+                        // present-but-non-string value is DROPPED to NIL rather than
+                        // taking the whole entry with it, because the label is
+                        // display-only and a missing one loses nothing load-bearing.
+                        oid is str+ = NIL.
                         iid = orec $invite_id.
-                        if iid == NIL || (a2a_versions::is_str iid)
-                        {
-                            oid is global_id+ = NIL.
-                            if iid != NIL { oid -> iid safe global_id. }
-                            // The KEY is cast here (the iteration yields `any`).
-                            // Residual, matching the one COMPATIBILITY.md already
-                            // documents for the registry: `safe global_id` also
-                            // hex-validates, so a STRING key that is not valid hex
-                            // still aborts. This blob is LOCAL state, not
-                            // peer-supplied, so producing one requires write access
-                            // to state_data.bin — at which point the attacker has
-                            // strictly better options than a corrupt provenance key.
-                            rebuilt (ocid safe global_id) -> ($via -> ((orec $via) safe str), $invite_id -> oid, $at -> ((orec $at) safe time)).
-                        }
+                        if iid != NIL && (a2a_versions::is_str iid) { oid -> iid safe str. }
+                        rebuilt ocid -> ($via -> ((orec $via) safe str), $invite_id -> oid, $at -> ((orec $at) safe time)).
                     }
                 }
                 contact_origin -> rebuilt.

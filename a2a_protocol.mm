@@ -99,7 +99,7 @@ library a2a_protocol loads library
     //         v1->v2 $e2e_bundle bump) so a v1 peer would reject a v2 AD.
     //   $m invite MODE (NULLABLE, core 0.13). One of invite_mode_* below. NIL means
     //     the inviter predates explicit modes ⇒ the redeemer treats it as ONE-TIME,
-    //     which is what every pre-0.10 invite actually was. Class-A addition: an
+    //     which is what every pre-0.13 invite actually was. Class-A addition: an
     //     older decoder ignores the extra member and a newer decoder reads a missing
     //     one as NIL (name-keyed metadefs + nullable), exactly as $iv documents — so
     //     this does NOT bump $iv, because neither direction needs to know the peer's
@@ -149,7 +149,13 @@ library a2a_protocol loads library
     origin_invite_one_time = "invite_one_time".  // redeemed a one-time invite I minted
     origin_invite_public   = "invite_public".    // walked in through a PUBLICLY POSTED reusable invite
     origin_invite_redeemed = "invite_redeemed".  // I redeemed THEIR invite (responder side)
-    metadef contact_origin_t: ($via -> str, $invite_id -> global_id+, $at -> time).
+    // $invite_id is str+, NOT global_id+, deliberately. It is a LOCAL provenance
+    // label that nothing ever routes or authenticates on, and `safe global_id`
+    // hex-validates — so a corrupt byte in a state blob would abort the import of an
+    // entry that is only ever displayed. str+ keeps a malformed value DROPPABLE by a
+    // shape guard instead of fatal. Wire-compatible with existing exports: a
+    // previously written global_id rides STRING at runtime and imports unchanged.
+    metadef contact_origin_t: ($via -> str, $invite_id -> str+, $at -> time).
 
     // A reply pointer carried on a message: the stable wire id of the message
     // being replied to, plus an optional 1-based sentence index into that

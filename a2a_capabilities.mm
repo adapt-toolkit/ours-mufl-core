@@ -116,7 +116,7 @@ library a2a_capabilities loads libraries
     // PROTOCOL-surface id with NO control verbs, $advertise-carried: "I understand
     // the removal notice and will drop you from my book when you remove me."
     // Gates the SENDER (a2a_messaging::contact_removal_gate) fail-CLOSED, the
-    // receipts polarity: a pre-0.10 daemon must never be sent an unknown control
+    // receipts polarity: a pre-0.13 daemon must never be sent an unknown control
     // transaction. Never authz (REG-6) — the RECEIVE side is unconditional and
     // authorizes strictly off the channel-authenticated envelope $from, so a peer
     // that declines to advertise this still gets removed when IT removes ME.

@@ -232,12 +232,14 @@ than from a success. Both halves must agree: routing emission to e2e without thi
 (or vice-versa) would leave exactly the hole it closes.
 
 **Bound control plane — atomic inbound transition.** The outbound trn still **refuses** to
-remove the bound CP (a dangling `monitoring_proxy` bricks messaging: the next send's forced
-copy fires `send_encrypted_tx` at an unregistered peer and aborts the user's send, and
-`disable_monitoring` is CP-only so there is no recovery). Inbound cannot refuse the same way
-— the CP has already dropped us, so staying bound would keep monitoring copies flowing to a
+remove the bound CP (pre-existing behaviour, retained). Inbound cannot refuse the same way —
+the CP has already dropped us, so staying bound would keep monitoring copies addressed to a
 peer that is no longer a contact. So an authenticated `crm` **from the bound CP** clears the
 binding via `do_disable_monitoring` **first, in the same transaction**, before the purge.
+The reason no copy can follow is direct: `monitor_copy_actions` returns `[]` when
+`monitoring_proxy == NIL`. It is **not** "a later send would otherwise abort" — copy
+emission is a separate queued action and the success of a send says nothing reliable about
+it. The regression asserts the binding is cleared and that no copy reaches the removed CP.
 This grants the CP no new power (the notice is authenticated as coming from that CP, and
 `disable_monitoring` is already CP-only) and leaves a recoverable state rather than an
 unrecoverable one. Both inbound routes funnel through one `apply_peer_removal_actions`, so

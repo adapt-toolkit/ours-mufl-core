@@ -675,7 +675,7 @@ library a2a_versions
     metadef crm_targ_t: crm_targ_v1_t.
     // Introduction dialect 9 — this surface cannot predate 0.10 (cf. rcp -> 7,
     // e2e -> 8): an unstamped body is treated as the introducing dialect rather
-    // than a pre-0.5 peer, because no pre-0.10 sender emits this transaction at all.
+    // than a pre-0.5 peer, because no pre-0.13 sender emits this transaction at all.
     fn crm_version_of (raw: any) -> int
     {
         pv = peer_pv raw.
