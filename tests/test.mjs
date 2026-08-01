@@ -427,12 +427,19 @@ async function main() {
   }
 
   // ================= V-series: versioned type registry (core 0.5.0) =========
-  // Cross-version leg-1 shapes against a 0.5.0 inviter (fresh packet pair so
-  // earlier scenarios' contacts cannot mask the registration outcomes).
-  const VI = mk('VI'); const VL = mk('VL');
+  // Cross-version leg-1 shapes against a 0.5.0 inviter. Each shape uses a
+  // distinct responder: contact re-registration is intentionally idempotent,
+  // so reusing one cid would preserve its first registered name and mask the
+  // per-version name-dispatch outcomes these cases assert.
+  const VI = mk('VI'); const VL = mk('VL'); const VL3 = mk('VL3');
+  const VL5 = mk('VL5'); const VLU = mk('VLU');
   await mkPacket(VI, 'eph-t-VI-04'); await mkPacket(VL, 'eph-t-VL-05');
+  await mkPacket(VL3, 'eph-t-VL3-06'); await mkPacket(VL5, 'eph-t-VL5-07');
+  await mkPacket(VLU, 'eph-t-VLU-08');
   await sleep(1200);
   await setName(VI, 'VerInviter'); await setName(VL, 'VerLegacy');
+  await setName(VL3, 'VerLegacy3'); await setName(VL5, 'VerLegacy5');
+  await setName(VLU, 'VerUpgrade');
   const pvOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('pv').Visualize();
   const capsOf = (id, cid) => ro(id, '::actor::qa_contact_pv_of', { cid }).Reduce('caps').Visualize();
   const nameOfContact = (id, cid) => ro(id, '::actor::qa_contact_name', { cid }).Reduce('name').Visualize();
@@ -463,11 +470,11 @@ async function main() {
   const blobV2 = Buffer.from(m.Reduce('invite').GetBinary());
   {
     const rejB = VI.rejects.length;
-    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV2), shape: 'v3', name: 'LegacyBob' });
+    await mutate(VL3, '::actor::qa_send_versioned_leg1', { invite: binv(VL3, blobV2), shape: 'v3', name: 'LegacyBob' });
     await sleep(4000);
     ok(VI.rejects.length === rejB, `v3 leg-1: no abort at inviter`);
-    ok(nameOfContact(VI, VL.cid) === 'LegacyBob', `v3 leg-1: $name honored (typed v3 branch)`);
-    ok(pvOf(VI, VL.cid) === '3', `v3 leg-1: contact_pv learned as 3 (shape-inferred)`);
+    ok(nameOfContact(VI, VL3.cid) === 'LegacyBob', `v3 leg-1: $name honored (typed v3 branch)`);
+    ok(pvOf(VI, VL3.cid) === '3', `v3 leg-1: contact_pv learned as 3 (shape-inferred)`);
   }
 
   // ---------- V3 v5 leg-1 ($pv stamped + $caps piggyback) ----------
@@ -477,12 +484,12 @@ async function main() {
   const blobV3 = Buffer.from(m.Reduce('invite').GetBinary());
   {
     const rejB = VI.rejects.length;
-    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV3), shape: 'v5', name: 'NewCarol' });
+    await mutate(VL5, '::actor::qa_send_versioned_leg1', { invite: binv(VL5, blobV3), shape: 'v5', name: 'NewCarol' });
     await sleep(4000);
     ok(VI.rejects.length === rejB, `v5 leg-1: no abort at inviter`);
-    ok(nameOfContact(VI, VL.cid) === 'NewCarol', `v5 leg-1: $name honored (typed v5 branch)`);
-    ok(pvOf(VI, VL.cid) === '5', `v5 leg-1: contact_pv learned as 5 ($pv stamped)`);
-    ok(/core\.notifications/.test(String(capsOf(VI, VL.cid))), `v5 leg-1: piggybacked $caps learned into contact_caps`);
+    ok(nameOfContact(VI, VL5.cid) === 'NewCarol', `v5 leg-1: $name honored (typed v5 branch)`);
+    ok(pvOf(VI, VL5.cid) === '5', `v5 leg-1: contact_pv learned as 5 ($pv stamped)`);
+    ok(/core\.notifications/.test(String(capsOf(VI, VL5.cid))), `v5 leg-1: piggybacked $caps learned into contact_caps`);
   }
 
   // ---------- V4 Additions A+B: below-floor leg-1 → error-as-data to inviter ----------
@@ -492,7 +499,7 @@ async function main() {
   const blobV4 = Buffer.from(m.Reduce('invite').GetBinary());
   {
     const before = st(VI); const rejB = VI.rejects.length; const errB = VI.errEvents.length;
-    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'too_old', name: '' });
+    await mutate(VLU, '::actor::qa_send_versioned_leg1', { invite: binv(VLU, blobV4), shape: 'too_old', name: '' });
     await sleep(4000);
     const after = st(VI);
     ok(VI.rejects.length === rejB, `A: inviter did NOT abort/rollback on a below-floor peer (no reject)`);
@@ -509,10 +516,10 @@ async function main() {
     ok(after.pi === before.pi && after.c === before.c && after.p === before.p,
       `B: NO state consumed (invite intact, no contact registered)`);
     // The same invite redeems fine once the peer "updates" (proves not consumed).
-    await mutate(VL, '::actor::qa_send_versioned_leg1', { invite: binv(VL, blobV4), shape: 'v3', name: 'UpdatedPeer' });
+    await mutate(VLU, '::actor::qa_send_versioned_leg1', { invite: binv(VLU, blobV4), shape: 'v3', name: 'UpdatedPeer' });
     await sleep(4000);
     ok(st(VI).pi === before.pi - 1, `B: SAME invite redeems after the peer updates (invite was not consumed)`);
-    ok(nameOfContact(VI, VL.cid) === 'UpdatedPeer', `B: post-update redeem registered the contact normally`);
+    ok(nameOfContact(VI, VLU.cid) === 'UpdatedPeer', `B: post-update redeem registered the contact normally`);
   }
 
   // NOTE: V5 CAP-1 (the notify client's capability gate — notify_register denied
