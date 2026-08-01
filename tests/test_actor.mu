@@ -67,6 +67,10 @@ application actor loads libraries
         // Receipt consumer log (core 0.7.0) — the driver's RC-series probe.
         receipts_log is any[] = [].
 
+        // core 0.13 TEST-ONLY probe ephemerals (cross-redeemer leg-1 isolation).
+        // Hidden and fixture-local: never exported, never reachable from production.
+        qa_leg1_keys is (str ->> secretkey_encrypt) = (,).
+
         // Storage hooks: deposit inbound messages; send/remove are no-ops.
         a2a_messaging::init (
             $_read_or_abort -> _read_or_abort,
@@ -422,6 +426,189 @@ application actor loads libraries
                 _return_data ($sent -> TRUE)
             ].
         }).
+    }
+
+    // ---- core 0.13 bilateral-removal QA (security regressions) ----
+    // ARRANGE an epoch pin for `cid`, standing in for a completed migration. Same
+    // pattern the V7 series already uses to arrange v2-era state (qa_set_contact_pv /
+    // qa_set_contact_caps): driving the full migration FSM between two born-DR nodes
+    // is not reachable in a fixture (mig_should_trigger refuses born-DR contacts by
+    // design), and what the barrier under test keys off is precisely the presence of
+    // contact_e2e_epoch. The BYTES are arbitrary — nothing in the barrier reads them.
+    trn qa_set_e2e_epoch _:($cid -> cid: global_id, $epoch -> ep: bin, $session_id -> sid: bin)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::contact_e2e_epoch cid -> ($epoch -> ep, $session_id -> sid).
+        a2a_messaging::contact_e2e_seen cid -> TRUE.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    // THE DOWNGRADE ATTACK: push a contact-removal notice over the LEGACY encrypted
+    // channel. Against a peer that is epoch-pinned to me this must be refused —
+    // purging nothing and clearing no pin.
+    trn qa_send_legacy_crm _:($target -> tgt: global_id, $reason -> reason: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return encrypted_channel::execute_transaction tgt (fn (_) -> transaction::results::type {
+            return transaction::success [
+                encrypted_channel::send_encrypted_tx tgt (
+                    $name -> "::a2a_messaging::receive_contact_removal",
+                    $targ -> ($reason -> reason, $pv -> 9)
+                ),
+                _return_data ($sent -> TRUE)
+            ].
+        }).
+    }
+
+    // FORGERY: the same notice as a BARE, UNENCRYPTED send. check_encrypted_or_abort
+    // must reject it before any state is touched.
+    trn qa_send_bare_crm _:($target -> tgt: global_id, $reason -> reason: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return transaction::success [
+            transaction::action::send tgt (
+                $name -> "::a2a_messaging::receive_contact_removal",
+                $targ -> ($reason -> reason, $pv -> 9)
+            ),
+            _return_data ($sent -> TRUE)
+        ].
+    }
+
+    // Typed test-only mint seam: compilation and transaction argument validation
+    // prove that invite mode is the same closed enum all the way into the shared
+    // construction helper (rather than an integer/string flag at this boundary).
+    trn qa_mint_mode_invite _:($mode -> mode: a2a_protocol::invite_mode_t)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        minted = a2a_messaging::mint_eph_invite "" mode.
+        return transaction::success [
+            _return_data ($invite -> (minted $blob), $invite_id -> (minted $invite_id)),
+            _save_state NIL
+        ].
+    }
+
+    // Decode the real invite blob through invite_eph_t and surface its enum. This
+    // checks that the mode did not become an untyped integer/string on the wire.
+    trn readonly qa_read_invite_mode _:($invite -> invite_blob: bin)
+    {
+        inv = (_read_or_abort invite_blob) safe a2a_protocol::invite_eph_t.
+        return ($mode -> (a2a_protocol::normalize_invite_mode (inv $m))).
+    }
+
+    // ---- core 0.13 cross-redeemer leg-1 confidentiality QA ----
+    // TEST-ONLY, AND DELIBERATELY ONLY HERE. These probes hand back raw leg-1
+    // ciphertext and attempt decryption with a CHOSEN ephemeral. They exist to produce
+    // NEGATIVE evidence (a wrong-key open must FAIL) and are confined to this QA
+    // fixture: actor.mu, the production unit, defines none of them, they are not
+    // reachable from any advertised capability or MCP tool, and the driver asserts
+    // that invoking them on a production packet fails.
+    //
+    // WHY THE PROBE KEYS STAND IN FOR pending_redemption_keys: that store is `hidden`
+    // in a2a_messaging, so only that library can read it. Exposing a peek would put a
+    // secret-reading accessor into the PRODUCTION core purely for a test — a strictly
+    // worse trade than this. The property under test is unaffected: each redeemer
+    // boxes with an INDEPENDENT ephemeral of its own, so "B's ephemeral cannot open
+    // A's box" is a property of the key pairing, not of which store holds the key.
+    // The boxes are built against the REAL published invite's ephemeral pubkey.
+
+    // Mint a probe ephemeral under `tag`; returns only its PUBLIC half.
+    trn qa_mint_probe_key _:($tag -> tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        kp = _crypto_construct_encryption_keypair (_crypto_default_scheme_id()).
+        qa_leg1_keys tag -> (kp $secret_key).
+        return transaction::success [ _return_data ($pub -> (kp $public_key)), _save_state NIL ].
+    }
+
+    // Build a leg-1-shaped box to `to_pub` with a FRESH sender ephemeral, exactly as
+    // add_contact boxes its identity bundle to the invite's ephemeral pubkey. Returns
+    // what travels on the wire ($epk + $data). Nothing is sent: the isolation property
+    // is a property of the box, not of delivery.
+    trn qa_leg1_box _:($to_pub -> to_pub: publickey_encrypt, $tag -> tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        kp = _crypto_construct_encryption_keypair (_crypto_default_scheme_id()).
+        payload = _write ($probe -> tag).
+        data = _crypto_encrypt_message (kp $secret_key) to_pub payload.
+        return transaction::success [
+            _return_data ($epk -> (kp $public_key), $data -> data),
+            _save_state NIL
+        ].
+    }
+
+    // Attempt to open `data` with the ephemeral stored under `key_tag`.
+    // _crypto_decrypt_message ABORTS on a wrong key, so a failed open surfaces to the
+    // driver as a REJECTED transaction — which is the negative evidence being sought.
+    // A successful open resolves and echoes the probe marker, proving it really opened
+    // the intended plaintext rather than merely not crashing.
+    trn qa_try_open_leg1 _:($epk -> epk: publickey_encrypt, $data -> data: crypto_message, $key_tag -> key_tag: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        sk = qa_leg1_keys key_tag abort "qa_try_open_leg1: no such probe key" WHEN IS NIL.
+        pt = _crypto_decrypt_message sk? epk data.
+        iv2 = key_storage::read_external pt.
+        marker is str = "".
+        if (iv2 $probe) != NIL { marker -> (iv2 $probe) safe str. }
+        return transaction::success [ _return_data ($opened -> TRUE, $marker -> marker) ].
+    }
+
+    // Report what a published invite blob actually carries, so the driver can assert
+    // it exposes only the PUBLIC ephemeral half — nothing able to open a leg-1 box.
+    trn readonly qa_invite_fields _:($invite -> blob: bin)
+    {
+        inv = (_read_or_abort blob) safe a2a_protocol::invite_eph_t.
+        return ($has_pub -> ((inv $k) != NIL), $eph_pub -> (inv $k), $mode -> (inv $m), $raw -> (_read_or_abort blob)).
+    }
+
+    // ---- core 0.13 contact_origin export/import QA ----
+    // Import a MINIMAL legacy-shaped core blob that has NO $contact_origin at all —
+    // the pre-0.13 case. Everything import_core_state treats as mandatory is present.
+    trn qa_import_legacy_core _
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::import_core_state (
+            $my_name -> "LegacyImported",
+            $contacts -> (,),
+            $peer_ads -> (,)
+        ).
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
+    }
+
+    // Import a core blob whose $contact_origin is HOSTILE: a wrong-typed $via on one
+    // entry, an unknown extra field on another, and one well-formed entry. The import
+    // must not abort, and the well-formed entry must survive.
+    // Every malformed shape the guard must survive, in ONE blob so a single import
+    // proves the whole class degrades rather than aborting. Keys are also placed in
+    // $contacts, because the rebuild draws its keys from there (trusted) rather than
+    // from the untrusted provenance map.
+    //   good      — well-formed, PLUS an unknown extra field (must be stripped)
+    //   bad_via   — wrong-typed $via (int)                       -> entry dropped
+    //   bad_at    — wrong-typed $at (str, not a time)            -> entry dropped
+    //   bad_iid   — non-hex $invite_id (would abort `safe global_id`) -> KEPT, label dropped
+    //   no_at     — missing $at entirely                          -> entry dropped
+    trn qa_import_hostile_origin _:($good_cid -> good: global_id, $bad_cid -> bad: global_id, $at_cid -> atc: global_id, $iid_cid -> iidc: global_id, $noat_cid -> noatc: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        now = (current_transaction_info::get_transaction_time())?.
+        a2a_messaging::import_core_state (
+            $my_name -> "HostileImported",
+            $contacts -> (
+                good  -> ($name -> "Good",   $container_id -> good),
+                bad   -> ($name -> "BadVia", $container_id -> bad),
+                atc   -> ($name -> "BadAt",  $container_id -> atc),
+                iidc  -> ($name -> "BadIid", $container_id -> iidc),
+                noatc -> ($name -> "NoAt",   $container_id -> noatc)
+            ),
+            $peer_ads -> (,),
+            $contact_origin -> (
+                bad   -> ($via -> 12345, $at -> now),
+                atc   -> ($via -> "invite_public", $at -> "not-a-time"),
+                iidc  -> ($via -> "invite_one_time", $at -> now, $invite_id -> "zzzz-not-hex-!!"),
+                noatc -> ($via -> "invite_public"),
+                good  -> ($via -> "invite_public", $at -> now, $unknown_extra -> "ignored-by-the-rebuild")
+            )
+        ).
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
     }
 
     // ---- core 0.7.0 receipts QA (RC-series) ----

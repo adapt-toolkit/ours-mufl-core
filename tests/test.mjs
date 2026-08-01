@@ -58,6 +58,7 @@ async function main() {
   console.log('\n=== T1 happy-flat ===');
   let m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'TheResponder' });
   const blob1 = Buffer.from(m.Reduce('invite').GetBinary());
+  ok(m.Reduce('mode').Visualize() === 'one_time', `absent mode defaults to the $one_time enum`);
   ok(st(I).pi === 1, `inviter has 1 pending_invite after mint`);
   await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob1), name: 'MyInviter' });
   await sleep(5000);
@@ -124,6 +125,53 @@ async function main() {
     const ifs = ro(I, '::actor::list_incoming_files', undefined).Visualize();
     ok(/answer\.bin/.test(ifs) && new RegExp(msgWireIR).test(ifs),
       `a send_file can reply_to a MESSAGE's wire_id (cross-kind, shared namespace)`);
+  }
+
+  // ---------- T2b invite-mode enum + public reuse/revocation ----------
+  CUR = 'T2b invite-mode enum';
+  console.log('\n=== T2b invite-mode enum + public reuse/revocation ===');
+  {
+    const PI = mk('PI'); const PA = mk('PA'); const PB = mk('PB'); const PC = mk('PC');
+    await mkPacket(PI, 'mode-inviter-01'); await mkPacket(PA, 'mode-a-02');
+    await mkPacket(PB, 'mode-b-03'); await mkPacket(PC, 'mode-c-04');
+    await sleep(1200);
+    await setName(PI, 'PublicInviter'); await setName(PA, 'PublicA');
+    await setName(PB, 'PublicB'); await setName(PC, 'PublicC');
+
+    const pub = await mutate(PI, '::a2a_messaging::generate_invite', { mode: 'public' });
+    const pubBlob = Buffer.from(pub.Reduce('invite').GetBinary());
+    const pubId = pub.Reduce('invite_id').Visualize();
+    ok(pub.Reduce('mode').Visualize() === 'public' && isT(pub.Reduce('reusable').Visualize()),
+      `generate_invite accepts and returns the $public enum`);
+    ok(ro(PI, '::actor::qa_read_invite_mode', { invite: binv(PI, pubBlob) }).Reduce('mode').Visualize() === 'public',
+      `invite_eph_t carries $public as the typed wire enum`);
+    const listed = ro(PI, '::a2a_messaging::list_invites', undefined).Visualize();
+    ok(new RegExp(pubId).test(listed) && /public/.test(listed),
+      `pending state + list_invites preserve the $public enum`);
+
+    await mutate(PA, '::a2a_messaging::add_contact', { invite: binv(PA, pubBlob) });
+    await mutate(PB, '::a2a_messaging::add_contact', { invite: binv(PB, pubBlob) });
+    await sleep(5000);
+    ok(new RegExp(PA.cid).test(lc(PI)) && new RegExp(PB.cid).test(lc(PI)),
+      `two distinct peers redeem the same $public invite`);
+    ok(st(PI).pi === 1, `$public redemption retains the authoritative pending invite`);
+
+    const beforeInvalid = st(PI).pi;
+    let invalidRejected = false;
+    try { await mutate(PI, '::a2a_messaging::generate_invite', { mode: 'future_mode' }); }
+    catch (e) { invalidRejected = /value set|match|mode|argument|cast/i.test(String(e)); }
+    ok(invalidRejected && st(PI).pi === beforeInvalid,
+      `unknown present mode is rejected by the closed enum with no invite minted`);
+
+    const revoked = await mutate(PI, '::a2a_messaging::revoke_invite', { invite_id: pubId });
+    ok(isT(revoked.Reduce('revoked').Visualize()) && isT(revoked.Reduce('was_public').Visualize()),
+      `revoke_invite reports the stored $public enum`);
+    ok(st(PI).pi === 0, `revocation removes the reusable invite`);
+    const rejBefore = PI.rejects.length;
+    await mutate(PC, '::a2a_messaging::add_contact', { invite: binv(PC, pubBlob) });
+    await sleep(3000);
+    ok(PI.rejects.slice(rejBefore).some((x) => /already-redeemed|Unknown or already/.test(x)) &&
+       !new RegExp(PI.cid).test(lc(PC)), `revoked $public invite cannot admit another peer`);
   }
 
   // ---------- T3 single-use (reuse blob1, already consumed) ----------
@@ -539,8 +587,8 @@ async function main() {
     await sleep(2500);
     ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(R, I.cid) === '8', `responder learned contact_pv=8 (wire-8 leg-3 + stamped messages)`);
-    ok(pvOf(I, R.cid) === '8', `inviter learned contact_pv=8 (real current-build leg-1)`);
+    ok(pvOf(R, I.cid) === '9', `responder learned contact_pv=9 (wire-9 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '9', `inviter learned contact_pv=9 (real current-build leg-1)`);
   }
 
   // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
@@ -562,14 +610,14 @@ async function main() {
     await sleep(2500);
     ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `post-upgrade stamped message delivered`);
-    ok(pvOf(I, R.cid) === '8', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→8 (ongoing learning)`);
+    ok(pvOf(I, R.cid) === '9', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→9 (ongoing learning)`);
     // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
     await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
     await sleep(2500);
     ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `legacy (pre-wire_id, unstamped) message still delivers`);
-    ok(pvOf(I, R.cid) === '8', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(pvOf(I, R.cid) === '9', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
     ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
       `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
   }

@@ -74,6 +74,9 @@ library a2a_messaging loads libraries
     // core 0.7.0 receipts inbound (LIBRARY-routed, new surface, no legacy
     // listeners; reachable only behind positive core.receipts.* caps).
     receive_receipt_tx         = "::a2a_messaging::receive_receipt".
+    // core 0.13 bilateral contact removal (LIBRARY-routed, new surface, no legacy
+    // listeners; emission gated fail-closed on core.contact.removal / pv >= 9).
+    receive_contact_removal_tx = "::a2a_messaging::receive_contact_removal".
     // core 0.9.0 E2E-migration inbound (LIBRARY-routed, wire 9). offer/ack ride the
     // legacy encrypted_channel; commit/confirm are inner txs on the fresh e2e session.
     e2e_migrate_offer_tx       = "::a2a_messaging::e2e_migrate_offer".
@@ -218,13 +221,37 @@ library a2a_messaging loads libraries
     // encryption PUBLIC key shipped in the slim invite, and the crypto scheme id.
     // The matching ephemeral PRIVATE key lives in the hidden, non-exported
     // pending_invite_keys store (INV-4) and is consumed together on first redeem.
-    metadef pending_invite_t: ($assigned -> str, $eph_pub -> publickey_encrypt, $scheme -> int).
+    // core 0.13: $mode makes the one-time-vs-public distinction EXPLICIT and
+    // INVITER-SIDE-AUTHORITATIVE. It is nullable purely for import compatibility
+    // (a pre-0.13 record has no such field) and a NIL reads as one-time — the
+    // safe default, because treating every legacy invite as reusable would turn
+    // it into a bearer credential that never expires. A present value is the
+    // closed invite_mode_t enum. See invite_mode_one_time / invite_mode_public
+    // in a2a_protocol.
+    // NOTE the mode lives HERE, in the inviter's own state, not (only) in the
+    // blob: the reuse decision at leg 2 is read from this record, never from
+    // anything the redeemer sends, so a redeemer cannot promote a one-time
+    // invite to reusable by editing the copy it holds.
+    metadef pending_invite_t: ($assigned -> str, $eph_pub -> publickey_encrypt, $scheme -> int, $mode -> a2a_protocol::invite_mode_t+, $created -> time+).
     pending_invites is (global_id ->> pending_invite_t) = (,).
+    // core 0.13: HOW each contact entered my book, keyed by contact cid. Pure
+    // provenance — nothing in this core reads it to make a decision. It exists so
+    // a LATER trust layer can mark contacts that walked in through a publicly
+    // posted reusable invite as unknown/unstarred without having to guess after
+    // the fact (the information is unrecoverable once the invite is gone). The
+    // future trust UI/policy is deliberately NOT implemented here.
+    // $via: one of the origin_* constants in a2a_protocol. $invite_id: the invite
+    // it came through (NIL for non-invite paths). $at: first-registration time.
+    contact_origin is (global_id ->> a2a_protocol::contact_origin_t) = (,).
     // core 3.0: responder-side pending redemptions, keyed by invite id — who I am
     // redeeming, so leg 3 (complete_invite) can name the contact and pin the
     // expected inviter cid. No secrets; transient (not exported — outstanding
     // invites do not survive a restart; see the 3.0 release note).
-    metadef pending_redemption_t: ($inviter_cid -> global_id, $inviter_name -> str, $custom_name -> str).
+    // $mode (core 0.13, nullable for pre-0.13 in-flight records): the invite mode as
+    // ADVERTISED by the blob I redeemed, carried here so leg 3 can record symmetric
+    // provenance ("I got in through a publicly posted invite"). Advisory metadata
+    // only — the responder cannot verify the inviter's claim, and nothing gates on it.
+    metadef pending_redemption_t: ($inviter_cid -> global_id, $inviter_name -> str, $custom_name -> str, $mode -> a2a_protocol::invite_mode_t+).
     pending_redemptions is (global_id ->> pending_redemption_t) = (,).
     // contact-restore (spec 2026-07-01): a DEGRADED contact is derivable state —
     // cid present in `contacts`, absent from `peer_ads` (e.g. a breaking-change
@@ -1617,13 +1644,18 @@ library a2a_messaging loads libraries
     // no root profile (those move to the encrypted two-message redeem hop). No role
     // branch: roles emit the same slim shape. Side effect: registers both stores; the
     // CALLER must emit _save_state. Returns the _write'd blob + its invite_id.
-    fn mint_eph_invite (assigned: str) -> ($blob -> bin, $invite_id -> global_id)
+    // core 0.13: `mode` is the a2a_protocol::invite_mode_t enum. It is recorded
+    // in the inviter's OWN pending_invites record (the
+    // authoritative copy, read at leg 2) and mirrored into the blob's advisory $m
+    // so the redeemer can see how it is being let in.
+    fn mint_eph_invite (assigned: str, mode: a2a_protocol::invite_mode_t) -> ($blob -> bin, $invite_id -> global_id)
     {
         scheme = _crypto_default_scheme_id().
         kp = _crypto_construct_encryption_keypair scheme.
         invite_id = _new_id "ours invite".
+        now = (current_transaction_info::get_transaction_time())?.
 
-        pending_invites invite_id -> ($assigned -> assigned, $eph_pub -> (kp $public_key), $scheme -> scheme).
+        pending_invites invite_id -> ($assigned -> assigned, $eph_pub -> (kp $public_key), $scheme -> scheme, $mode -> mode, $created -> now).
         pending_invite_keys invite_id -> (kp $secret_key).
 
         my_ad = address_document::get_my_address_document().
@@ -1633,26 +1665,85 @@ library a2a_messaging loads libraries
             $n -> my_name,
             $k -> (kp $public_key),
             $v -> scheme,
-            $iv -> invite_current_version
+            $iv -> invite_current_version,
+            $m -> mode
         ).
         return ($blob -> (_write invite), $invite_id -> invite_id).
     }
 
-    trn generate_invite _:($name -> name: str+)
+    // $mode (core 0.13, OPTIONAL enum): $public for a perpetual reusable invite
+    // you can post openly, or $one_time for the historical behavior. Absent ⇒
+    // one-time is the compatibility-preserving default and the safe one: every
+    // existing caller keeps minting exactly the invite it minted before. Because
+    // this is a closed ADAPT enum, any other present value is rejected at the API
+    // boundary rather than silently selecting a mode.
+    trn generate_invite _:($name -> name: str+, $mode -> mode_ref: a2a_protocol::invite_mode_t+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         // Empty string is the "no assigned name" sentinel: accept_contact then
         // registers the joiner under its self-announced name instead.
         assigned = (name == NIL ?? "" ; name?).
-        minted = mint_eph_invite assigned.
+        mode is a2a_protocol::invite_mode_t = (mode_ref == NIL ?? a2a_protocol::invite_mode_one_time ; mode_ref?).
+        // A PUBLIC invite with an assigned name is a contradiction worth refusing
+        // rather than silently resolving: the assigned name would be applied to
+        // EVERY redeemer, so a hundred strangers would all land in the book under
+        // one name and overwrite each other's entry. Public invites always register
+        // redeemers under the name they announce.
+        abort "A public invite cannot pre-assign a contact name — every redeemer would be registered under it. Omit `name` for a public invite." when mode == a2a_protocol::invite_mode_public && assigned != "".
+        minted = mint_eph_invite assigned mode.
         return transaction::success [
             _return_data (
                 $invite     -> (minted $blob),
                 $invite_id  -> (minted $invite_id),
-                $peer_name  -> assigned
+                $peer_name  -> assigned,
+                $mode       -> mode,
+                // A public invite is never consumed, so revocation is the ONLY way
+                // to close it. Surfaced on creation so the caller records the id.
+                $reusable   -> (mode == a2a_protocol::invite_mode_public)
             ),
             _save_state NIL
         ].
+    }
+
+    // core 0.13: close an outstanding invite. THE control for a public invite,
+    // which has no expiry and is never consumed by redemption — without this a
+    // posted blob would be irrevocable. Idempotent: revoking an unknown or
+    // already-revoked/consumed id succeeds with $revoked -> FALSE rather than
+    // aborting, so a caller retrying after a crash cannot be told it failed.
+    // Consumes BOTH halves, exactly as a leg-2 redemption does.
+    trn revoke_invite _:($invite_id -> invite_ref: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        rec = pending_invites invite_ref.
+        if rec == NIL
+        {
+            return transaction::success [ _return_data ($revoked -> FALSE, $invite_id -> invite_ref) ].
+        }
+        was_public = (a2a_protocol::normalize_invite_mode (rec? $mode)) == a2a_protocol::invite_mode_public.
+        delete pending_invites invite_ref.
+        if (pending_invite_keys invite_ref) != NIL { delete pending_invite_keys invite_ref. }
+        return transaction::success [
+            _return_data ($revoked -> TRUE, $invite_id -> invite_ref, $was_public -> was_public),
+            _save_state NIL
+        ].
+    }
+
+    // Outstanding invites I minted (readonly). Exposes the mode + assigned name so a
+    // client can show which blobs are still live and revoke them. Carries NO key
+    // material: $eph_pub is the PUBLIC half already on the wire in the blob, and the
+    // private half lives in the hidden store this never reads.
+    trn readonly list_invites _
+    {
+        out is (global_id ->> ($assigned -> str, $mode -> a2a_protocol::invite_mode_t, $created -> time+)) = (,).
+        sc pending_invites -- (iid -> rec)
+        {
+            out iid -> (
+                $assigned -> (rec $assigned),
+                $mode -> (a2a_protocol::normalize_invite_mode (rec $mode)),
+                $created -> (rec $created)
+            ).
+        }
+        return out.
     }
 
     // core 3.0 LEG 1 (responder): redeem a slim ephemeral invite. Generate a
@@ -1709,7 +1800,9 @@ library a2a_messaging loads libraries
         // Remember who I am redeeming (name + expected inviter cid; no secrets) and
         // KEEP my ephemeral private key (secret store) so leg 3 can be opened.
         contact_name = (custom_name == NIL ?? "" ; custom_name?).
-        pending_redemptions invite_id -> ($inviter_cid -> inviter_cid, $inviter_name -> inviter_name, $custom_name -> contact_name).
+        // Advisory mode from the blob (NIL on a pre-0.13 invite ⇒ one-time).
+        redeemed_mode = a2a_protocol::normalize_invite_mode (inv $m).
+        pending_redemptions invite_id -> ($inviter_cid -> inviter_cid, $inviter_name -> inviter_name, $custom_name -> contact_name, $mode -> redeemed_mode).
         pending_redemption_keys invite_id -> (kpr $secret_key).
 
         // BARE send (NOT send_encrypted_tx): the inviter is not registered, so the
@@ -1951,22 +2044,89 @@ library a2a_messaging loads libraries
         }).
     }
 
-    trn remove_contact _:($contact -> contact_ref: str)
+    // ---- bilateral contact removal (core 0.13) -------------------------------
+    // Send-side gate for the removal NOTICE, fail-CLOSED in the receipts polarity:
+    // emit only on POSITIVE evidence that the peer understands the transaction
+    // (it advertises core.contact.removal), with the caps-silent fallback of a
+    // learned dialect >= 9 so two upgraded peers self-heal without re-pairing
+    // (contact_caps only refreshes on invite/restore legs, contact_pv on every
+    // stamped message — the exact stale-caps hole the receipts single-tick bug hit).
+    // A pre-0.13 peer therefore never receives an unknown control transaction.
+    // REG-6: this gates EMISSION only, never authorization.
+    fn contact_removal_gate (peer: global_id) -> bool
     {
-        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if a2a_capabilities::self_advertises a2a_capabilities::cap_contact_removal != TRUE { return FALSE. }
+        caps = contact_caps peer.
+        if caps != NIL && (_count (caps?)|) > 0
+        {
+            return caps_contains (caps?) a2a_capabilities::cap_contact_removal.
+        }
+        pv = contact_pv peer.
+        return pv != NIL && pv? >= 9.
+    }
 
-        target_id = resolve_contact contact_ref.
-        // Guard the monitoring invariant "monitoring_proxy != NIL ⇒ the proxy is a
-        // registered contact": removing the bound control plane would leave a
-        // dangling monitoring_proxy, so the next send_message's forced copy would
-        // fire send_encrypted_tx at an unregistered peer and ABORT the user's send —
-        // and disable_monitoring is CP-only, so with the CP gone there is no
-        // recovery (all messaging bricked). Block the removal instead; this is NOT
-        // an app-callable clear (removal is refused, monitoring is not switched off).
-        abort "Cannot remove the bound control plane while monitoring is active — the control plane must disable monitoring first." when monitoring_proxy != NIL && target_id == (monitoring_proxy? $proxy_cid).
-        removed = contacts target_id.
-        removed_name = removed? $name.
+    // Clear the monitoring binding if `sid` IS the bound proxy. Shared by the
+    // core.monitoring `disable` verb handler AND by apply_peer_removal_actions (a
+    // bound control plane that removes ME must not stay bound). Returns TRUE iff
+    // disabled. Defined here rather than beside the other proxy-ceremony fns purely
+    // because mufl requires define-before-use.
+    fn do_disable_monitoring (sid: global_id) -> bool
+    {
+        if monitoring_proxy == NIL { return FALSE. }
+        if sid != (monitoring_proxy? $proxy_cid) { return FALSE. }
+        monitoring_proxy -> NIL.
+        proxy_pending -> NIL.
+        return TRUE.
+    }
 
+    // THE removal primitive: drop the CONTACT-LAYER state and the queued PLAINTEXT
+    // for `target_id`. The CALLER decides whether to also emit the peer notice and
+    // what to return/notify. Split out of the remove_contact trn deliberately so a
+    // future room-close can invoke it once per participant — that caller does NOT
+    // exist yet and is NOT implemented here.
+    //
+    // THIS IS NOT A HARD PURGE AND DOES NOT LEAVE "NO RESIDUE". Two classes of
+    // cryptographic material deliberately or unavoidably survive; see below. Callers
+    // and docs must not claim otherwise.
+    //
+    // EXPLICIT DROP-LIST: every store below is named literally. It is NOT derived by
+    // iterating `contacts` and keeping what matches, because such a keep-list would
+    // also delete the entries of peers who are legitimately mid-handshake (pending
+    // redemptions, in-flight restores, migration FSM entries for a contact not yet
+    // registered) — those are keyed by cid but are NOT contacts yet.
+    //
+    // RETAINED ON PURPOSE — the e2e ANTI-DOWNGRADE PINS (contact_e2e_seen,
+    // contact_e2e_epoch, contact_born_dr). These are irreversible, monotone evidence
+    // that this cid once proved it speaks e2e, and they are what stops a later
+    // silent downgrade. Removal must NOT clear them, because removal is triggerable
+    // by the PEER (receive_contact_removal): clearing them there would let a peer
+    // that can reach the legacy channel erase the very evidence that forbids the
+    // legacy channel. An EARLIER revision of this function cleared them, justified by
+    // "retaining them bricks a re-add (epoch-pinned with no live session ⇒
+    // downgrade_refused forever)". THAT JUSTIFICATION IS FALSE and the claim is
+    // retracted here: e2e_route's epoch branch is
+    //     if peer_has_e2e_bundle cid { return "e2e". } return "downgrade_refused".
+    // and peer_has_e2e_bundle reads peer_ads[cid], which a re-add RESTORES from the
+    // fresh handshake AD. So a re-added v2 peer routes "e2e" with the pin intact;
+    // "downgrade_refused" fires only for a peer presenting no e2e bundle, which is
+    // exactly when refusing is correct. There is no brick, so there was never
+    // anything to trade the pins for.
+    //
+    // CLEARED — mig_deferred (queued PLAINTEXT app data, the same class as
+    // deferred_msgs / unacked_e2e, which the pre-existing code already cleared) and
+    // contact_migration (transient FSM; the migration sweep iterates `contacts`, so
+    // an entry for a non-contact is inert either way — this is cleanup, not security).
+    //
+    // NOT purged (unavoidable residual, NOT a regression): the cid-keyed Olm session
+    // pickle inside the adapt `e2e` library. That library exposes no per-cid session
+    // drop (only discard_rotation, which clears the STAGED slot), so the live
+    // ratchet for a removed peer survives in packet state and in the exported
+    // $e2e_sessions blob. This matches remove_contact's long-standing documented
+    // contract ("a contacts-layer forget, NOT a key wipe") but it does mean a true
+    // key wipe needs an upstream addition to the toolkit stdlib. Surfaced as
+    // $key_material_retained on the removal result so no caller can mistake it.
+    fn purge_contact_state (target_id: global_id) -> nil
+    {
         delete contacts target_id.
         if (import_renames target_id) != NIL { delete import_renames target_id. }
         if peer_ads target_id != NIL { delete peer_ads target_id. }
@@ -1986,17 +2146,160 @@ library a2a_messaging loads libraries
         if (delivered_wire target_id) != NIL { delete delivered_wire target_id. }
         if (rekey_pending target_id) != NIL { delete rekey_pending target_id. }
         if (rekey_served target_id) != NIL { delete rekey_served target_id. }
+        if (ad_response_last target_id) != NIL { delete ad_response_last target_id. }
         if (pending_restores target_id) != NIL { delete pending_restores target_id. }
         if (pending_restore_keys target_id) != NIL { delete pending_restore_keys target_id. }
         if (pending_restore_replies target_id) != NIL { delete pending_restore_replies target_id. }
         if (pending_restore_reply_keys target_id) != NIL { delete pending_restore_reply_keys target_id. }
+        // core 0.13: transient migration FSM + its queued PLAINTEXT. The
+        // anti-downgrade pins (contact_e2e_seen / contact_e2e_epoch /
+        // contact_born_dr) are deliberately NOT touched — see the header.
+        if (contact_migration target_id) != NIL { delete contact_migration target_id. }
+        if (mig_deferred target_id) != NIL { delete mig_deferred target_id. }
+        // Provenance dies with the contact: keeping it would let a re-added peer
+        // inherit a trust marking earned by a DIFFERENT admission decision.
+        if (contact_origin target_id) != NIL { delete contact_origin target_id. }
+        // The staged (not yet committed) Olm rotation IS droppable — the live
+        // session is not (see the residual note above).
+        e2e::discard_rotation target_id.
+        return NIL.
+    }
 
-        actions is transaction::action::type[] = [].
+    // The peer-facing half: "I removed you, drop me too." Returns [] when the gate
+    // says the peer cannot parse it, so callers append blindly. Fire-and-forget —
+    // this MUST be built BEFORE purge_contact_state runs, because both routes below
+    // resolve the peer's address document.
+    //
+    // §5.6 CONTROL-LEG CARVE-OUT, ROUTED. The removal notice is control traffic, but
+    // it is NOT exempt from the app-data barrier: an epoch-pinned (migrated) peer
+    // MUST be told over the e2e session, never over the legacy box. Sending it legacy
+    // would hand an attacker who can reach the legacy channel a lever on the
+    // receiver's contact state — which is exactly the hole the receive-side barrier
+    // in handle_receive_contact_removal closes, and the two halves must agree.
+    // So the route is consulted, exactly as send_message does:
+    //   "e2e"                -> e2e-boxed inner carrying the $contact_removal marker,
+    //                           over receive_e2e_message_tx (the proven $rekey_ping
+    //                           contentless-marker pattern — same envelope, same
+    //                           authenticated session, no new wire surface).
+    //   "legacy"             -> the plain crm transaction (unmigrated pair).
+    //   "downgrade_refused" / "migrating" -> NOTHING. We cannot notify safely: legacy
+    //                           is prohibited for this peer and no committed e2e
+    //                           session is available. The caller reports $notified
+    //                           FALSE and the local removal still proceeds — an
+    //                           un-notified removal is honest, a downgraded one is not.
+    fn contact_removal_notice_actions (target_id: global_id, reason: str) -> transaction::action::type[]
+    {
+        if (contact_removal_gate target_id) != TRUE { return []. }
+        pad = peer_ads target_id.
+        if pad == NIL { return []. }
+        route = e2e_route target_id.
+        if route == "e2e"
+        {
+            epb = (((pad?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+            if epb == NIL { return []. }
+            rinner = _write ( $contact_removal -> TRUE, $reason -> reason, $pv -> a2a_versions::wire_version ).
+            eenv = e2e::encrypt_to target_id rinner epb.
+            return [ encrypted_channel::send_encrypted_tx target_id (
+                         $name -> receive_e2e_message_tx,
+                         $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
+        }
+        if route != "legacy" { return []. }
+        return [ encrypted_channel::send_encrypted_tx target_id (
+                     $name -> receive_contact_removal_tx,
+                     $targ -> ( $reason -> reason, $pv -> a2a_versions::wire_version ) ) ].
+    }
+
+    // SHARED apply half, used by BOTH inbound removal routes (the legacy crm surface
+    // and the e2e $contact_removal marker). Single implementation on purpose: the
+    // bound-control-plane transition and the pin policy must not be able to drift
+    // between the two surfaces — a guard that exists on only one of them is the same
+    // class of hole as having no guard at all.
+    //
+    // BOUND CONTROL PLANE, ATOMIC TRANSITION. The outbound trn REFUSES to remove the
+    // bound CP (that refusal is pre-existing and is retained). Inbound we cannot
+    // refuse the same way — the CP has ALREADY dropped us, so keeping it bound would
+    // leave monitoring copies addressed to a peer that is no longer a contact.
+    // Instead the binding is cleared FIRST, in the same transaction, so
+    // monitor_copy_actions self-gates to [] on every subsequent send: it returns
+    // early when monitoring_proxy == NIL, which is the DIRECT reason no copy can
+    // follow, and the only claim made here.
+    // NOTE (review L2): do NOT justify this by "a dangling proxy would abort the
+    // user's next send, so a send succeeding proves no copy was emitted". That
+    // inference does not hold — copy emission is a separate queued action, and its
+    // fate is not a reliable signal about the send. The load-bearing evidence is the
+    // binding being cleared plus the absence of any copy at the removed CP, and the
+    // regression asserts exactly those two things.
+    // This grants the CP no new power: the notice is authenticated as coming FROM
+    // that CP, and disable_monitoring is already a CP-only operation, so this is the
+    // CP exercising authority it already had — and it leaves a recoverable state (no
+    // proxy bound) rather than a dangling one.
+    // Returns the actions; the CALLER appends its own notify/save (the notice $reason is
+    // the caller's to surface — it is diagnostics, never an input to this transition).
+    fn apply_peer_removal_actions (sender_id: global_id) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        was_cp = monitoring_proxy != NIL && sender_id == (monitoring_proxy? $proxy_cid).
+        if was_cp
+        {
+            do_disable_monitoring sender_id.
+            acts (_count acts|) -> _notify_agent ($event -> $monitoring_disabled, $cid -> sender_id, $cause -> $control_plane_removed_contact).
+        }
+        purge_contact_state sender_id.
+        sc on_contact_removed ($container_id -> sender_id) -- ( -> a)
+        {
+            acts (_count acts|) -> a.
+        }
+        return acts.
+    }
+
+    trn remove_contact _:($contact -> contact_ref: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+
+        target_id = resolve_contact contact_ref.
+        // Guard the monitoring invariant "monitoring_proxy != NIL ⇒ the proxy is a
+        // registered contact": removing the bound control plane would leave a
+        // dangling monitoring_proxy, so the next send_message's forced copy would
+        // fire send_encrypted_tx at an unregistered peer and ABORT the user's send —
+        // and disable_monitoring is CP-only, so with the CP gone there is no
+        // recovery (all messaging bricked). Block the removal instead; this is NOT
+        // an app-callable clear (removal is refused, monitoring is not switched off).
+        abort "Cannot remove the bound control plane while monitoring is active — the control plane must disable monitoring first." when monitoring_proxy != NIL && target_id == (monitoring_proxy? $proxy_cid).
+        removed = contacts target_id.
+        removed_name = removed? $name.
+
+        // Build the peer notice FIRST — it needs peer_ads, which the purge deletes.
+        // Whether it was actually built is reported back so the caller can tell the
+        // user the truth about what happened remotely (see $notified below).
+        notice = contact_removal_notice_actions target_id "user".
+        notified = (_count notice|) > 0.
+
+        purge_contact_state target_id.
+
+        actions is transaction::action::type[] = notice.
         sc on_contact_removed ($container_id -> target_id) -- ( -> a)
         {
             actions (_count actions|) -> a.
         }
-        actions (_count actions|) -> _return_data ($removed -> removed_name, $container_id -> target_id).
+        // HONEST RESULT SHAPE. $notified says only that a notice was QUEUED to the
+        // transport, never that the peer applied it: this is a fire-and-forget send
+        // over a relay broker with no acknowledgement, and — unlike ordinary message
+        // traffic — it CANNOT be redriven, because the redrive machinery is keyed by
+        // contact and we just deleted the contact. If the peer is offline and the
+        // broker drops the packet, the removal is local-only and nothing will retry.
+        // $notified FALSE means we deliberately sent nothing: either the peer does
+        // not advertise core.contact.removal (a pre-0.13 client) or it is degraded
+        // (no address document to send to). Callers MUST NOT render either case as
+        // "the peer removed you".
+        actions (_count actions|) -> _return_data (
+            $removed -> removed_name,
+            $container_id -> target_id,
+            $notified -> notified,
+            // The removal is a contacts-layer purge, not a key wipe: the adapt e2e
+            // library exposes no per-cid session drop, so the Olm ratchet for this
+            // peer survives. Surfaced, never silent.
+            $key_material_retained -> TRUE
+        ).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -2032,6 +2335,84 @@ library a2a_messaging loads libraries
         ].
     }
 
+    // The INBOUND half of bilateral removal: my contact told me it removed me.
+    //
+    // AUTHORIZATION IS THE ENVELOPE, AND ONLY THE ENVELOPE. The removed party is
+    // `sender_id` — the channel-authenticated $from — so this transaction can only
+    // ever make the sender forget itself. There is deliberately no target field to
+    // aim: a peer cannot use this to evict a third party from my book, which is the
+    // whole reason the notice is a protocol operation rather than an unauthenticated
+    // hint. check_encrypted_or_abort keeps it on the established channel (an
+    // unencrypted forgery is rejected before any state is touched).
+    //
+    // IDEMPOTENT AND REPLAY-SAFE BY CONSTRUCTION: the operation is "ensure this
+    // sender is absent". A duplicate, a replay, or a notice from someone who was
+    // never my contact all converge on the same state and all return success — so
+    // no replay ledger is needed, and a crossed removal (both sides remove at once)
+    // simply has each side apply a no-op to state it already reached.
+    fn handle_receive_contact_removal (args: any) -> transaction::results::type
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::external,).
+        encrypted_channel::check_encrypted_or_abort().
+        sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
+
+        // Abort-free classification (M1/REG-4): a malformed notice is IGNORED with
+        // success rather than aborted — like receipts, this is best-effort control
+        // traffic and must never fail a peer's transaction.
+        if (a2a_versions::crm_shape_ok args) != TRUE
+        {
+            return transaction::success [].
+        }
+        reason is str = a2a_versions::opt_str (args $reason) "".
+
+        // §5.7 RECEIVE-SIDE DOWNGRADE REFUSAL — the same barrier handle_receive_message
+        // applies to legacy app data, and it matters MORE here. This surface deletes
+        // contact state; without the barrier, anyone able to reach the LEGACY channel of
+        // an already-migrated pair could evict themselves back out of the peer's book and
+        // (in the earlier revision that also cleared the pins) erase the very evidence
+        // that forbids the legacy channel. A migrated peer's removal notice MUST arrive
+        // over the e2e session (contact_removal_notice_actions routes it there), so a
+        // legacy one from an EPOCH-PINNED contact is a downgrade attempt: refuse it,
+        // purge NOTHING, touch NO pins, and surface it. NOT an abort — a hostile sender
+        // must not learn more from a failure than from a success.
+        // NOTE the pins are also no longer cleared on the success path at all, so this
+        // barrier is defence in depth rather than the only thing standing between a
+        // legacy forgery and the anti-downgrade evidence.
+        if (contact_e2e_epoch sender_id) != NIL
+        {
+            return transaction::success [ _notify_agent ($event -> $downgrade_refused, $cid -> sender_id, $context -> $contact_removal) ].
+        }
+
+        // NOTE there is deliberately no learn_contact_version here: the very next
+        // thing this handler does on the success path is purge contact_pv/caps for
+        // this sender, so learning the dialect would be written and immediately
+        // deleted. crm_version_of exists for the registry's sake (REG-1/REG-4), not
+        // for a store this surface is about to erase.
+        existing = contacts sender_id.
+        if existing == NIL
+        {
+            // Not (or no longer) a contact: nothing to do. Success, no state write,
+            // no notify — an unknown sender must not be able to make me emit events.
+            return transaction::success [].
+        }
+        removed_name = existing? $name.
+
+        actions is transaction::action::type[] = apply_peer_removal_actions sender_id.
+        actions (_count actions|) -> _notify_agent (
+            $event -> $contact_removed_by_peer,
+            $name -> removed_name,
+            $container_id -> sender_id,
+            $reason -> reason
+        ).
+        actions (_count actions|) -> _save_state NIL.
+        return transaction::success actions.
+    }
+
+    trn receive_contact_removal args: any
+    {
+        return handle_receive_contact_removal args.
+    }
+
     trn readonly list_contacts _
     {
         return contacts.
@@ -2047,6 +2428,37 @@ library a2a_messaging loads libraries
     trn readonly list_contact_roots _
     {
         return contact_roots.
+    }
+
+    // core 0.13: provenance per contact (readonly). Exposed so a client — and a
+    // FUTURE trust layer — can see which contacts walked in off a publicly posted
+    // invite. Read-only reporting surface; this core makes no decision from it.
+    trn readonly list_contact_origins _
+    {
+        return contact_origin.
+    }
+
+    // core 0.13: per-contact E2E ANTI-DOWNGRADE PIN state (readonly diagnostics).
+    // PRESENCE BOOLEANS ONLY — the epoch/session-id BYTES are deliberately not
+    // returned; a caller needs to know THAT a peer is pinned, never the canonical
+    // bytes. Exists so an operator (and the removal regression suite) can prove the
+    // pins survived an event that must not clear them.
+    trn readonly list_e2e_pins _
+    {
+        out is (global_id ->> ($seen -> bool, $born_dr -> bool, $epoch -> bool, $migrating -> bool)) = (,).
+        sc contact_e2e_seen -- (cid -> )
+        {
+            out cid -> ($seen -> TRUE, $born_dr -> ((contact_born_dr cid) == TRUE), $epoch -> ((contact_e2e_epoch cid) != NIL), $migrating -> ((contact_migration cid) != NIL)).
+        }
+        sc contact_e2e_epoch -- (cid -> )
+        {
+            out cid -> ($seen -> ((contact_e2e_seen cid) == TRUE), $born_dr -> ((contact_born_dr cid) == TRUE), $epoch -> TRUE, $migrating -> ((contact_migration cid) != NIL)).
+        }
+        sc contact_born_dr -- (cid -> )
+        {
+            out cid -> ($seen -> ((contact_e2e_seen cid) == TRUE), $born_dr -> TRUE, $epoch -> ((contact_e2e_epoch cid) != NIL), $migrating -> ((contact_migration cid) != NIL)).
+        }
+        return out.
     }
 
     // ---- monitoring bind ceremony (writes hidden gate state) -----------------
@@ -2119,16 +2531,10 @@ library a2a_messaging loads libraries
         return ($verified -> TRUE, $reason -> "ok", $attempts_left -> 0).
     }
 
-    // Clear the monitoring binding if `sid` IS the bound proxy. Shared by the
-    // core.monitoring `disable` verb handler. Returns TRUE iff disabled.
-    fn do_disable_monitoring (sid: global_id) -> bool
-    {
-        if monitoring_proxy == NIL { return FALSE. }
-        if sid != (monitoring_proxy? $proxy_cid) { return FALSE. }
-        monitoring_proxy -> NIL.
-        proxy_pending -> NIL.
-        return TRUE.
-    }
+    // (do_disable_monitoring was MOVED UP, above the contact-removal section — mufl
+    // requires define-before-use and apply_peer_removal_actions calls it to clear a
+    // removing control plane's binding atomically. It is unchanged; see its new home
+    // just before purge_contact_state.)
 
     trn verify_proxy_code _:($code -> code: str, $sender -> sender_ref: str)
     {
@@ -2715,8 +3121,44 @@ library a2a_messaging loads libraries
         if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
-        delete pending_invites invite_id.
-        delete pending_invite_keys invite_id.
+
+        // ---- core 0.13: consume iff ONE-TIME -------------------------------
+        // The mode is read from MY OWN pending_invites record, never from anything
+        // the redeemer sent, so a redeemer cannot promote a one-time invite to
+        // reusable. An unknown/absent mode normalizes to one-time (fail-safe).
+        //
+        // WHY REUSE IS SAFE HERE, precisely: what is retained is the invite's
+        // ephemeral keypair, and it is only ever used to OPEN leg-1 boxes addressed
+        // to it. Each redeemer boxes with its OWN fresh ephemeral (add_contact's
+        // kpr), so redeemer B cannot open redeemer A's leg-1 — the retained key is
+        // the inviter's, not a shared secret between redeemers. Leg 3 already mints
+        // a FRESH inviter ephemeral per redemption (kpi below), and the resulting
+        // contact/session state is cid-keyed, so no session, ratchet, or bundle is
+        // shared. A public invite is therefore many independent two-party
+        // handshakes that happen to start from the same published pubkey.
+        //
+        // REPLAY, stated honestly: for a public invite a replayed leg 1 from the
+        // same authenticated sender re-registers that same sender — idempotent, and
+        // semantically what a public invite means ("anyone holding this may connect,
+        // at any time"). It also means re-redemption can re-add a peer previously
+        // removed. That is the mode's contract, and revoke_invite is the control.
+        invite_mode = a2a_protocol::normalize_invite_mode (rec? $mode).
+        if invite_mode != a2a_protocol::invite_mode_public
+        {
+            delete pending_invites invite_id.
+            delete pending_invite_keys invite_id.
+        }
+        // Provenance for a FUTURE trust level (recorded once, at first admission;
+        // an existing entry is left alone so a re-redemption cannot rewrite how a
+        // contact originally got in). Nothing in this core reads it.
+        if (contact_origin sender_id) == NIL
+        {
+            contact_origin sender_id -> (
+                $via -> (invite_mode == a2a_protocol::invite_mode_public ?? a2a_protocol::origin_invite_public ; a2a_protocol::origin_invite_one_time),
+                $invite_id -> invite_id,
+                $at -> (current_transaction_info::get_transaction_time())?
+            ).
+        }
 
         // reply leg 3 as a BARE BOXED send (NOT encrypted_channel): the responder
         // has NOT registered me yet, so it could not resolve my source key to open a
@@ -2758,7 +3200,14 @@ library a2a_messaging loads libraries
             )
         ].
         sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
-        actions (_count actions|) -> _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id).
+        // $via_public_invite lets the daemon/UI distinguish a stranger who walked in
+        // off a publicly posted blob from a peer handed a one-time invite — the same
+        // distinction contact_origin persists for a future trust level. Rides the
+        // uniqueness work's register_contact result: `contact_name` is now whatever
+        // allocate_contact_name settled on, so the notify reports the name actually
+        // stored rather than the one requested.
+        actions (_count actions|) -> _notify_agent ($event -> $contact_accepted, $name -> contact_name, $container_id -> sender_id,
+                                                    $via_public_invite -> (invite_mode == a2a_protocol::invite_mode_public)).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -2826,12 +3275,26 @@ library a2a_messaging loads libraries
         if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
+        // Symmetric provenance (core 0.13): record that I got in by redeeming THEIR
+        // invite. $via is origin_invite_redeemed regardless of the advertised mode,
+        // because from THIS side the trust-relevant fact is "I chose to redeem
+        // them", not "they let me in" — and the mode is only the inviter's
+        // unverifiable claim anyway. Recorded once; never rewritten.
+        if (contact_origin sender_id) == NIL
+        {
+            contact_origin sender_id -> (
+                $via -> a2a_protocol::origin_invite_redeemed,
+                $invite_id -> invite_id,
+                $at -> (current_transaction_info::get_transaction_time())?
+            ).
+        }
         delete pending_redemptions invite_id.
         delete pending_redemption_keys invite_id.
 
         actions is transaction::action::type[] = [].
         sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
-        actions (_count actions|) -> _notify_agent ($event -> $contact_added, $name -> contact_name, $container_id -> sender_id).
+        actions (_count actions|) -> _notify_agent ($event -> $contact_added, $name -> contact_name, $container_id -> sender_id,
+                                                    $via_public_invite -> ((a2a_protocol::normalize_invite_mode ((pend?) $mode)) == a2a_protocol::invite_mode_public)).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.
     }
@@ -3495,6 +3958,34 @@ library a2a_messaging loads libraries
             pacts (_count pacts|) -> _notify_agent ($event -> $e2e_rekey, $cid -> sender_id, $role -> $healed, $session_id -> env_sid).
             pacts (_count pacts|) -> _save_state NIL.
             return transaction::success pacts.
+        }
+        // core 0.13 bilateral removal over the MIGRATED session — the correct route for
+        // an epoch-pinned pair (the legacy crm surface refuses them, §5.7). Arriving
+        // here means the notice was carried by the authenticated, decrypted e2e session,
+        // which is strictly stronger evidence than the legacy channel could give.
+        // Authorization is still the envelope and only the envelope: the removed party
+        // is `sender_id`, there is no target field, so this cannot evict a third party.
+        // Delivers NOTHING to the inbox and emits no receipt — it is control traffic.
+        if (iv $contact_removal) == TRUE
+        {
+            rm_reason is str = a2a_versions::opt_str (iv $reason) "".
+            rex = contacts sender_id.
+            if rex == NIL
+            {
+                // Idempotent: already gone (or never a contact). Success, no writes.
+                return transaction::success [].
+            }
+            rm_name = rex? $name.
+            racts2 is transaction::action::type[] = apply_peer_removal_actions sender_id.
+            racts2 (_count racts2|) -> _notify_agent (
+                $event -> $contact_removed_by_peer,
+                $name -> rm_name,
+                $container_id -> sender_id,
+                $reason -> rm_reason,
+                $route -> $e2e
+            ).
+            racts2 (_count racts2|) -> _save_state NIL.
+            return transaction::success racts2.
         }
         text = (iv $text) safe str.
         wire_id is str = "".
@@ -4736,6 +5227,8 @@ library a2a_messaging loads libraries
             $contact_advertised_caps -> contact_advertised_caps,
             $contact_e2e_seen -> contact_e2e_seen,
             $contact_born_dr -> contact_born_dr,
+            // core 0.13: contact provenance (additive; public data, no secrets).
+            $contact_origin  -> contact_origin,
             // core 0.9.0 migration FSM metadata — additive, all keyed by cid. Only
             // PUBLIC FSM/epoch/queue metadata travels; the staged/active Olm session
             // pickles stay packet-local in the adapt e2e library (INV-4 / spec §5.1).
@@ -4860,6 +5353,17 @@ library a2a_messaging loads libraries
         // pending_redemption_keys) are likewise not exported and default to empty
         // here. Net: outstanding invites/redemptions are transient — they do not
         // survive export/import or a daemon restart, fail-closed (plan §4.4).
+        //
+        // core 0.13 KNOWN LIMITATION, deliberately not worked around here: this
+        // applies to PUBLIC (reusable) invites too, so a publicly posted blob stops
+        // being redeemable after a daemon restart and must be re-published. The
+        // blocker is exactly the one above — the invite's ephemeral PRIVATE key
+        // cannot ride this blob (INV-4, plus the serializer corrupts raw secret
+        // keys) — so making a public invite genuinely perpetual requires either a
+        // local-only secret sidecar the host re-injects at boot, or a secret-free
+        // public leg 1. That is an owner-level security decision and is NOT taken
+        // here; generate_invite's result and the MCP tool text say so plainly
+        // rather than implying a durability the code does not provide.
         pending_invites -> (,).
         // Restore handshake state is transient exactly like pending_invites: the eph
         // PRIVATE halves are hidden + never exported, so imported records would be
@@ -4947,6 +5451,58 @@ library a2a_messaging loads libraries
         if (data $contact_e2e_seen) != NIL
         {
             contact_e2e_seen -> (data $contact_e2e_seen) safe (global_id ->> bool).
+        }
+        // core 0.13 provenance. ENTRY-BY-ENTRY and shape-guarded, NOT a whole-map
+        // `safe` cast. A blanket cast aborts the ENTIRE import on one malformed entry,
+        // which would violate this function's own contract ("NEVER let an incompatible
+        // optional field abort the whole import — degrade, don't reset") and would turn
+        // a corrupt provenance record into total state loss for an identity. Since
+        // mufl has no try/catch, the guard is the M1 `_typeof` idiom the version
+        // registry already uses: pre-check every field the cast will read, DROP the
+        // entries that fail, and keep the rest well-formed. Provenance is advisory
+        // metadata that nothing in this core reads, so losing a bad entry costs
+        // nothing; losing the identity's contacts would cost everything.
+        // An absent field (every pre-0.13 blob) simply leaves the map empty.
+        //
+        // KEYS COME FROM `contacts`, NOT FROM THE UNTRUSTED MAP. Iterating the blob's
+        // own keys would force `ocid safe global_id`, which hex-validates and so would
+        // abort on a corrupt key — the exact failure mode this guard exists to prevent,
+        // reintroduced one level up. `contacts` is imported ABOVE and its keys are
+        // already typed global_id, so every key used here is trusted by construction.
+        // Provenance for a cid that is not a contact is meaningless anyway (removal
+        // drops both together), so nothing of value is skipped.
+        //
+        // The `time` domain is derived at RUNTIME from a real transaction time rather
+        // than hardcoded: the toolkit exposes no stable literal for it, and a
+        // hardcoded guess would silently start dropping every entry if the domain
+        // string ever changed.
+        if (data $contact_origin) != NIL
+        {
+            src = data $contact_origin.
+            if (_typeof src) == "IMMUTABLE_DICTIONARY"
+            {
+                td_time = _typeof ((current_transaction_info::get_transaction_time())?).
+                rebuilt is (global_id ->> a2a_protocol::contact_origin_t) = (,).
+                sc contacts -- (ocid -> )
+                {
+                    orec = src ocid.
+                    if orec != NIL
+                        && (a2a_versions::is_str (orec $via))
+                        && (orec $at) != NIL
+                        && (_typeof (orec $at)) == td_time
+                    {
+                        // $invite_id is nullable and str+ (see contact_origin_t): a
+                        // present-but-non-string value is DROPPED to NIL rather than
+                        // taking the whole entry with it, because the label is
+                        // display-only and a missing one loses nothing load-bearing.
+                        oid is str+ = NIL.
+                        iid = orec $invite_id.
+                        if iid != NIL && (a2a_versions::is_str iid) { oid -> iid safe str. }
+                        rebuilt ocid -> ($via -> ((orec $via) safe str), $invite_id -> oid, $at -> ((orec $at) safe time)).
+                    }
+                }
+                contact_origin -> rebuilt.
+            }
         }
         if (data $contact_born_dr) != NIL
         {

@@ -97,14 +97,71 @@ library a2a_protocol loads library
     //       - invite_eph_t changing shape such that an older decoder cannot consume it;
     //       - the address-document format moving to an incompatible version (the
     //         v1->v2 $e2e_bundle bump) so a v1 peer would reject a v2 AD.
+    //   $m invite MODE (NULLABLE, core 0.13). One of invite_mode_* below. NIL means
+    //     the inviter predates explicit modes ⇒ the redeemer treats it as ONE-TIME,
+    //     which is what every pre-0.13 invite actually was. Class-A addition: an
+    //     older decoder ignores the extra member and a newer decoder reads a missing
+    //     one as NIL (name-keyed metadefs + nullable), exactly as $iv documents — so
+    //     this does NOT bump $iv, because neither direction needs to know the peer's
+    //     version to interoperate.
+    //     ADVISORY ON THE WIRE, BY DESIGN: the mode that actually governs whether a
+    //     redemption consumes the invite is the one in the INVITER's own
+    //     pending_invites record (a2a_messaging::pending_invite_t $mode). This field
+    //     exists so the REDEEMER can see how it was let in — the symmetric half of
+    //     the provenance the inviter records in contact_origin — and so a client can
+    //     warn "this is a public invite" before redeeming. Nothing authorizes off it.
+    // Closed ADAPT enum, not an integer flag. The wire representation is the
+    // stable symbolic value itself ("one_time" / "public"), which keeps every
+    // mode-bearing surface self-describing and lets the type boundary reject an
+    // unknown value before it can influence invite consumption.
+    metadef invite_mode_t: <$one_time, $public>.
+
     metadef invite_eph_t: (
         $d -> global_id,
         $c -> global_id,
         $n -> str,
         $k -> publickey_encrypt,
         $v -> int,
-        $iv -> int+
+        $iv -> int+,
+        $m -> invite_mode_t+
     ).
+
+    // ---- invite modes (core 0.13) ---------------------------------------
+    // ONE-TIME (the historical and DEFAULT behaviour): the first valid redemption
+    // consumes the invite; a second redeemer gets "Unknown or already-redeemed
+    // invite." Suitable for handing to one named peer out of band.
+    invite_mode_one_time is invite_mode_t = $one_time.
+    // PUBLIC / reusable: the invite survives redemption and may be redeemed by
+    // many distinct peers — the mode you post openly. Each redemption still runs
+    // the full leg-1/2/3 handshake and yields its OWN authenticated session; see
+    // a2a_messaging::handle_submit_invite_response for why no secret or session
+    // state is shared between redeemers. A public invite has no expiry, so
+    // revocation (a2a_messaging::revoke_invite) is the ONLY way to close it —
+    // that is why revocation ships together with this mode, not after it.
+    invite_mode_public is invite_mode_t = $public.
+    // Normalize the sole compatibility case: a pre-0.13 wire/state record has no
+    // mode. The enum itself is closed, so an unknown present value is rejected by
+    // the typed wire/state boundary rather than silently becoming permissive.
+    fn normalize_invite_mode (m: invite_mode_t+) -> invite_mode_t
+    {
+        return (m == NIL ?? invite_mode_one_time ; m?).
+    }
+
+    // ---- contact provenance (core 0.13) ---------------------------------
+    // How a contact entered the book. Recorded at first registration and never
+    // rewritten, so it stays a fact about the ORIGINAL admission decision.
+    // Consumed by nothing in this core today: it is the substrate a future trust
+    // level needs, captured now because it cannot be reconstructed later.
+    origin_invite_one_time = "invite_one_time".  // redeemed a one-time invite I minted
+    origin_invite_public   = "invite_public".    // walked in through a PUBLICLY POSTED reusable invite
+    origin_invite_redeemed = "invite_redeemed".  // I redeemed THEIR invite (responder side)
+    // $invite_id is str+, NOT global_id+, deliberately. It is a LOCAL provenance
+    // label that nothing ever routes or authenticates on, and `safe global_id`
+    // hex-validates — so a corrupt byte in a state blob would abort the import of an
+    // entry that is only ever displayed. str+ keeps a malformed value DROPPABLE by a
+    // shape guard instead of fatal. Wire-compatible with existing exports: a
+    // previously written global_id rides STRING at runtime and imports unchanged.
+    metadef contact_origin_t: ($via -> str, $invite_id -> str+, $at -> time).
 
     // A reply pointer carried on a message: the stable wire id of the message
     // being replied to, plus an optional 1-based sentence index into that

@@ -66,7 +66,7 @@ compatibility is visible in the types and the branches, not buried in NIL defaul
 
 ### `$pv` — the wire dialect id
 
-Every 0.5.0+ core-originated send stamps `$pv -> 5` (minor-version ints) on its `$targ`
+Every 0.5.0+ core-originated send stamps `$pv` (minor-version ints; currently `9`) on its `$targ`
 and inside the boxed identity-bundle payloads. Absence means a pre-0.5 peer; the registry
 infers the shape (e.g. leg-1 bundle: `$name` present ⇒ v3, else v2).
 
@@ -76,7 +76,14 @@ infers the shape (e.g. leg-1 bundle: `$name` present ⇒ v3, else v2).
 | 2 | 0.2.0 dialect | synthetic (0.2.0 never stamps) |
 | 3–4 | 0.3.0 dialect | 0.4.x never shipped; wire-identical to 0.3 |
 | 5 | 0.5.0 | first stamped dialect |
-| > 5 | future | narrows as the newest registered version (class-A additions strip safely) |
+| 7 | 0.7.0 | the **rcp** receipts surface registered; `>= 7` is the receipts gate's caps-silent fallback. 0.7.0 initially under-bumped (still stamped 5), which left pre-receipts contacts permanently gated — the fixed single-tick bug |
+| 8 | 0.8.0 | the **e2e** signed-message surface registered; belt to the `core.e2e` cap for send-side routing |
+| 9 | 0.13 | the **crm** contact-removal surface registered; `>= 9` is the removal gate's caps-silent fallback |
+| > 9 | future | narrows as the newest registered version (class-A additions strip safely) |
+
+Every consumer of a learned `$pv` is a `>=` threshold, so raising `wire_version` never
+changes an existing gate. Bump it **only** when a wire surface registers a new versioned
+type — not on every release.
 
 Peers' dialects are learned passively into `a2a_messaging::contact_pv` (and their
 advertised capability ids into `contact_caps`, from the `$caps` piggyback on the invite/
