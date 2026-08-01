@@ -224,14 +224,15 @@ library a2a_messaging loads libraries
     // core 0.13: $mode makes the one-time-vs-public distinction EXPLICIT and
     // INVITER-SIDE-AUTHORITATIVE. It is nullable purely for import compatibility
     // (a pre-0.13 record has no such field) and a NIL reads as one-time — the
-    // safe default, because treating an unknown-mode invite as reusable would
-    // silently turn every legacy invite into a bearer credential that never
-    // expires. See invite_mode_one_time / invite_mode_public in a2a_protocol.
+    // safe default, because treating every legacy invite as reusable would turn
+    // it into a bearer credential that never expires. A present value is the
+    // closed invite_mode_t enum. See invite_mode_one_time / invite_mode_public
+    // in a2a_protocol.
     // NOTE the mode lives HERE, in the inviter's own state, not (only) in the
     // blob: the reuse decision at leg 2 is read from this record, never from
     // anything the redeemer sends, so a redeemer cannot promote a one-time
     // invite to reusable by editing the copy it holds.
-    metadef pending_invite_t: ($assigned -> str, $eph_pub -> publickey_encrypt, $scheme -> int, $mode -> int+, $created -> time+).
+    metadef pending_invite_t: ($assigned -> str, $eph_pub -> publickey_encrypt, $scheme -> int, $mode -> a2a_protocol::invite_mode_t+, $created -> time+).
     pending_invites is (global_id ->> pending_invite_t) = (,).
     // core 0.13: HOW each contact entered my book, keyed by contact cid. Pure
     // provenance — nothing in this core reads it to make a decision. It exists so
@@ -250,7 +251,7 @@ library a2a_messaging loads libraries
     // ADVERTISED by the blob I redeemed, carried here so leg 3 can record symmetric
     // provenance ("I got in through a publicly posted invite"). Advisory metadata
     // only — the responder cannot verify the inviter's claim, and nothing gates on it.
-    metadef pending_redemption_t: ($inviter_cid -> global_id, $inviter_name -> str, $custom_name -> str, $mode -> int+).
+    metadef pending_redemption_t: ($inviter_cid -> global_id, $inviter_name -> str, $custom_name -> str, $mode -> a2a_protocol::invite_mode_t+).
     pending_redemptions is (global_id ->> pending_redemption_t) = (,).
     // contact-restore (spec 2026-07-01): a DEGRADED contact is derivable state —
     // cid present in `contacts`, absent from `peer_ads` (e.g. a breaking-change
@@ -1643,11 +1644,11 @@ library a2a_messaging loads libraries
     // no root profile (those move to the encrypted two-message redeem hop). No role
     // branch: roles emit the same slim shape. Side effect: registers both stores; the
     // CALLER must emit _save_state. Returns the _write'd blob + its invite_id.
-    // core 0.13: `mode` is one of a2a_protocol::invite_mode_* and is normalized by
-    // the caller. It is recorded in the inviter's OWN pending_invites record (the
+    // core 0.13: `mode` is the a2a_protocol::invite_mode_t enum. It is recorded
+    // in the inviter's OWN pending_invites record (the
     // authoritative copy, read at leg 2) and mirrored into the blob's advisory $m
     // so the redeemer can see how it is being let in.
-    fn mint_eph_invite (assigned: str, mode: int) -> ($blob -> bin, $invite_id -> global_id)
+    fn mint_eph_invite (assigned: str, mode: a2a_protocol::invite_mode_t) -> ($blob -> bin, $invite_id -> global_id)
     {
         scheme = _crypto_default_scheme_id().
         kp = _crypto_construct_encryption_keypair scheme.
@@ -1670,19 +1671,19 @@ library a2a_messaging loads libraries
         return ($blob -> (_write invite), $invite_id -> invite_id).
     }
 
-    // $mode (core 0.13, OPTIONAL): "public" for a perpetual reusable invite you can
-    // post openly, anything else (including absent) for the historical ONE-TIME
-    // invite. Absent ⇒ one-time is the compatibility-preserving default and the
-    // safe one: every existing caller keeps minting exactly the invite it minted
-    // before, and no caller can get a reusable bearer credential by accident.
-    trn generate_invite _:($name -> name: str+, $mode -> mode_ref: str+)
+    // $mode (core 0.13, OPTIONAL enum): $public for a perpetual reusable invite
+    // you can post openly, or $one_time for the historical behavior. Absent ⇒
+    // one-time is the compatibility-preserving default and the safe one: every
+    // existing caller keeps minting exactly the invite it minted before. Because
+    // this is a closed ADAPT enum, any other present value is rejected at the API
+    // boundary rather than silently selecting a mode.
+    trn generate_invite _:($name -> name: str+, $mode -> mode_ref: a2a_protocol::invite_mode_t+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         // Empty string is the "no assigned name" sentinel: accept_contact then
         // registers the joiner under its self-announced name instead.
         assigned = (name == NIL ?? "" ; name?).
-        mode is int = a2a_protocol::invite_mode_one_time.
-        if mode_ref != NIL && (mode_ref?) == "public" { mode -> a2a_protocol::invite_mode_public. }
+        mode is a2a_protocol::invite_mode_t = (mode_ref == NIL ?? a2a_protocol::invite_mode_one_time ; mode_ref?).
         // A PUBLIC invite with an assigned name is a contradiction worth refusing
         // rather than silently resolving: the assigned name would be applied to
         // EVERY redeemer, so a hundred strangers would all land in the book under
@@ -1695,7 +1696,7 @@ library a2a_messaging loads libraries
                 $invite     -> (minted $blob),
                 $invite_id  -> (minted $invite_id),
                 $peer_name  -> assigned,
-                $mode       -> (mode == a2a_protocol::invite_mode_public ?? "public" ; "one_time"),
+                $mode       -> mode,
                 // A public invite is never consumed, so revocation is the ONLY way
                 // to close it. Surfaced on creation so the caller records the id.
                 $reusable   -> (mode == a2a_protocol::invite_mode_public)
@@ -1733,12 +1734,12 @@ library a2a_messaging loads libraries
     // private half lives in the hidden store this never reads.
     trn readonly list_invites _
     {
-        out is (global_id ->> ($assigned -> str, $mode -> str, $created -> time+)) = (,).
+        out is (global_id ->> ($assigned -> str, $mode -> a2a_protocol::invite_mode_t, $created -> time+)) = (,).
         sc pending_invites -- (iid -> rec)
         {
             out iid -> (
                 $assigned -> (rec $assigned),
-                $mode -> ((a2a_protocol::normalize_invite_mode (rec $mode)) == a2a_protocol::invite_mode_public ?? "public" ; "one_time"),
+                $mode -> (a2a_protocol::normalize_invite_mode (rec $mode)),
                 $created -> (rec $created)
             ).
         }

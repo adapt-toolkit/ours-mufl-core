@@ -474,9 +474,10 @@ application actor loads libraries
         ].
     }
 
-    // Mint an invite carrying an UNKNOWN/future mode int, to prove normalize_invite_mode
-    // degrades to one-time (restrictive) rather than treating it as reusable.
-    trn qa_mint_mode_invite _:($mode -> mode: int)
+    // Typed test-only mint seam: compilation and transaction argument validation
+    // prove that invite mode is the same closed enum all the way into the shared
+    // construction helper (rather than an integer/string flag at this boundary).
+    trn qa_mint_mode_invite _:($mode -> mode: a2a_protocol::invite_mode_t)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         minted = a2a_messaging::mint_eph_invite "" mode.
@@ -484,6 +485,14 @@ application actor loads libraries
             _return_data ($invite -> (minted $blob), $invite_id -> (minted $invite_id)),
             _save_state NIL
         ].
+    }
+
+    // Decode the real invite blob through invite_eph_t and surface its enum. This
+    // checks that the mode did not become an untyped integer/string on the wire.
+    trn readonly qa_read_invite_mode _:($invite -> invite_blob: bin)
+    {
+        inv = (_read_or_abort invite_blob) safe a2a_protocol::invite_eph_t.
+        return ($mode -> (a2a_protocol::normalize_invite_mode (inv $m))).
     }
 
     // ---- core 0.13 cross-redeemer leg-1 confidentiality QA ----

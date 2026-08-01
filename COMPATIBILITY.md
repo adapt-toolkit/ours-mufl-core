@@ -293,11 +293,15 @@ upstream toolkit addition. Surfaced as `$key_material_retained`.
 extra member, a newer decoder reads a missing one as NIL. `$iv` is **not** bumped — neither
 direction needs to know the peer's version to interoperate.
 
-- `invite_mode_one_time = 1` — the historical behaviour and the **default** for an absent
-  mode, on the wire and in state. Every existing caller keeps minting exactly what it minted
-  before, and an unrecognized future mode normalizes *down* to one-time (fail-safe).
-- `invite_mode_public = 2` — reusable; leg 2 does not consume `pending_invites` /
+- `invite_mode_t = <$one_time, $public>` is a closed ADAPT enum; the symbolic enum value is
+  used consistently on the wire, in state, and at the transaction API.
+- `$one_time` is the historical behaviour and the **default** for an absent mode, on the
+  wire and in state. Every existing caller keeps minting exactly what it minted before.
+- `$public` is reusable; leg 2 does not consume `pending_invites` /
   `pending_invite_keys`.
+
+An unknown present mode is rejected by the enum type boundary. It is never interpreted as
+`$public`; only the compatibility absence (`NIL`) defaults to `$one_time`.
 
 **The wire `$m` is advisory.** The mode that decides consumption is the one in the
 **inviter's own** `pending_invite_t.$mode`, so a redeemer cannot promote a one-time invite by

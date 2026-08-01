@@ -110,6 +110,12 @@ library a2a_protocol loads library
     //     exists so the REDEEMER can see how it was let in — the symmetric half of
     //     the provenance the inviter records in contact_origin — and so a client can
     //     warn "this is a public invite" before redeeming. Nothing authorizes off it.
+    // Closed ADAPT enum, not an integer flag. The wire representation is the
+    // stable symbolic value itself ("one_time" / "public"), which keeps every
+    // mode-bearing surface self-describing and lets the type boundary reject an
+    // unknown value before it can influence invite consumption.
+    metadef invite_mode_t: <$one_time, $public>.
+
     metadef invite_eph_t: (
         $d -> global_id,
         $c -> global_id,
@@ -117,14 +123,14 @@ library a2a_protocol loads library
         $k -> publickey_encrypt,
         $v -> int,
         $iv -> int+,
-        $m -> int+
+        $m -> invite_mode_t+
     ).
 
     // ---- invite modes (core 0.13) ---------------------------------------
     // ONE-TIME (the historical and DEFAULT behaviour): the first valid redemption
     // consumes the invite; a second redeemer gets "Unknown or already-redeemed
     // invite." Suitable for handing to one named peer out of band.
-    invite_mode_one_time = 1.
+    invite_mode_one_time is invite_mode_t = $one_time.
     // PUBLIC / reusable: the invite survives redemption and may be redeemed by
     // many distinct peers — the mode you post openly. Each redemption still runs
     // the full leg-1/2/3 handshake and yields its OWN authenticated session; see
@@ -132,13 +138,13 @@ library a2a_protocol loads library
     // state is shared between redeemers. A public invite has no expiry, so
     // revocation (a2a_messaging::revoke_invite) is the ONLY way to close it —
     // that is why revocation ships together with this mode, not after it.
-    invite_mode_public = 2.
-    // Normalize an arbitrary wire/state int into a KNOWN mode, defaulting to
-    // one-time. Fail-safe by construction: an unrecognized (future) mode
-    // degrades to the RESTRICTIVE option rather than the permissive one.
-    fn normalize_invite_mode (m: int+) -> int
+    invite_mode_public is invite_mode_t = $public.
+    // Normalize the sole compatibility case: a pre-0.13 wire/state record has no
+    // mode. The enum itself is closed, so an unknown present value is rejected by
+    // the typed wire/state boundary rather than silently becoming permissive.
+    fn normalize_invite_mode (m: invite_mode_t+) -> invite_mode_t
     {
-        return (m == NIL ?? invite_mode_one_time ; (m? == invite_mode_public ?? invite_mode_public ; invite_mode_one_time)).
+        return (m == NIL ?? invite_mode_one_time ; m?).
     }
 
     // ---- contact provenance (core 0.13) ---------------------------------

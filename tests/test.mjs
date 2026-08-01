@@ -58,6 +58,7 @@ async function main() {
   console.log('\n=== T1 happy-flat ===');
   let m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'TheResponder' });
   const blob1 = Buffer.from(m.Reduce('invite').GetBinary());
+  ok(m.Reduce('mode').Visualize() === 'one_time', `absent mode defaults to the $one_time enum`);
   ok(st(I).pi === 1, `inviter has 1 pending_invite after mint`);
   await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob1), name: 'MyInviter' });
   await sleep(5000);
@@ -124,6 +125,53 @@ async function main() {
     const ifs = ro(I, '::actor::list_incoming_files', undefined).Visualize();
     ok(/answer\.bin/.test(ifs) && new RegExp(msgWireIR).test(ifs),
       `a send_file can reply_to a MESSAGE's wire_id (cross-kind, shared namespace)`);
+  }
+
+  // ---------- T2b invite-mode enum + public reuse/revocation ----------
+  CUR = 'T2b invite-mode enum';
+  console.log('\n=== T2b invite-mode enum + public reuse/revocation ===');
+  {
+    const PI = mk('PI'); const PA = mk('PA'); const PB = mk('PB'); const PC = mk('PC');
+    await mkPacket(PI, 'mode-inviter-01'); await mkPacket(PA, 'mode-a-02');
+    await mkPacket(PB, 'mode-b-03'); await mkPacket(PC, 'mode-c-04');
+    await sleep(1200);
+    await setName(PI, 'PublicInviter'); await setName(PA, 'PublicA');
+    await setName(PB, 'PublicB'); await setName(PC, 'PublicC');
+
+    const pub = await mutate(PI, '::a2a_messaging::generate_invite', { mode: 'public' });
+    const pubBlob = Buffer.from(pub.Reduce('invite').GetBinary());
+    const pubId = pub.Reduce('invite_id').Visualize();
+    ok(pub.Reduce('mode').Visualize() === 'public' && isT(pub.Reduce('reusable').Visualize()),
+      `generate_invite accepts and returns the $public enum`);
+    ok(ro(PI, '::actor::qa_read_invite_mode', { invite: binv(PI, pubBlob) }).Reduce('mode').Visualize() === 'public',
+      `invite_eph_t carries $public as the typed wire enum`);
+    const listed = ro(PI, '::a2a_messaging::list_invites', undefined).Visualize();
+    ok(new RegExp(pubId).test(listed) && /public/.test(listed),
+      `pending state + list_invites preserve the $public enum`);
+
+    await mutate(PA, '::a2a_messaging::add_contact', { invite: binv(PA, pubBlob) });
+    await mutate(PB, '::a2a_messaging::add_contact', { invite: binv(PB, pubBlob) });
+    await sleep(5000);
+    ok(new RegExp(PA.cid).test(lc(PI)) && new RegExp(PB.cid).test(lc(PI)),
+      `two distinct peers redeem the same $public invite`);
+    ok(st(PI).pi === 1, `$public redemption retains the authoritative pending invite`);
+
+    const beforeInvalid = st(PI).pi;
+    let invalidRejected = false;
+    try { await mutate(PI, '::a2a_messaging::generate_invite', { mode: 'future_mode' }); }
+    catch (e) { invalidRejected = /value set|match|mode|argument|cast/i.test(String(e)); }
+    ok(invalidRejected && st(PI).pi === beforeInvalid,
+      `unknown present mode is rejected by the closed enum with no invite minted`);
+
+    const revoked = await mutate(PI, '::a2a_messaging::revoke_invite', { invite_id: pubId });
+    ok(isT(revoked.Reduce('revoked').Visualize()) && isT(revoked.Reduce('was_public').Visualize()),
+      `revoke_invite reports the stored $public enum`);
+    ok(st(PI).pi === 0, `revocation removes the reusable invite`);
+    const rejBefore = PI.rejects.length;
+    await mutate(PC, '::a2a_messaging::add_contact', { invite: binv(PC, pubBlob) });
+    await sleep(3000);
+    ok(PI.rejects.slice(rejBefore).some((x) => /already-redeemed|Unknown or already/.test(x)) &&
+       !new RegExp(PI.cid).test(lc(PC)), `revoked $public invite cannot admit another peer`);
   }
 
   // ---------- T3 single-use (reuse blob1, already consumed) ----------
