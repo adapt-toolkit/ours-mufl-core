@@ -2117,14 +2117,16 @@ library a2a_messaging loads libraries
     // contact_migration (transient FSM; the migration sweep iterates `contacts`, so
     // an entry for a non-contact is inert either way — this is cleanup, not security).
     //
-    // NOT purged (unavoidable residual, NOT a regression): the cid-keyed Olm session
-    // pickle inside the adapt `e2e` library. That library exposes no per-cid session
-    // drop (only discard_rotation, which clears the STAGED slot), so the live
-    // ratchet for a removed peer survives in packet state and in the exported
-    // $e2e_sessions blob. This matches remove_contact's long-standing documented
-    // contract ("a contacts-layer forget, NOT a key wipe") but it does mean a true
-    // key wipe needs an upstream addition to the toolkit stdlib. Surfaced as
-    // $key_material_retained on the removal result so no caller can mistake it.
+    // PURGED (closes the former "unavoidable residual"): the cid-keyed Olm session
+    // pickles inside the adapt `e2e` library — BOTH the live slot and the staged
+    // rotation — via e2e::forget_peer, in the SAME state transaction as the contact
+    // deletion. Before the stdlib grew forget_peer, only discard_rotation (staged
+    // slot) was reachable from here, so every removed contact's live ratchet
+    // survived in packet state and in each exported $e2e_sessions blob, forever.
+    // The removal result's $key_material_retained is therefore now FALSE.
+    // NOTE: sessions orphaned by removals that predate this fix are NOT swept here —
+    // that is a one-time reconciliation over persisted state (spec step 4), deferred
+    // to the deployment phase because it needs a backup + dry-run against real state.
     fn purge_contact_state (target_id: global_id) -> nil
     {
         delete contacts target_id.
@@ -2159,9 +2161,10 @@ library a2a_messaging loads libraries
         // Provenance dies with the contact: keeping it would let a re-added peer
         // inherit a trust marking earned by a DIFFERENT admission decision.
         if (contact_origin target_id) != NIL { delete contact_origin target_id. }
-        // The staged (not yet committed) Olm rotation IS droppable — the live
-        // session is not (see the residual note above).
-        e2e::discard_rotation target_id.
+        // The contact's E2E session lifecycle ends with the contact: drop BOTH the
+        // live Olm session and any staged (not yet committed) rotation. Idempotent,
+        // tolerates a peer the e2e library never saw, and leaks no session material.
+        e2e::forget_peer target_id.
         return NIL.
     }
 
@@ -2295,10 +2298,11 @@ library a2a_messaging loads libraries
             $removed -> removed_name,
             $container_id -> target_id,
             $notified -> notified,
-            // The removal is a contacts-layer purge, not a key wipe: the adapt e2e
-            // library exposes no per-cid session drop, so the Olm ratchet for this
-            // peer survives. Surfaced, never silent.
-            $key_material_retained -> TRUE
+            // The removal now IS a key wipe for this peer: purge_contact_state calls
+            // e2e::forget_peer, which drops the live Olm session AND any staged
+            // rotation in this same transaction. The field stays (result-shape
+            // compatibility) and stays honest — it just reports FALSE now.
+            $key_material_retained -> FALSE
         ).
         actions (_count actions|) -> _save_state NIL.
         return transaction::success actions.

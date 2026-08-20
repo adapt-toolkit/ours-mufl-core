@@ -796,6 +796,76 @@ async function main() {
        'reload: the reloaded packet DECRYPTS B\'s in-gap message on the restored session (page-reload message-loss FIXED)');
   }
 
+  // ═══ REMOVE_CONTACT → e2e::forget_peer — contact deletion and session lifecycle are ATOMIC ═══
+  // The former "known residual" (a removed contact's live Olm ratchet surviving in packet state
+  // and every $e2e_sessions export) is closed: purge_contact_state calls e2e::forget_peer in the
+  // same transaction. Asserts: live + staged deletion, unrelated-peer preservation, honest
+  // $key_material_retained=FALSE, absence surviving an export/import round trip, anti-downgrade
+  // pin retention (the intentionally-retained class), and remove/re-add starting a FRESH session.
+  console.log('\n=== mig: remove_contact wipes the peer\'s e2e state (forget_peer, atomic) ===');
+  {
+    const XA = await mkNode('mig-rmv-A', 'RMA');
+    const XB = await mkNode('mig-rmv-B', 'RMB');
+    const XC = await mkNode('mig-rmv-C', 'RMC'); await sleep(1000);
+    const invB = await mutate(XA, '::a2a_messaging::generate_invite', { name: 'RMB' });
+    await mutate(XB, '::a2a_messaging::add_contact', { invite: binv(XB, Buffer.from(invB.Reduce('invite').GetBinary())), name: 'RMA' });
+    const invC = await mutate(XA, '::a2a_messaging::generate_invite', { name: 'RMC' });
+    await mutate(XC, '::a2a_messaging::add_contact', { invite: binv(XC, Buffer.from(invC.Reduce('invite').GetBinary())), name: 'RMA' });
+    await sleep(6000);   // invite redeem round-trips (contacts + peer_ads incl. e2e bundle)
+    await mutate(XA, '::actor::qa_learn_peer', { cid: XB.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(XB, '::actor::qa_learn_peer', { cid: XA.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(XA, '::actor::qa_learn_peer', { cid: XC.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(XC, '::actor::qa_learn_peer', { cid: XA.cid, pv: 9, caps: ['core.e2e'] });
+
+    // Live e2e sessions to BOTH peers (send establishes + advances the ratchet).
+    await mutate(XB, '::actor::qa_recv_reset', {});
+    await mutate(XA, '::a2a_messaging::send_message', { contact: 'RMB', text: 'rmv-to-b' });
+    await mutate(XA, '::a2a_messaging::send_message', { contact: 'RMC', text: 'rmv-to-c' });
+    await sleep(4000);
+    ok(ro(XB, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'rmv-to-b', 'rmv: pre-removal A→B delivered over e2e (live session established)');
+    const sidB = hex(getBin(ro(XA, '::actor::qa_e2e_active', { cid: XB.cid }), 'sid'));
+    const sidC = hex(getBin(ro(XA, '::actor::qa_e2e_active', { cid: XC.cid }), 'sid'));
+    ok(sidB.length > 0, 'rmv: A holds a live e2e session for B before removal');
+    ok(sidC.length > 0, 'rmv: A holds a live e2e session for C before removal');
+
+    // Populate the STAGED slot for B too — forget_peer must clear BOTH.
+    const bBundle = getBin(ro(XB, '::actor::qa_e2e_bundle', {}), 'bundle');
+    await mutate(XA, '::actor::qa_e2e_stage_out', { cid: XB.cid, peer: binv(XA, bBundle) });
+    ok(hex(getBin(ro(XA, '::actor::qa_e2e_staged', { cid: XB.cid }), 'sid')).length > 0, 'rmv: A holds a staged rotation for B before removal');
+
+    // REMOVE B. The purge and e2e::forget_peer commit in the SAME transaction.
+    const rm = await mutate(XA, '::a2a_messaging::remove_contact', { contact: 'RMB' });
+    ok(!T(rm.Reduce('key_material_retained').Visualize()), 'rmv: result reports $key_material_retained=FALSE (the removal IS a key wipe now)');
+    ok(hex(getBin(ro(XA, '::actor::qa_e2e_active', { cid: XB.cid }), 'sid')).length === 0, 'rmv: B\'s LIVE session deleted (m_sessions[cid])');
+    ok(hex(getBin(ro(XA, '::actor::qa_e2e_staged', { cid: XB.cid }), 'sid')).length === 0, 'rmv: B\'s STAGED rotation deleted (m_staged[cid])');
+    ok(hex(getBin(ro(XA, '::actor::qa_e2e_active', { cid: XC.cid }), 'sid')) === sidC, 'rmv: unrelated peer C\'s session is UNTOUCHED');
+    ok(T(ro(XA, '::actor::qa_cap_state', { cid: XB.cid }).Reduce('pinned').Visualize()), 'rmv: the anti-downgrade pin SURVIVES removal (intentionally-retained class)');
+
+    // Export/import round trip: the removed cid stays absent, the retained peer survives.
+    const savedCore = Buffer.from(ro(XA, '::actor::export_state', {}).Serialize());
+    wrapper.packet_manager.remove_packet(XA.cid);
+    await sleep(800);
+    const XA2 = await mkNode('mig-rmv-A', 'RMA'); await sleep(500);
+    await mutate(XA2, '::actor::import_state', XA2.pw.packet.ParseValue(new Uint8Array(savedCore)));
+    const rcr = await mutate(XA2, '::a2a_messaging::commit_e2e_restore', {});
+    ok(rcr.Reduce('status').Visualize() === 'ok', 'rmv: commit_e2e_restore installs the persisted sessions');
+    ok(hex(getBin(ro(XA2, '::actor::qa_e2e_active', { cid: XB.cid }), 'sid')).length === 0, 'rmv: removed peer is ABSENT after the export/import round trip');
+    ok(hex(getBin(ro(XA2, '::actor::qa_e2e_active', { cid: XC.cid }), 'sid')) === sidC, 'rmv: retained peer\'s session SURVIVES the round trip (same id)');
+
+    // Remove/re-add freshness: a NEW invite handshake starts a FRESH ratchet, not the old one.
+    const invB2 = await mutate(XA2, '::a2a_messaging::generate_invite', { name: 'RMB' });
+    await mutate(XB, '::a2a_messaging::add_contact', { invite: binv(XB, Buffer.from(invB2.Reduce('invite').GetBinary())), name: 'RMA' });
+    await sleep(6000);
+    await mutate(XA2, '::actor::qa_learn_peer', { cid: XB.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(XB, '::actor::qa_learn_peer', { cid: XA2.cid, pv: 9, caps: ['core.e2e'] });
+    await mutate(XB, '::actor::qa_recv_reset', {});
+    await mutate(XA2, '::a2a_messaging::send_message', { contact: 'RMB', text: 'rmv-fresh' });
+    await sleep(4000);
+    ok(ro(XB, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'rmv-fresh', 'rmv: post-re-add A→B delivered over e2e');
+    const sidB2 = hex(getBin(ro(XA2, '::actor::qa_e2e_active', { cid: XB.cid }), 'sid'));
+    ok(sidB2.length > 0 && sidB2 !== sidB, 'rmv: the re-added pair runs a FRESH session (new id, old ratchet not resurrected)');
+  }
+
   console.log('\n================ MIG ================');
   if (scorecard.length === 0) console.log('MIG: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }
