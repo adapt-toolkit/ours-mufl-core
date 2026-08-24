@@ -2085,9 +2085,9 @@ library a2a_messaging loads libraries
     // future room-close can invoke it once per participant — that caller does NOT
     // exist yet and is NOT implemented here.
     //
-    // THIS IS NOT A HARD PURGE AND DOES NOT LEAVE "NO RESIDUE". Two classes of
-    // cryptographic material deliberately or unavoidably survive; see below. Callers
-    // and docs must not claim otherwise.
+    // THIS IS NOT A HARD PURGE AND DOES NOT LEAVE "NO RESIDUE". One class of
+    // cryptographic material deliberately survives; see below. Callers and docs must
+    // not claim otherwise.
     //
     // EXPLICIT DROP-LIST: every store below is named literally. It is NOT derived by
     // iterating `contacts` and keeping what matches, because such a keep-list would
