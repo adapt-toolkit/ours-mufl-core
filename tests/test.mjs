@@ -58,6 +58,7 @@ async function main() {
   console.log('\n=== T1 happy-flat ===');
   let m = await mutate(I, '::a2a_messaging::generate_invite', { name: 'TheResponder' });
   const blob1 = Buffer.from(m.Reduce('invite').GetBinary());
+  const invite1Id = m.Reduce('invite_id').Visualize();
   ok(m.Reduce('mode').Visualize() === 'one_time', `absent mode defaults to the $one_time enum`);
   ok(st(I).pi === 1, `inviter has 1 pending_invite after mint`);
   await mutate(R, '::a2a_messaging::add_contact', { invite: binv(R, blob1), name: 'MyInviter' });
@@ -70,6 +71,10 @@ async function main() {
   ok(r1.c >= 1 && r1.p >= 1, `leg-3 RECEIVER-SIDE: responder DECRYPTED + registered inviter (c=${r1.c},peer_ads=${r1.p})`);
   ok(new RegExp(I.cid).test(lc(R)), `responder list_contacts includes inviter cid`);
   ok(new RegExp(R.cid).test(lc(I)), `inviter list_contacts includes responder cid`);
+  const oneTimeOrigins = ro(I, '::a2a_messaging::list_contact_origins', undefined).Visualize();
+  ok(new RegExp(R.cid).test(oneTimeOrigins) && new RegExp(invite1Id).test(oneTimeOrigins)
+    && /invite_one_time/.test(oneTimeOrigins),
+  `inviter records the authenticated responder CID against the exact one-time invite`);
   // bidirectional encrypted_channel round-trip
   const smIR = await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: 'msg-I-to-R' });
   const msgWireIR = smIR.Reduce('wire_id').Visualize();
@@ -154,6 +159,10 @@ async function main() {
     await sleep(5000);
     ok(new RegExp(PA.cid).test(lc(PI)) && new RegExp(PB.cid).test(lc(PI)),
       `two distinct peers redeem the same $public invite`);
+    const publicOrigins = ro(PI, '::a2a_messaging::list_contact_origins', undefined).Visualize();
+    ok(new RegExp(PA.cid).test(publicOrigins) && new RegExp(PB.cid).test(publicOrigins)
+      && publicOrigins.split(pubId).length === 3 && /invite_public/.test(publicOrigins),
+    `each public redeemer is attributed to the exact reusable invite id`);
     ok(st(PI).pi === 1, `$public redemption retains the authoritative pending invite`);
 
     const beforeInvalid = st(PI).pi;
@@ -172,6 +181,8 @@ async function main() {
     await sleep(3000);
     ok(PI.rejects.slice(rejBefore).some((x) => /already-redeemed|Unknown or already/.test(x)) &&
        !new RegExp(PI.cid).test(lc(PC)), `revoked $public invite cannot admit another peer`);
+    ok(!new RegExp(PC.cid).test(ro(PI, '::a2a_messaging::list_contact_origins', undefined).Visualize()),
+      `a revoke race that rejects the handshake records no provenance`);
   }
 
   // ---------- T3 single-use (reuse blob1, already consumed) ----------
@@ -183,6 +194,9 @@ async function main() {
   const after = st(I);
   ok(I.rejects.slice(rej0).some((x) => /already-redeemed|Unknown or already/.test(x)), `2nd leg-1 for the same invite_id aborts "already-redeemed" at inviter`);
   ok(after.c === before.c && after.pi === before.pi, `single-use: inviter state unchanged by replay (c=${after.c},pi=${after.pi})`);
+  const replayOrigins = ro(I, '::a2a_messaging::list_contact_origins', undefined).Visualize();
+  ok(new RegExp(R.cid).test(replayOrigins) && new RegExp(invite1Id).test(replayOrigins),
+    `one-time replay cannot rewrite established invite provenance`);
 
   // ---------- T4 invalid-then-valid (bad box must NOT consume) ----------
   CUR = 'T4 invalid-then-valid';
@@ -320,6 +334,9 @@ async function main() {
   ok(s10.c >= 1 && s10.p >= 1, `import restored contacts + peer_ads (c=${s10.c},peer_ads=${s10.p})`);
   ok(s10.pi === 0, `import reset pending_invites to empty (migration) → ${s10.pi}`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
+  const importedOrigins = ro(I2, '::a2a_messaging::list_contact_origins', undefined).Visualize();
+  ok(new RegExp(R.cid).test(importedOrigins) && new RegExp(invite1Id).test(importedOrigins),
+    `restart/import preserves authenticated invite provenance`);
   // version-0 path: strip the stamp from a re-exported blob → still imports.
   const exp0 = ro(I2, '::actor::export_state', undefined);
   ok(exp0.Reduce('core').Reduce('format_version').Visualize() === '1', `re-export carries the stamp`);
