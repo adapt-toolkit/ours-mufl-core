@@ -255,14 +255,14 @@ removed you". Local removal always succeeds regardless.
 absent". Duplicates, replays, and notices from a non-contact all converge on the same state
 and return success, so no replay ledger exists. A crossed removal is two no-ops.
 
-**Scope of the purge — contact-layer state and queued plaintext ONLY.** This is **not** a
-hard purge and does **not** leave "no residue"; do not describe it as either.
+**Scope of the purge — contact-layer state, queued plaintext, and the peer's E2E sessions.**
 `purge_contact_state(cid)` names every store literally — deliberately NOT derived from a
 `contacts` keep-list, which would also delete peers legitimately mid-handshake (pending
 redemptions, in-flight restores, FSM entries for a not-yet-registered contact). It clears
 contact/AD/caps/pv state, the restore stores, the plaintext queues (`deferred_msgs`,
-`unacked_e2e`, `mig_deferred`), `delivered_wire`, `contact_origin`, and the transient
-`contact_migration` FSM entry.
+`unacked_e2e`, `mig_deferred`), `delivered_wire`, `contact_origin`, the transient
+`contact_migration` FSM entry, and — via `e2e::forget_peer` in the same transaction — the
+peer's live Olm session and any staged rotation.
 
 **The anti-downgrade pins are RETAINED** — `contact_e2e_seen`, `contact_e2e_epoch`,
 `contact_born_dr`. They are irreversible, monotone evidence that this cid once proved it
@@ -281,11 +281,15 @@ There is no brick, so there was never anything to trade the pins for.
 it per participant (that caller does not exist yet), but what it guarantees is removal of
 contact-layer state and queued plaintext — **not** the absence of cryptographic residue.
 
-**Known residual:** the adapt `e2e` library exposes no per-cid session drop (only
-`discard_rotation`, which clears the STAGED slot), so the live Olm ratchet for a removed peer
-survives in packet state and in the exported `$e2e_sessions`. Consistent with the
-long-standing "contacts-layer forget, NOT a key wipe" contract; a true key wipe needs an
-upstream toolkit addition. Surfaced as `$key_material_retained`.
+**Former known residual — now closed:** the adapt `e2e` library grew `forget_peer(cid)`
+(deletes both the live session and the staged rotation, idempotent, exposes no session
+material), and `purge_contact_state` calls it in the same state transaction as the contact
+deletion, so a removed peer's Olm ratchet no longer survives in packet state or in the
+exported `$e2e_sessions`. The removal result keeps the `$key_material_retained` field for
+shape compatibility; it now reports FALSE. Requires an adapt toolkit with `e2e::forget_peer`
+(the toolchain pin covers this). Sessions orphaned by removals that predate this fix are not
+swept at runtime — that is a one-time reconciliation over persisted state, deferred to the
+deployment phase (backup + dry-run against real state first).
 
 ## Invite modes (core 0.13) — class-A, default-preserving
 

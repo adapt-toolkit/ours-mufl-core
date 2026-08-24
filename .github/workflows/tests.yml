@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TOOLCHAIN_VERSION: 0.10.12
+  TOOLCHAIN_VERSION: 0.12.0
 
 jobs:
   suite:
