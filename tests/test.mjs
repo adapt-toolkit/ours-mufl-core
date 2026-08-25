@@ -755,6 +755,85 @@ async function main() {
       'RC10: expectation = unknown toward a pv-5 peer');
   }
 
+  // ---------- DW receive-side E2E dedup/redrive window ----------
+  CUR = 'DW bounded receive dedup';
+  console.log('\n=== DW receive dedup is the shared newest-50 redrive window ===');
+  {
+    // F is only a packet-state fixture here; I.cid/R.cid are independent map keys.
+    for (let i = 1; i <= 50; i++) {
+      await mutate(F, '::actor::qa_dedup_note', { contact: I.cid, wire_id: `dw-${String(i).padStart(2, '0')}` });
+    }
+    let ds = ro(F, '::actor::qa_dedup_state', { contact: I.cid });
+    ok(+ds.Reduce('count').Visualize() === 50, 'DW1: entries 1..50 are retained');
+    ok(isT(ro(F, '::actor::qa_dedup_seen', { contact: I.cid, wire_id: 'dw-01' }).Reduce('seen').Visualize()) &&
+       isT(ro(F, '::actor::qa_dedup_seen', { contact: I.cid, wire_id: 'dw-50' }).Reduce('seen').Visualize()),
+      'DW1: every edge of the retained sender window deduplicates');
+
+    await mutate(F, '::actor::qa_dedup_note', { contact: I.cid, wire_id: 'dw-51' });
+    ds = ro(F, '::actor::qa_dedup_state', { contact: I.cid });
+    const ids51 = ds.Reduce('ids').Visualize();
+    ok(+ds.Reduce('count').Visualize() === 50 && !ids51.includes('dw-01') && ids51.includes('dw-02') && ids51.includes('dw-51'),
+      'DW2: entry 51 evicts exactly the oldest and leaves 50');
+
+    await mutate(F, '::actor::qa_dedup_note', { contact: R.cid, wire_id: 'other-1' });
+    ok(+ro(F, '::actor::qa_dedup_state', { contact: R.cid }).Reduce('count').Visualize() === 1 &&
+       +ro(F, '::actor::qa_dedup_state', { contact: I.cid }).Reduce('count').Visualize() === 50,
+      'DW3: contacts have independent windows');
+
+    await mutate(F, '::actor::qa_dedup_seed', { contact: R.cid,
+      wire_ids: ['age-same', ...Array.from({ length: 49 }, (_, i) => `age-${i + 2}`)], expire_first: true });
+    const expiredSeen = isT(ro(F, '::actor::qa_dedup_seen', { contact: R.cid, wire_id: 'age-same' }).Reduce('seen').Visualize());
+    await mutate(F, '::actor::qa_dedup_note', { contact: R.cid, wire_id: 'age-same' });
+    const aged = ro(F, '::actor::qa_dedup_state', { contact: R.cid });
+    ok(!expiredSeen && +aged.Reduce('count').Visualize() === 50 && aged.Reduce('ids').Visualize().includes('"age-same"'),
+      'DW4: expired same-ID is pruned before lookup, then accepted and appended once');
+
+    const ua = await mutate(F, '::actor::qa_unacked_fill', { contact: I.cid,
+      wire_ids: Array.from({ length: 51 }, (_, i) => `dw-${String(i + 1).padStart(2, '0')}`) });
+    const allSenderRetainedSeen = Array.from({ length: 50 }, (_, i) => `dw-${String(i + 2).padStart(2, '0')}`)
+      .every((wid) => isT(ro(F, '::actor::qa_dedup_seen', { contact: I.cid, wire_id: wid }).Reduce('seen').Visualize()));
+    ok(+ua.Reduce('count').Visualize() === 50 && allSenderRetainedSeen,
+      'DW5: all 50 sender-retained IDs remain inside the receiver dedup window');
+
+    // Import both persisted shapes independently. Each must retain newest 50 and
+    // remain bounded through an export/import restart round-trip.
+    const importIds = Array.from({ length: 75 }, (_, i) => `import-${i + 1}`);
+    await mutate(F, '::actor::qa_dedup_import', { contact: I.cid, wire_ids: importIds, legacy: false });
+    let imported = ro(F, '::actor::qa_dedup_state', { contact: I.cid });
+    ok(+imported.Reduce('count').Visualize() === 50 && !imported.Reduce('ids').Visualize().includes('import-25') &&
+       imported.Reduce('ids').Visualize().includes('import-26') && imported.Reduce('ids').Visualize().includes('import-75'),
+      'DW6: current-shape legacy oversize import normalizes to newest 50');
+    await mutate(F, '::actor::qa_dedup_restart', {});
+    ok(+ro(F, '::actor::qa_dedup_state', { contact: I.cid }).Reduce('count').Visualize() === 50,
+      'DW6: normalized current-shape import is restart-safe');
+
+    await mutate(F, '::actor::qa_dedup_import', { contact: I.cid, wire_ids: importIds, legacy: true });
+    imported = ro(F, '::actor::qa_dedup_state', { contact: I.cid });
+    ok(+imported.Reduce('count').Visualize() === 50 && imported.Reduce('ids').Visualize().includes('import-26') &&
+       imported.Reduce('ids').Visualize().includes('import-75'),
+      'DW7: old str[] import shape normalizes to newest 50');
+    await mutate(F, '::actor::qa_dedup_restart', {});
+    ok(+ro(F, '::actor::qa_dedup_state', { contact: I.cid }).Reduce('count').Visualize() === 50,
+      'DW7: normalized str[] import is restart-safe');
+
+    // 64-character normal IDs approximate production IDs. Measure the actual
+    // serialized delivered_wire list and prove >50 traffic plateaus.
+    await mutate(F, '::actor::qa_dedup_import', { contact: I.cid, wire_ids: [], legacy: false });
+    for (let i = 1; i <= 50; i++) {
+      const wid = `state-${String(i).padStart(3, '0')}`.padEnd(64, 'x');
+      await mutate(F, '::actor::qa_dedup_note', { contact: I.cid, wire_id: wid });
+    }
+    const size50 = +ro(F, '::actor::qa_dedup_state', { contact: I.cid }).Reduce('serialized_bytes').Visualize();
+    for (let i = 51; i <= 75; i++) {
+      const wid = `state-${String(i).padStart(3, '0')}`.padEnd(64, 'x');
+      await mutate(F, '::actor::qa_dedup_note', { contact: I.cid, wire_id: wid });
+    }
+    const plateau = ro(F, '::actor::qa_dedup_state', { contact: I.cid });
+    const size75 = +plateau.Reduce('serialized_bytes').Visualize();
+    ok(size50 > 0 && size50 < 32768 && +plateau.Reduce('count').Visualize() === 50 && size75 <= size50 + 256,
+      `DW8: 50 serialized normal entries stay low-tens-of-KiB and plateau (${size50}→${size75} bytes)`);
+  }
+
   // ---------- CN contact naming after an AD introduction ----------
   CUR = 'CN contact naming';
   console.log('\n=== CN AD introduction adopts only a CID fallback name ===');

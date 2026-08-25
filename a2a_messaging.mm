@@ -127,9 +127,15 @@ library a2a_messaging loads libraries
     // cleared on the first successful decode from that cid). Low on purpose: one request
     // usually heals; the cap only bounds a lost-request retry, never a per-message storm.
     rekey_max_attempts = 3.
-    // Per-contact cap on unacknowledged (no delivered-receipt yet) e2e sends retained for
-    // redrive after a re-key (mirrors deferred_msgs_cap; oldest dropped first, never abort).
-    unacked_cap = 50.
+    // Exact per-contact protocol window shared by BOTH sides of at-least-once E2E
+    // delivery: the sender retains at most this many unacknowledged sends and the
+    // receiver retains exactly the same number of delivered wire IDs. One constant
+    // makes it impossible for the redrive and dedup guarantees to silently diverge.
+    redrive_window_cap = 50.
+    // Inbound IDs are compatibility strings (older peers/tests use short labels), not
+    // global_id values. Bound their `_strlen` character count after authenticated
+    // decrypt so a fixed entry count also gives a bounded packet-state footprint.
+    wire_id_max_chars = 128.
     // Age before the periodic sweep re-sends a stuck unacked message (no delivered
     // receipt). Covers a PRE-fix peer that silently rejected our sends and cannot ask
     // us to re-key (it heals once our boot-readvertise refreshed its copy of our AD),
@@ -139,7 +145,7 @@ library a2a_messaging loads libraries
     // Review #12 + ship-review major-4: per-sweep budgets — one txn re-driving 50×N
     // contacts (or emitting one expiry notify per contact across thousands) could hit
     // fuel/action limits and lose the WHOLE sweep, cyclically. A contact's queue is
-    // capped at unacked_cap (50) < the crypto budget, so every contact is individually
+    // capped at redrive_window_cap (50) < the crypto budget, so every contact is individually
     // processable; overflow defers the remainder to the (exported) cursor.
     // The crypto budget is DELIBERATELY denominated in CRYPTO OPERATIONS (each entry =
     // one e2e::encrypt_to = 1 ratchet encryption + 1 signature GENERATION; this path
@@ -323,7 +329,7 @@ library a2a_messaging loads libraries
     // the redrive source that turns "session healed" into "the message still reached
     // the receiver's inbox". Holds the serialized INNER app body ($text/$wire_id/...):
     // the SAME plaintext class the exported inbox already persists at rest, never key
-    // material (INV-4 untouched — no session pickle here). Bounded (unacked_cap,
+    // material (INV-4 untouched — no session pickle here). Bounded (redrive_window_cap,
     // oldest-first drop); entries clear on delivered/read receipt; EXPORTED so a
     // sender-side restart (offline-pair case) does not lose undelivered messages.
     // $kind: "m" (message, redriven as receive_e2e_message_tx) | "f" (file,
@@ -355,21 +361,12 @@ library a2a_messaging loads libraries
     // at-least-once redrive: a re-delivered wire_id re-acks (delivered receipt, so the
     // sender's buffer clears) but never re-deposits into the inbox. EXPORTED (tiny):
     // the inbox it guards is persisted too, so the guard must survive the same restarts.
-    // Retention is AGE-ONLY (finding H + ship-review major-3): an entry lives exactly
-    // as long as the SENDER can still redrive it (unacked_ttl_seconds). There is
-    // deliberately NO count-based eviction inside that window — any count cap could be
-    // pushed past by heavy (still authenticated) traffic while one receipt was lost,
-    // and the late redrive would re-deposit a duplicate. The storage bound is the
-    // AUTHENTICATED per-contact inbound rate over the 2-day window (each entry is one
-    // wire_id string + a date; only accepted contacts reach delivered_note).
+    // Retention is bounded by BOTH the sender's redrive TTL and the shared redrive
+    // window. The newest 50 accepted IDs are the intentional protocol guarantee:
+    // every send the peer can still retain for redrive remains deduplicated here.
+    // IDs older than that count window are outside the redrivable/deduplicated promise.
     metadef delivered_entry_t: ($w -> str, $d -> time).
     delivered_wire is (global_id ->> delivered_entry_t[]) = (,).
-    // Storage CEILING (not a dedup window): an authenticated flooder must not grow
-    // delivered_wire without bound over the 2-day window (memory-DoS). Reaching it is
-    // a GUARANTEE-LOSS event — the oldest in-TTL entry is dropped AND the loss is
-    // SURFACED ($dedup_degraded notify), never a silent eviction. ~16k entries ≈ low
-    // single-digit MB per pathological contact.
-    delivered_wire_hard_cap = 16384.
     // Peer address documents, captured when a contact is established. Self-
     // signed, code-independent, and seed-stable: import_core_state replays
     // them through address_document::process_address_document so encrypted
@@ -1129,7 +1126,7 @@ library a2a_messaging loads libraries
         return code == "no_session" || code == "session_mismatch" || code == "tampered".
     }
     // Retain an outbound e2e app send until its delivered/read receipt (redrive source).
-    // Bounded three ways, never an abort: entry count (unacked_cap, oldest first),
+    // Bounded three ways, never an abort: entry count (redrive_window_cap, oldest first),
     // per-contact bytes (unacked_max_bytes — an entry alone above the budget is not
     // retained at all), and age (unacked_ttl_seconds, purged by the periodic sweep).
     // Typed retention result (review #7): the caller must SURFACE what the redrive
@@ -1157,7 +1154,7 @@ library a2a_messaging loads libraries
             drop is int = 0.
             sc q0? -- ( -> ent)
             {
-                if cnt > unacked_cap || total > unacked_max_bytes
+                if cnt > redrive_window_cap || total > unacked_max_bytes
                 {
                     total -> total - (_binlen (ent $inner)).
                     cnt -> cnt - 1.
@@ -1172,45 +1169,52 @@ library a2a_messaging loads libraries
         unacked_e2e cid -> kept.
         return ( $retained -> TRUE, $evicted -> evicted ).
     }
-    // Receive-side dedup store (see delivered_wire above): membership probe + bounded note.
+    // Deterministic normalization shared by runtime mutation and import. First remove
+    // entries outside the sender's redrive TTL, preserving order, then retain only the
+    // newest `cap` entries. Runtime passes cap-1 before appending; import passes cap.
+    fn delivered_normalize (q0: delivered_entry_t[], now: time, cap: int) -> delivered_entry_t[]
+    {
+        aged is delivered_entry_t[] = [].
+        sc q0 -- ( -> e)
+        { if (_substract_seconds now (e $d)) <= unacked_ttl_seconds { aged (_count aged|) -> e. } }
+        skip is int = (_count aged|) - cap.
+        if skip < 0 { skip -> 0. }
+        q is delivered_entry_t[] = [].
+        i is int = 0.
+        sc aged -- ( -> e) { if i >= skip { q (_count q|) -> e. }  i -> i + 1. }
+        return q.
+    }
+    // Every authenticated ingress normalizes BEFORE membership: expired IDs are no
+    // longer duplicates, and even a duplicate re-ack shrinks legacy oversized state.
     fn wire_seen (cid: global_id, wire_id: str) -> bool
     {
-        q = delivered_wire cid.
-        if q == NIL { return FALSE. }
+        q0 = delivered_wire cid.
+        if q0 == NIL { return FALSE. }
+        now = (current_transaction_info::get_transaction_time())?.
+        q = delivered_normalize q0? now redrive_window_cap.
+        delivered_wire cid -> q.
         hit is bool = FALSE.
-        sc q? -- ( -> e) { if (e $w) == wire_id { hit -> TRUE. } }
+        sc q -- ( -> e) { if (e $w) == wire_id { hit -> TRUE. } }
         return hit.
     }
-    // AGE-ONLY retention (ship-review major-3): an entry is evicted only past
-    // unacked_ttl_seconds — no count-based eviction inside the sender's redrive
-    // window. The hard storage ceiling above is the sole exception; crossing it
-    // returns the dropped wire_id so the CALLER surfaces the guarantee loss.
-    fn delivered_note (cid: global_id, wire_id: str) -> ( $dropped -> str+ )
+    fn wire_id_valid (wire_id: str) -> bool
     {
-        dropped is str+ = NIL.
+        return wire_id == "" || (_strlen wire_id) <= wire_id_max_chars.
+    }
+    // Accepted inbound ordering is deliberately prune-expired → enforce count →
+    // append. Normal oldest eviction at 50 is the protocol boundary, not degradation.
+    fn delivered_note (cid: global_id, wire_id: str) -> nil
+    {
         if wire_id != ""
         {
             now = (current_transaction_info::get_transaction_time())?.
             q0 = delivered_wire cid.
-            aged is delivered_entry_t[] = [].
-            if q0 != NIL
-            {
-                sc q0? -- ( -> e)
-                { if (_substract_seconds now (e $d)) <= unacked_ttl_seconds { aged (_count aged|) -> e. } }
-            }
             q is delivered_entry_t[] = [].
-            skip is int = 0.
-            if (_count aged|) >= delivered_wire_hard_cap
-            {
-                skip -> 1.
-                sc aged -- ( -> e) { if dropped == NIL { dropped -> (e $w). } }
-            }
-            i is int = 0.
-            sc aged -- ( -> e) { if i >= skip { q (_count q|) -> e. }  i -> i + 1. }
+            if q0 != NIL { q -> delivered_normalize q0? now (redrive_window_cap - 1). }
             q (_count q|) -> ($w -> wire_id, $d -> now).
             delivered_wire cid -> q.
         }
-        return ( $dropped -> dropped ).
+        return NIL.
     }
     // Drop the entries a delivered/read receipt covers. Returns TRUE when anything cleared.
     fn unacked_clear (cid: global_id, ids: str[]) -> bool
@@ -3849,6 +3853,26 @@ library a2a_messaging loads libraries
         sc flush_mig_deferred_actions sender_id -- ( -> a) { acts (_count acts|) -> a. }
         return acts.
     }
+    // A successfully authenticated/decrypted app envelope with an oversized wire ID
+    // is rejected as protocol error data before dedup lookup or app deposit. Decrypt
+    // advanced the ratchet, so preserve all successful-decode convergence bookkeeping
+    // and save state exactly as the accepted/duplicate paths do; emit no receipt.
+    fn mig_e2e_invalid_wire_actions (sender_id: global_id, env_sid: bin+, do_ic: bool, pre_sid: bin+, is_file: bool) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { acts (_count acts|) -> a. } }
+        if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+        if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
+        post_sid is bin+ = e2e::active_session_id sender_id.
+        if pre_sid != NIL && post_sid != NIL && (pre_sid?) != (post_sid?)
+        { sc redrive_unacked_actions sender_id -- ( -> a) { acts (_count acts|) -> a. } }
+        if is_file
+        { acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "", $code -> "invalid_wire_id", $file -> TRUE). }
+        else
+        { acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> FALSE, $wire_id -> "", $code -> "invalid_wire_id"). }
+        acts (_count acts|) -> _save_state NIL.
+        return acts.
+    }
     // Delivery tail shared by both handlers: DELIVERED receipt (gated on a wire_id) + the §4
     // $e2e_app_recv notify (session_id from the ACTUAL inbound envelope, non-circular #1867 proof) +
     // _save_state (the e2e decode advanced the ratchet — persist unconditionally on the accept path).
@@ -3862,11 +3886,7 @@ library a2a_messaging loads libraries
         if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
         // Record the delivery for the at-least-once redrive dedup (no-op on ""). Rides the
         // same tx as the deposit, so guard and inbox commit or roll back together.
-        // Ship-review major-3: crossing the storage ceiling drops the oldest in-TTL
-        // entry — a real dedup-guarantee loss, surfaced, never silent.
-        dn = delivered_note sender_id wire_id.
-        if (dn $dropped) != NIL
-        { acts (_count acts|) -> _notify_agent ($event -> $dedup_degraded, $cid -> sender_id, $dropped_wire_id -> ((dn $dropped)?)). }
+        delivered_note sender_id wire_id.
         if wire_id != ""
         { sc receipt_actions sender_id "delivered" [wire_id] -- ( -> a) { acts (_count acts|) -> a. } }
         acts (_count acts|) -> _notify_agent ($event -> $e2e_app_recv, $cid -> sender_id, $session_id -> env_sid, $ok -> TRUE, $wire_id -> wire_id).
@@ -3997,6 +4017,9 @@ library a2a_messaging loads libraries
         reply_to is a2a_protocol::reply_ref_t+ = NIL.
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
 
+        if (wire_id_valid wire_id) != TRUE
+        { return transaction::success (mig_e2e_invalid_wire_actions sender_id env_sid do_ic pre_sid FALSE). }
+
         // core 0.11 self-heal: at-least-once redrive dedup. An already-delivered wire_id
         // RE-ACKS (so the sender's unacked buffer clears even when the first receipt was
         // lost) but never re-deposits into the inbox. The decode above ADVANCED the
@@ -4120,6 +4143,9 @@ library a2a_messaging loads libraries
         if (iv $wire_id) != NIL { wire_id -> (iv $wire_id) safe str. }
         reply_to is a2a_protocol::reply_ref_t+ = NIL.
         if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
+
+        if (wire_id_valid wire_id) != TRUE
+        { return transaction::success (mig_e2e_invalid_wire_actions sender_id env_sid do_ic pre_sid TRUE). }
 
         // At-least-once redrive dedup for FILES (finding E) — mirrors the message
         // handler: a re-delivered wire_id RE-ACKS (the sender's buffer clears even
@@ -5539,21 +5565,43 @@ library a2a_messaging loads libraries
         {
             // Current shape first; a pre-H blob carried bare wire_id strings — migrate
             // them with the import time as the delivery date (they age out on the same
-            // TTL clock from now, which can only RETAIN LONGER, never dedup less).
-            dwn = (data $delivered_wire) safe (global_id ->> delivered_entry_t[]).
-            if dwn != NIL { delivered_wire -> dwn?. }
+            // TTL clock from now, which can only RETAIN LONGER, never dedup less). Both
+            // shapes normalize immediately to the newest in-TTL redrive window so a
+            // legacy oversized snapshot re-exports and restarts in bounded form.
+            dnow = (current_transaction_info::get_transaction_time())?.
+            raw_dw = data $delivered_wire.
+            old_shape is bool = FALSE.
+            shape_known is bool = FALSE.
+            sc raw_dw -- (_ -> raw_entries)
+            {
+                if shape_known != TRUE
+                {
+                    sc raw_entries -- ( -> raw_entry)
+                    {
+                        if shape_known != TRUE
+                        {
+                            old_shape -> (_typeof raw_entry) == "STRING".
+                            shape_known -> TRUE.
+                        }
+                    }
+                }
+            }
+            if old_shape != TRUE
+            {
+                dwn = raw_dw safe (global_id ->> delivered_entry_t[]).
+                delivered_wire -> (,).
+                sc dwn -- (mcid -> entries)
+                { delivered_wire mcid -> delivered_normalize entries dnow redrive_window_cap. }
+            }
             else
             {
-                dwo = (data $delivered_wire) safe (global_id ->> str[]).
-                if dwo != NIL
+                dwo = raw_dw safe (global_id ->> str[]).
+                delivered_wire -> (,).
+                sc dwo -- (mcid -> ws)
                 {
-                    mnow = (current_transaction_info::get_transaction_time())?.
-                    sc dwo? -- (mcid -> ws)
-                    {
-                        mq is delivered_entry_t[] = [].
-                        sc ws -- ( -> w) { mq (_count mq|) -> ($w -> w, $d -> mnow). }
-                        delivered_wire mcid -> mq.
-                    }
+                    mq is delivered_entry_t[] = [].
+                    sc ws -- ( -> w) { mq (_count mq|) -> ($w -> w, $d -> dnow). }
+                    delivered_wire mcid -> delivered_normalize mq dnow redrive_window_cap.
                 }
             }
         }

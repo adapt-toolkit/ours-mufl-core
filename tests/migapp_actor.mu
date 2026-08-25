@@ -30,6 +30,7 @@ application actor loads libraries
     hidden
     {
         fn _return_data (payload: any) = (transaction::action::return_data ($kind -> $data, $payload -> payload)).
+        fn _save_state (_) = (transaction::action::return_data ($kind -> $save_state)).
         _read_or_abort = grab( _read_or_abort ).
         key_storage::init ($_read_or_abort -> _read_or_abort).
         encrypted_channel::init ($_read_or_abort -> _read_or_abort).
@@ -41,6 +42,7 @@ application actor loads libraries
         qa_recv_file is str = "".
         qa_recv_flen is int = 0.
         qa_recv_count is int = 0.
+        qa_receipt_count is int = 0.
         qa_recv_abort is bool = FALSE.
         a2a_messaging::init (
             $_read_or_abort      -> _read_or_abort,
@@ -58,7 +60,7 @@ application actor loads libraries
                 qa_recv_count -> (qa_recv_count + 1).
                 return []. },
             $on_file_sent        -> fn (_: any) -> transaction::action::type[] { return []. },
-            $on_receipt_received -> fn (_: any) -> transaction::action::type[] { return []. }
+            $on_receipt_received -> fn (_: any) -> transaction::action::type[] { qa_receipt_count -> qa_receipt_count + 1. return []. }
         ).
     }
 
@@ -113,6 +115,47 @@ application actor loads libraries
     // ── delivery observability + the must-fix-C rollback probe.
     trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
     trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
+    trn readonly qa_receipt_count _ { return ($count -> qa_receipt_count). }
+    trn readonly qa_dedup_count _:($cid -> cid: global_id)
+    {
+        q = a2a_messaging::delivered_wire cid.
+        n is int = 0.
+        if q != NIL { n -> _count q?|. }
+        return ($count -> n).
+    }
+    trn qa_seed_dedup _:($cid -> cid: global_id, $expired_wire -> expired: str, $fresh_wires -> fresh: str[])
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        ancient = _time_from_seconds_and_nanoseconds_since_epoch 0 0.
+        q is a2a_messaging::delivered_entry_t[] = [($w -> expired, $d -> ancient)].
+        sc fresh -- ( -> w) { q (_count q|) -> ($w -> w, $d -> now). }
+        a2a_messaging::delivered_wire cid -> q.
+        return transaction::success [ _return_data ($count -> (_count q|)), _save_state NIL ].
+    }
+
+    // Authenticated E2E app send with a caller-selected compatibility wire ID.
+    // This drives the production receive handlers while allowing exact 128/129 and
+    // duplicate-ID cases that the public send APIs (correctly) randomize.
+    trn qa_send_custom_message _:($cid -> cid: global_id, $text -> text: str, $wire_id -> wid: str)
+    {
+        epb = ((((a2a_messaging::peer_ads cid)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        inner = _write ($text -> text, $wire_id -> wid, $reply_to -> NIL, $pv -> a2a_versions::wire_version).
+        env = e2e::encrypt_to cid inner epb.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx cid ($name -> a2a_messaging::receive_e2e_message_tx,
+                $targ -> ($e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature))),
+            _return_data ($sent -> TRUE), _save_state NIL ].
+    }
+    trn qa_send_custom_file _:($cid -> cid: global_id, $filename -> filename: str, $wire_id -> wid: str)
+    {
+        epb = ((((a2a_messaging::peer_ads cid)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
+        inner = _write ($filename -> filename, $mime -> "application/octet-stream", $data -> (_write "x"), $wire_id -> wid, $reply_to -> NIL, $pv -> a2a_versions::wire_version).
+        env = e2e::encrypt_to cid inner epb.
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx cid ($name -> a2a_messaging::receive_e2e_file_tx,
+                $targ -> ($e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature))),
+            _return_data ($sent -> TRUE), _save_state NIL ].
+    }
     trn qa_recv_set_abort _:($abort -> ab: bool) { qa_recv_abort -> ab.  return transaction::success [ _return_data ($abort -> qa_recv_abort) ]. }
 
     // Learn a peer's version/caps (caps incl. "core.e2e" → note_e2e_seen sets contact_e2e_seen).
