@@ -422,6 +422,79 @@ async function main() {
     ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'photo.bin', 'D-file: the inbound e2e file was DELIVERED to on_file_received (over the existing born-DR session)');
     ok(!T(ro(RCV, '::actor::qa_mig_state', { cid: SND.cid }).Reduce('present').Visualize()), '★ D-file(B2): a born-DR pair does NOT migrate on inbound e2e file (migration reserved for legacy)'); }
 
+  console.log('=== migapp: bounded wire IDs + authenticated message/file duplicate semantics ===');
+  { const { I, R } = await connect('dedup-wire');
+    const [RCV, SND] = I.cid < R.cid ? [I, R] : [R, I];
+    const rcvIk = getBin(ro(RCV, '::actor::qa_e2e_ik', {}), 'ik');
+    const sndBundle = getBin(ro(SND, '::actor::qa_e2e_bundle', {}), 'bundle');
+    const first = await mutate(RCV, '::actor::qa_e2e_first_send',
+      { cid: SND.cid, pt: binv(RCV, Buffer.from('dedup-live')), peer: binv(RCV, sndBundle) });
+    await mutate(SND, '::actor::qa_e2e_recv', { from: RCV.cid, ik: binv(SND, rcvIk),
+      olm_type: +first.Reduce('olm_type').Visualize(), ciphertext: binv(SND, getBin(first, 'ciphertext')) });
+    await mutate(RCV, '::actor::qa_init_caps', { advertise: ['core.receipts.emit', 'core.receipts.receive'] });
+    await mutate(SND, '::actor::qa_init_caps', { advertise: ['core.receipts.emit', 'core.receipts.receive'] });
+    await mutate(RCV, '::actor::qa_learn_peer', { cid: SND.cid, pv: 9, caps: ['core.e2e', 'core.receipts.receive'] });
+    await mutate(SND, '::actor::qa_learn_peer', { cid: RCV.cid, pv: 9, caps: ['core.e2e', 'core.receipts.emit'] });
+    await mutate(RCV, '::actor::qa_recv_reset', {});
+
+    const w128 = 'm'.repeat(128), w129 = 'm'.repeat(129);
+    await mutate(RCV, '::actor::qa_seed_dedup', { cid: SND.cid, expired_wire: w128,
+      fresh_wires: Array.from({ length: 51 }, (_, i) => `pre-${i + 1}`) });
+    await mutate(SND, '::actor::qa_send_custom_message', { cid: RCV.cid, text: 'boundary-128', wire_id: w128 });
+    await sleep(2200);
+    let recv = ro(RCV, '::actor::qa_recv_last', {});
+    const receipt1 = +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize();
+    ok(+recv.Reduce('count').Visualize() === 1 && recv.Reduce('text').Visualize() === 'boundary-128' &&
+       +ro(RCV, '::actor::qa_dedup_count', { cid: SND.cid }).Reduce('count').Visualize() === 50,
+      'wire boundary: expired same-ID is unseen; 128-character message deposits and bounded append leaves 50');
+    await mutate(RCV, '::actor::qa_seed_dedup', { cid: SND.cid, expired_wire: 'expired-sibling',
+      fresh_wires: [...Array.from({ length: 50 }, (_, i) => `dup-pre-${i + 1}`), w128] });
+    await mutate(SND, '::actor::qa_send_custom_message', { cid: RCV.cid, text: 'must-not-redeposit', wire_id: w128 });
+    await sleep(2200);
+    recv = ro(RCV, '::actor::qa_recv_last', {});
+    const receipt2 = +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize();
+    ok(+recv.Reduce('count').Visualize() === 1 && receipt2 === receipt1 + 1 &&
+       +ro(RCV, '::actor::qa_dedup_count', { cid: SND.cid }).Reduce('count').Visualize() === 50,
+      'message duplicate re-acks without deposit and normalizes expired/oversized siblings');
+    await mutate(SND, '::actor::qa_send_custom_file', { cid: RCV.cid, filename: 'cross-kind-duplicate', wire_id: w128 });
+    await sleep(2200);
+    const crossReceipt = +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize();
+    ok(+ro(RCV, '::actor::qa_recv_last', {}).Reduce('count').Visualize() === 1 && crossReceipt === receipt2 + 1,
+      'message and file IDs share one namespace: cross-kind duplicate re-acks without file deposit');
+
+    await mutate(SND, '::actor::qa_send_custom_message', { cid: RCV.cid, text: 'oversized-129', wire_id: w129 });
+    await sleep(2200);
+    ok(+ro(RCV, '::actor::qa_recv_last', {}).Reduce('count').Visualize() === 1 &&
+       +ro(RCV, '::actor::qa_dedup_count', { cid: SND.cid }).Reduce('count').Visualize() === 50 &&
+       +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize() === crossReceipt,
+      'wire boundary: 129-character message ID emits no receipt, deposit, or dedup mutation');
+    await mutate(SND, '::actor::qa_send_custom_message', { cid: RCV.cid, text: 'after-invalid', wire_id: 'after-invalid-message' });
+    await sleep(2200);
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === 'after-invalid',
+      'oversized-message rejection saves the ratchet: the next valid item decrypts');
+
+    const fw128 = 'f'.repeat(128), fw129 = 'f'.repeat(129);
+    await mutate(SND, '::actor::qa_send_custom_file', { cid: RCV.cid, filename: 'boundary-file', wire_id: fw128 });
+    await sleep(2200);
+    const fileCount = +ro(RCV, '::actor::qa_recv_last', {}).Reduce('count').Visualize();
+    const fileReceipt1 = +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize();
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'boundary-file',
+      'wire boundary: 128-character authenticated file ID is accepted');
+    await mutate(SND, '::actor::qa_send_custom_file', { cid: RCV.cid, filename: 'duplicate-file', wire_id: fw128 });
+    await sleep(2200);
+    const fileReceipt2 = +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize();
+    ok(+ro(RCV, '::actor::qa_recv_last', {}).Reduce('count').Visualize() === fileCount && fileReceipt2 === fileReceipt1 + 1,
+      'file duplicate shares the window: re-acknowledged but not re-deposited');
+    await mutate(SND, '::actor::qa_send_custom_file', { cid: RCV.cid, filename: 'oversized-file', wire_id: fw129 });
+    await sleep(2200);
+    ok(+ro(RCV, '::actor::qa_recv_last', {}).Reduce('count').Visualize() === fileCount &&
+       +ro(SND, '::actor::qa_receipt_count', {}).Reduce('count').Visualize() === fileReceipt2,
+      'wire boundary: 129-character file ID emits no receipt or deposit');
+    await mutate(SND, '::actor::qa_send_custom_file', { cid: RCV.cid, filename: 'after-invalid-file', wire_id: 'after-invalid-file' });
+    await sleep(2200);
+    ok(ro(RCV, '::actor::qa_recv_last', {}).Reduce('filename').Visualize() === 'after-invalid-file',
+      'oversized-file rejection saves the ratchet: the next valid file decrypts'); }
+
   console.log('\n================ MIGAPP ================');
   if (scorecard.length === 0) console.log('MIGAPP: ALL GREEN');
   else { console.log(`${scorecard.length} FAILURE(S):`); scorecard.forEach((s) => console.log('  ' + s)); }

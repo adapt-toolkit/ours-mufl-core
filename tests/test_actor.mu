@@ -233,6 +233,85 @@ application actor loads libraries
     // ephemeral secret store appears in the portable export.
     trn readonly qa_export_core _ { return ($core -> (a2a_messaging::export_core_state NIL)). }
 
+    // ---- receive-side E2E dedup window QA ----
+    trn qa_dedup_note _:($contact -> cid: global_id, $wire_id -> wid: str)
+    {
+        a2a_messaging::delivered_note cid wid.
+        return transaction::success [ _return_data ($noted -> TRUE), _save_state NIL ].
+    }
+    trn readonly qa_dedup_state _:($contact -> cid: global_id)
+    {
+        q = a2a_messaging::delivered_wire cid.
+        ids is str[] = [].
+        bytes is int = 0.
+        if q != NIL
+        {
+            sc q? -- ( -> e) { ids (_count ids|) -> (e $w). }
+            bytes -> _binlen (_write q?).
+        }
+        return ($count -> (_count ids|), $ids -> ids, $serialized_bytes -> bytes).
+    }
+    trn readonly qa_dedup_seen _:($contact -> cid: global_id, $wire_id -> wid: str)
+    { return ($seen -> (a2a_messaging::wire_seen cid wid)). }
+    trn qa_dedup_seed _:($contact -> cid: global_id, $wire_ids -> wids: str[], $expire_first -> expire_first: bool)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        ancient = _time_from_seconds_and_nanoseconds_since_epoch 0 0.
+        q is a2a_messaging::delivered_entry_t[] = [].
+        i is int = 0.
+        sc wids -- ( -> w)
+        {
+            d = now.
+            if expire_first && i == 0 { d -> ancient. }
+            q (_count q|) -> ($w -> w, $d -> d).
+            i -> i + 1.
+        }
+        a2a_messaging::delivered_wire cid -> q.
+        return transaction::success [ _return_data ($seeded -> (_count wids|)), _save_state NIL ].
+    }
+    trn qa_dedup_import _:($contact -> cid: global_id, $wire_ids -> wids: str[], $legacy -> legacy: bool)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        current is a2a_messaging::delivered_entry_t[] = [].
+        old is str[] = [].
+        sc wids -- ( -> w)
+        {
+            current (_count current|) -> ($w -> w, $d -> now).
+            old (_count old|) -> w.
+        }
+        if legacy
+        {
+            dw_old is (global_id ->> str[]) = (,).
+            dw_old cid -> old.
+            a2a_messaging::import_core_state ($my_name -> "DedupImport", $contacts -> (,), $peer_ads -> (,), $delivered_wire -> dw_old).
+        }
+        else
+        {
+            dw_new is (global_id ->> a2a_messaging::delivered_entry_t[]) = (,).
+            dw_new cid -> current.
+            a2a_messaging::import_core_state ($my_name -> "DedupImport", $contacts -> (,), $peer_ads -> (,), $delivered_wire -> dw_new).
+        }
+        return transaction::success [ _return_data ($imported -> (_count wids|)), _save_state NIL ].
+    }
+    trn qa_dedup_restart _
+    {
+        state = a2a_messaging::export_core_state NIL.
+        a2a_messaging::import_core_state state.
+        return transaction::success [ _return_data ($restarted -> TRUE), _save_state NIL ].
+    }
+    trn qa_unacked_fill _:($contact -> cid: global_id, $wire_ids -> wids: str[])
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        sc wids -- ( -> w)
+        {
+            a2a_messaging::unacked_note cid "m" w (_write ($wire_id -> w)) now.
+        }
+        q = a2a_messaging::unacked_e2e cid.
+        n is int = 0.
+        if q != NIL { n -> _count q?|. }
+        return transaction::success [ _return_data ($count -> n), _save_state NIL ].
+    }
+
     // Simulate a breaking-change migration that carried contacts but dropped the
     // address documents (the spec's "degraded contact" state).
     trn qa_strip_peer_ads _
