@@ -322,13 +322,12 @@ re-registers that sender — idempotent, and semantically what the mode means. I
 re-redemption can re-add a previously removed peer. `revoke_invite` is the control, which is
 why it ships with the mode rather than after it.
 
-**Known limitation:** `import_core_state` still resets `pending_invites` to empty, so a public
-invite does not survive a daemon restart and must be re-published. The blocker is INV-4 — the
-invite's ephemeral private key cannot ride the export blob. Making a public invite genuinely
-perpetual requires either a local-only secret sidecar the host re-injects at boot, or a
-secret-free public leg 1; that is an owner-level security decision and is deliberately not
-taken here. `generate_invite` and the MCP tool text state the limitation rather than implying
-durability the code does not provide.
+**Restart compatibility:** the format-1 export adds optional `$public_invites` and
+`$public_invite_keys` projections of the existing runtime maps. Only reusable public pairs are
+included; one-time invites remain transient. New code restores a pair only after validating the
+complete ID set, public mode, empty assignment, supported scheme, and matching key IDs. An old
+export without either additive field imports as having no recoverable public invites. Old code
+ignores the additive fields, so the format stamp and invite/wire shapes do not change.
 
 **Provenance:** `contact_origin` (cid → `$via`/`$invite_id`/`$at`, exported additively,
 readable via `list_contact_origins`) records how each contact was admitted, so a future trust

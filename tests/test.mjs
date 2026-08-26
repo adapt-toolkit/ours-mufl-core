@@ -174,6 +174,54 @@ async function main() {
        !new RegExp(PI.cid).test(lc(PC)), `revoked $public invite cannot admit another peer`);
   }
 
+  // ---------- T2c durable public invite serialization round-trip ----------
+  CUR = 'T2c durable-public-import';
+  console.log('\n=== T2c durable public invite serialization round-trip ===');
+  {
+    const DP = mk('durable-public'); const DR = mk('durable-redeemer');
+    await mkPacket(DP, 'durable-public-seed');
+    await mkPacket(DR, 'durable-redeemer-seed');
+    await setName(DP, 'DurableInviter'); await setName(DR, 'DurableRedeemer');
+    const minted = await mutate(DP, '::a2a_messaging::generate_invite', { mode: 'public' });
+    const durableBlob = Buffer.from(minted.Reduce('invite').GetBinary());
+    const durableId = minted.Reduce('invite_id').Visualize();
+    let mismatchRejected = false;
+    try { await mutate(DP, '::actor::qa_import_mismatched_public_key', {}); }
+    catch (e) { mismatchRejected = /keypair does not match/i.test(String(e)); }
+    ok(mismatchRejected && st(DP).pi === 1,
+      `mismatched record/key import aborts atomically without replacing live authority`);
+    const saved = Buffer.from(ro(DP, '::actor::export_state', undefined).Serialize());
+    const originalCid = DP.cid;
+
+    wrapper.remove_packet(DP.cid);
+    const DP2 = mk('durable-public-restored');
+    await mkPacket(DP2, 'durable-public-seed');
+    ok(DP2.cid === originalCid, `replacement packet has the same stable identity`);
+    await mutate(DP2, '::actor::import_state', DP2.pw.packet.ParseValue(new Uint8Array(saved)));
+    const rows = ro(DP2, '::a2a_messaging::list_invites', undefined);
+    ok(st(DP2).pi === 1 && new RegExp(durableId).test(rows.Visualize()),
+      `format-1 import restores the same public invite id exactly once`);
+    await mutate(DP2, '::actor::import_state', DP2.pw.packet.ParseValue(new Uint8Array(saved)));
+    ok(st(DP2).pi === 1, `repeated byte-identical import is idempotent`);
+
+    await mutate(DR, '::a2a_messaging::add_contact', { invite: binv(DR, durableBlob) });
+    await sleep(5000);
+    ok(new RegExp(DR.cid).test(lc(DP2)), `the exact pre-export blob redeems after Serialize → ParseValue → import`);
+
+    await mutate(DP2, '::a2a_messaging::revoke_invite', { invite_id: durableId });
+    const revokedSaved = Buffer.from(ro(DP2, '::actor::export_state', undefined).Serialize());
+    wrapper.remove_packet(DP2.cid);
+    const DP3 = mk('durable-public-revoked');
+    await mkPacket(DP3, 'durable-public-seed');
+    await mutate(DP3, '::actor::import_state', DP3.pw.packet.ParseValue(new Uint8Array(revokedSaved)));
+    ok(st(DP3).pi === 0, `post-revoke snapshot cannot resurrect public authority`);
+
+    const oldStyle = await mutate(DP3, '::a2a_messaging::generate_invite', { mode: 'public' });
+    ok(oldStyle.Reduce('invite_id').Visualize() !== '', `old-export fallback probe minted public authority`);
+    await mutate(DP3, '::actor::qa_import_without_public_fields', {});
+    ok(st(DP3).pi === 0, `format-1 export without additive public fields recovers no invites`);
+  }
+
   // ---------- T3 single-use (reuse blob1, already consumed) ----------
   CUR = 'T3 single-use';
   console.log('\n=== T3 single-use ===');
@@ -277,14 +325,22 @@ async function main() {
   // ---------- T9 export-secrecy ----------
   CUR = 'T9 export-secrecy';
   console.log('\n=== T9 export-secrecy ===');
-  await mutate(I, '::a2a_messaging::generate_invite', { name: 'P9' }); // ensure an outstanding invite (eph secret present)
+  const oneTime9 = await mutate(I, '::a2a_messaging::generate_invite', { name: 'P9' });
+  const public9 = await mutate(I, '::a2a_messaging::generate_invite', { mode: 'public' });
   const exp = ro(I, '::actor::qa_export_core', undefined).Reduce('core');
   const expStr = exp.Serialize ? Buffer.from(exp.Serialize()).toString('latin1') : '';
   const expVis = exp.Visualize();
   ok(!/pending_invite_keys/.test(expVis), `export_core_state has NO pending_invite_keys field`);
   ok(!/pending_redemption_keys/.test(expVis), `export_core_state has NO pending_redemption_keys field`);
-  // the exported pending_invites entry must carry only assigned/eph_pub/scheme (public) — not a secret field
-  ok(/eph_pub|\$eph_pub/.test(expVis) || /pending_invites/.test(expVis), `export carries the public pending_invites record (eph_pub/assigned/scheme only)`);
+  const publicId9 = public9.Reduce('invite_id').Visualize();
+  const oneTimeId9 = oneTime9.Reduce('invite_id').Visualize();
+  const durableVis = exp.Reduce('public_invites').Visualize();
+  const durableKeysVis = exp.Reduce('public_invite_keys').Visualize();
+  ok(new RegExp(publicId9).test(durableVis) && !new RegExp(oneTimeId9).test(durableVis),
+    `durable invite projection contains public records only`);
+  ok(new RegExp(publicId9).test(durableKeysVis) && !new RegExp(oneTimeId9).test(durableKeysVis),
+    `durable key projection contains matching public keys only`);
+  ok(!/PRIVKEY|SECRETKEY/i.test(durableKeysVis), `Visualize does not render raw invite secret material`);
 
   // ---------- T2 happy-role (chain verified BOTH legs) ----------
   CUR = 'T2 happy-role';
@@ -318,7 +374,9 @@ async function main() {
   await mutate(I2, '::actor::import_state', adData);
   const s10 = st(I2);
   ok(s10.c >= 1 && s10.p >= 1, `import restored contacts + peer_ads (c=${s10.c},peer_ads=${s10.p})`);
-  ok(s10.pi === 0, `import reset pending_invites to empty (migration) → ${s10.pi}`);
+  const importedInvites = ro(I2, '::a2a_messaging::list_invites', undefined).Visualize();
+  ok(s10.pi === 1 && new RegExp(publicId9).test(importedInvites) && !new RegExp(oneTimeId9).test(importedInvites),
+    `import restores only the public invite and drops the one-time invite (pi=${s10.pi})`);
   ok(new RegExp(R.cid).test(lc(I2)), `imported state includes the original contact (responder)`);
   // version-0 path: strip the stamp from a re-exported blob → still imports.
   const exp0 = ro(I2, '::actor::export_state', undefined);
