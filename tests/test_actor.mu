@@ -312,6 +312,31 @@ application actor loads libraries
         return transaction::success [ _return_data ($count -> n), _save_state NIL ].
     }
 
+    trn qa_import_mismatched_public_key _
+    {
+        data = a2a_messaging::export_core_state NIL.
+        bad_keys is (global_id ->> secretkey_encrypt) = (,).
+        sc a2a_messaging::pending_invites -- (iid -> rec) ?? (_count bad_keys|) == 0 &&
+            (a2a_protocol::normalize_invite_mode (rec $mode)) == a2a_protocol::invite_mode_public
+        {
+            substitute = _crypto_construct_encryption_keypair (rec $scheme).
+            bad_keys iid -> (substitute $secret_key).
+        }
+        abort "qa_import_mismatched_public_key requires one public invite" when (_count bad_keys|) != 1.
+        data $public_invite_keys -> bad_keys.
+        a2a_messaging::import_core_state data.
+        return transaction::success [ _return_data ($unexpected_success -> TRUE) ].
+    }
+
+    trn qa_import_without_public_fields _
+    {
+        data = a2a_messaging::export_core_state NIL.
+        data $public_invites -> NIL.
+        data $public_invite_keys -> NIL.
+        a2a_messaging::import_core_state data.
+        return transaction::success [ _return_data ($imported -> TRUE), _save_state NIL ].
+    }
+
     // Simulate a breaking-change migration that carried contacts but dropped the
     // address documents (the spec's "degraded contact" state).
     trn qa_strip_peer_ads _

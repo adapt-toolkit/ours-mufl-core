@@ -225,8 +225,11 @@ library a2a_messaging loads libraries
     // core 3.0: invites I generated, keyed by invite id. Holds the NON-secret
     // per-invite material — the assigned contact name ("" = none), the ephemeral
     // encryption PUBLIC key shipped in the slim invite, and the crypto scheme id.
-    // The matching ephemeral PRIVATE key lives in the hidden, non-exported
-    // pending_invite_keys store (INV-4) and is consumed together on first redeem.
+    // The matching ephemeral PRIVATE key lives in the hidden pending_invite_keys
+    // store and is consumed together on first redeem. Public-invite pairs are the
+    // sole exception to its transient/export boundary: export_core_state carries
+    // them inside the authenticated identity-state blob so posted public invites
+    // survive restart; one-time invite keys remain transient.
     // core 0.13: $mode makes the one-time-vs-public distinction EXPLICIT and
     // INVITER-SIDE-AUTHORITATIVE. It is nullable purely for import compatibility
     // (a pre-0.13 record has no such field) and a NIL reads as one-time — the
@@ -471,12 +474,11 @@ library a2a_messaging loads libraries
         advertised_caps is str = "".
 
         // core 3.0: per-outstanding-invite ephemeral PRIVATE keys, keyed by invite id.
-        // hidden ⇒ only this library mutates it AND it is structurally invisible to the
-        // export record builder, but `hidden` governs VISIBILITY, not persistence — it
-        // is deliberately NEVER added to export_core_state (INV-4: secrets must not ride
-        // the portable export blob; empirically the SDK export serializer also corrupts
-        // raw secret keys). Consumed (deleted) together with pending_invites[id] on the
-        // first valid redemption. Outstanding entries do not survive a daemon restart.
+        // hidden ⇒ only this library mutates it and management/listing surfaces cannot
+        // expose it. One-time entries are never exported. The public-only projection is
+        // carried by export_core_state under the same authenticated identity-state
+        // boundary as other local key/session material, and restored as an exact pair.
+        // Consumed (deleted) together with pending_invites[id] on one-time redemption.
         pending_invite_keys is (global_id ->> secretkey_encrypt) = (,).
 
         // core 3.0: RESPONDER-side per-redemption ephemeral PRIVATE keys, keyed by
@@ -5231,11 +5233,24 @@ library a2a_messaging loads libraries
 
     fn export_core_state (_) -> any
     {
+        durable_public_invites is (global_id ->> pending_invite_t) = (,).
+        durable_public_invite_keys is (global_id ->> secretkey_encrypt) = (,).
+        sc pending_invites -- (iid -> rec) ??
+            (a2a_protocol::normalize_invite_mode (rec $mode)) == a2a_protocol::invite_mode_public &&
+            (pending_invite_keys iid) != NIL
+        {
+            durable_public_invites iid -> rec.
+            durable_public_invite_keys iid -> (pending_invite_keys iid)?.
+        }
         return (
             $my_name         -> my_name,
             $contacts        -> contacts,
             $import_renames  -> import_renames,
             $pending_invites -> pending_invites,
+            // Additive format-1 fields. Only reusable public authority is durable;
+            // one-time invite secrets never enter the exported identity state.
+            $public_invites -> durable_public_invites,
+            $public_invite_keys -> durable_public_invite_keys,
             $peer_ads        -> peer_ads,
             $my_bio          -> my_bio,
             $my_persona      -> my_persona,
@@ -5373,28 +5388,32 @@ library a2a_messaging loads libraries
             }
         }
         contacts -> deduped.
-        // core 3.0 migration: pending_invites changed shape (pre-3.0 (global_id ->>
-        // str) → (global_id ->> pending_invite_t)). It is reset to EMPTY on import,
-        // unconditionally and for BOTH shapes: a pre-3.0 str-map is incompatible (so
-        // it is dropped rather than safe-cast, which would abort), and even a 3.0
-        // record-map entry is unredeemable after import because its matching
-        // ephemeral private key (pending_invite_keys) is hidden + NEVER exported
-        // (INV-4). The responder-side stores (pending_redemptions /
-        // pending_redemption_keys) are likewise not exported and default to empty
-        // here. Net: outstanding invites/redemptions are transient — they do not
-        // survive export/import or a daemon restart, fail-closed (plan §4.4).
-        //
-        // core 0.13 KNOWN LIMITATION, deliberately not worked around here: this
-        // applies to PUBLIC (reusable) invites too, so a publicly posted blob stops
-        // being redeemable after a daemon restart and must be re-published. The
-        // blocker is exactly the one above — the invite's ephemeral PRIVATE key
-        // cannot ride this blob (INV-4, plus the serializer corrupts raw secret
-        // keys) — so making a public invite genuinely perpetual requires either a
-        // local-only secret sidecar the host re-injects at boot, or a secret-free
-        // public leg 1. That is an owner-level security decision and is NOT taken
-        // here; generate_invite's result and the MCP tool text say so plainly
-        // rather than implying a durability the code does not provide.
-        pending_invites -> (,).
+        // Invite durability is an additive format-1 extension. Old exports omit one
+        // or both public fields and safely recover no invite authority. New exports
+        // restore only complete public record/key pairs, staged and validated before
+        // either runtime map is published. The existing pending_invite_t, minting and
+        // wire blob stay unchanged; one-time invites remain transient.
+        restored_public_invites is (global_id ->> pending_invite_t) = (,).
+        restored_public_invite_keys is (global_id ->> secretkey_encrypt) = (,).
+        if (data $public_invites) != NIL && (data $public_invite_keys) != NIL
+        {
+            src_public_invites = (data $public_invites) safe (global_id ->> pending_invite_t).
+            src_public_invite_keys = (data $public_invite_keys) safe (global_id ->> secretkey_encrypt).
+            abort "Public invite state has mismatched record/key counts." when (_count src_public_invites|) != (_count src_public_invite_keys|).
+            sc src_public_invites -- (iid -> rec)
+            {
+                key = src_public_invite_keys iid.
+                abort "Public invite state is missing its matching secret key." when key == NIL.
+                abort "Imported durable invite is not public." when (a2a_protocol::normalize_invite_mode (rec $mode)) != a2a_protocol::invite_mode_public.
+                abort "Imported public invite has an assigned contact name." when (rec $assigned) != "".
+                abort "Imported public invite uses an unsupported crypto scheme." when (rec $scheme) != _crypto_default_scheme_id().
+                abort "Imported public invite keypair does not match." when _crypto_get_key_id key? != _crypto_get_key_id (rec $eph_pub).
+                restored_public_invites iid -> rec.
+                restored_public_invite_keys iid -> key?.
+            }
+        }
+        pending_invites -> restored_public_invites.
+        pending_invite_keys -> restored_public_invite_keys.
         // Restore handshake state is transient exactly like pending_invites: the eph
         // PRIVATE halves are hidden + never exported, so imported records would be
         // unanswerable. The boot sweep (restore_degraded_contacts) re-mints them.
