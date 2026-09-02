@@ -66,9 +66,9 @@ application actor loads libraries
                     qa_recv_wire -> ((a $wire_id) safe str).
                     qa_recv_wires -> qa_recv_wires + qa_recv_wire + ",".
                 }
-                kind is str = a2a_protocol::message_kind_text.
-                if (a $message_kind) != NIL { kind -> ((a $message_kind) safe str). }
-                qa_recv_kinds -> qa_recv_kinds + kind + ",".
+                kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+                if (a $message_kind) != NIL { kind -> ((a $message_kind) safe a2a_protocol::message_kind_t). }
+                qa_recv_kinds -> qa_recv_kinds + (_str kind) + ",".
                 reply_wire is str = "-".
                 if (a $reply_to) != NIL { reply_wire -> ((a $reply_to) $wire_id) safe str. }
                 qa_recv_reply_wires -> qa_recv_reply_wires + reply_wire + ",".

@@ -94,6 +94,8 @@ async function main() {
   ok(T(g('msg.v9_missing_wire.ok')), 'msg v9: optional wire_id behavior remains unchanged');
   ok(T(g('msg.v10.ok')) && g('msg.v10.kind') === 'command', 'msg v10: required command kind preserved');
   ok(!T(g('msg.missing.ok')) && g('msg.missing.code') === 'payload_shape_unrecognized', 'msg v10: missing kind rejected, never text');
+  ok(!T(g('msg.unknown_kind.ok')) && g('msg.unknown_kind.code') === 'payload_shape_unrecognized', 'msg v10: unknown enum kind rejected as error-as-data');
+  ok(!T(g('msg.bad_kind_type.ok')) && g('msg.bad_kind_type.code') === 'payload_shape_unrecognized', 'msg v10: non-string enum kind rejected as error-as-data');
   ok(!T(g('msg.missing_wire.ok')) && g('msg.missing_wire.code') === 'payload_shape_unrecognized', 'msg v10: missing wire_id rejected');
   ok(!T(g('msg.bad_wire.ok')) && g('msg.bad_wire.code') === 'payload_shape_unrecognized', 'msg v10: non-string wire_id rejected');
   ok(!T(g('msg.bad_reply_wire.ok')) && g('msg.bad_reply_wire.code') === 'payload_shape_unrecognized', 'msg v10: malformed reply wire_id rejected');

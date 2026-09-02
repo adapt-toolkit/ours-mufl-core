@@ -726,7 +726,7 @@ library a2a_versions loads library a2a_protocol
         $wire_id      -> str,
         $reply_to     -> a2a_protocol::reply_ref_t+,
         $pv           -> int,
-        $message_kind -> str
+        $message_kind -> a2a_protocol::message_kind_t
     ).
     metadef msg_payload_t: msg_payload_v10_t || msg_payload_v9_t.
     metadef msg_versions_t: [msg_payload_v9_t, msg_payload_v10_t].
@@ -758,22 +758,25 @@ library a2a_versions loads library a2a_protocol
             if is_str (raw $wire_id) != TRUE
                 || (reply != NIL && (is_str (reply $wire_id) != TRUE
                     || ((reply $sentence) != NIL && is_int (reply $sentence) != TRUE)))
-                || is_str (raw $message_kind) != TRUE
-                || (((raw $message_kind) safe str) != "text"
-                    && ((raw $message_kind) safe str) != "command"
-                    && ((raw $message_kind) safe str) != "command_result")
             {
                 return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "msg" v msg_max_version).
             }
-            return ($ok -> TRUE, $payload -> raw safe msg_payload_v10_t, $err -> NIL).
+            // The closed enum SAFE-cast is the membership check. Catch its
+            // provisional mismatch so malformed wire input remains error-as-data.
+            WHEN provisional abort _kind_error
+            {
+                narrowed = raw safe msg_payload_v10_t.
+                return ($ok -> TRUE, $payload -> narrowed, $err -> NIL).
+            }
+            return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "msg" v msg_max_version).
         }
         return ($ok -> TRUE, $payload -> raw safe msg_payload_v9_t, $err -> NIL).
     }
-    fn msg_kind (input: any) -> str
+    fn msg_kind (input: any) -> a2a_protocol::message_kind_t
     {
         raw = input as any.
         if rmsg_version_of raw >= 10 { return (raw safe msg_payload_v10_t) $message_kind. }
-        return "text".
+        return a2a_protocol::message_kind_text.
     }
 
     // Actor-owned contact entry surfaces are registered here so their v10

@@ -97,6 +97,8 @@ application actor loads libraries
         m9_missing_wire = a2a_versions::try_narrow_msg ($text -> "legacy", $reply_to -> NIL, $pv -> 9).
         m10 = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w10", $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
         m10_missing = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "bad", $reply_to -> NIL, $pv -> 10).
+        m10_unknown_kind = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w", $reply_to -> NIL, $pv -> 10, $message_kind -> "future_kind").
+        m10_bad_kind_type = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w", $reply_to -> NIL, $pv -> 10, $message_kind -> 42).
         m10_missing_wire = a2a_versions::try_narrow_msg ($text -> "{}", $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
         m10_bad_wire = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> 42, $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
         m10_bad_reply_wire = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w", $reply_to -> ($wire_id -> 42, $sentence -> NIL), $pv -> 10, $message_kind -> "command_result").
@@ -224,6 +226,8 @@ application actor loads libraries
                 $v9_missing_wire -> ($ok -> (m9_missing_wire $ok)),
                 $v10 -> ($ok -> (m10 $ok), $kind -> (a2a_versions::msg_kind ((m10 $payload)?))),
                 $missing -> ($ok -> (m10_missing $ok), $code -> (((m10_missing $err)?) $code)),
+                $unknown_kind -> ($ok -> (m10_unknown_kind $ok), $code -> (((m10_unknown_kind $err)?) $code)),
+                $bad_kind_type -> ($ok -> (m10_bad_kind_type $ok), $code -> (((m10_bad_kind_type $err)?) $code)),
                 $missing_wire -> ($ok -> (m10_missing_wire $ok), $code -> (((m10_missing_wire $err)?) $code)),
                 $bad_wire -> ($ok -> (m10_bad_wire $ok), $code -> (((m10_bad_wire $err)?) $code)),
                 $bad_reply_wire -> ($ok -> (m10_bad_reply_wire $ok), $code -> (((m10_bad_reply_wire $err)?) $code)),

@@ -39,7 +39,7 @@ application actor loads libraries
         // qa_recv_abort makes the message hook ABORT (must-fix-C rollback probe).
         qa_recv_text is str = "".
         qa_recv_wire is str = "".
-        qa_recv_kind is str = "".
+        qa_recv_kind is a2a_protocol::message_kind_t+ = NIL.
         qa_recv_reply_wire is str = "".
         qa_recv_file is str = "".
         qa_recv_flen is int = 0.
@@ -53,7 +53,7 @@ application actor loads libraries
                 qa_recv_text -> ((a $text) safe str).
                 if (a $wire_id) != NIL { qa_recv_wire -> ((a $wire_id) safe str). }
                 qa_recv_kind -> a2a_protocol::message_kind_text.
-                if (a $message_kind) != NIL { qa_recv_kind -> ((a $message_kind) safe str). }
+                if (a $message_kind) != NIL { qa_recv_kind -> ((a $message_kind) safe a2a_protocol::message_kind_t). }
                 qa_recv_reply_wire -> "".
                 if (a $reply_to) != NIL { qa_recv_reply_wire -> ((a $reply_to) $wire_id) safe str. }
                 qa_recv_count -> (qa_recv_count + 1).
@@ -121,7 +121,7 @@ application actor loads libraries
     // ── delivery observability + the must-fix-C rollback probe.
     trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $message_kind -> qa_recv_kind,
         $reply_wire -> qa_recv_reply_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
-    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_kind -> "".  qa_recv_reply_wire -> "".
+    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_kind -> NIL.  qa_recv_reply_wire -> "".
         qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
     trn readonly qa_receipt_count _ { return ($count -> qa_receipt_count). }
     trn readonly qa_dedup_count _:($cid -> cid: global_id)

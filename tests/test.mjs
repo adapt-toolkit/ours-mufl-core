@@ -108,8 +108,8 @@ async function main() {
 
     let invalidKind = false;
     try { await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: '{}', message_kind: 'future_kind' }); }
-    catch (e) { invalidKind = /unsupported application message kind/i.test(String(e)); }
-    ok(invalidKind, `unknown local message kind is rejected before SEND`);
+    catch (e) { invalidKind = /value set|message_kind|runtime mismatch/i.test(String(e)); }
+    ok(invalidKind, `unknown local message kind is rejected by the enum boundary before SEND`);
   }
 
   // ---------- T1 catalog contact exchange + export state ----------
@@ -138,6 +138,13 @@ async function main() {
     const restoredCatalogs = ro(CA, '::actor::qa_get_command_catalogs', { cid: CB.cid }).Visualize();
     ok(/a\.ping/.test(restoredCatalogs) && /b\.ping/.test(restoredCatalogs) && !/changed\./.test(restoredCatalogs),
       `actual export→import round-trip restores both opaque command catalogs`);
+
+    const CL = mk('catalog-legacy');
+    await mkPacket(CL, 'catalog-legacy-seed');
+    await mutate(CL, '::actor::qa_import_legacy_core', {});
+    const absentCatalogs = ro(CL, '::actor::qa_get_command_catalogs', { cid: CA.cid }).Visualize();
+    ok(!/commands/.test(absentCatalogs),
+      `legacy core import with both catalog fields absent keeps compatible empty defaults`);
   }
 
   // ---------- T1 file round-trip (send_file both directions) ----------

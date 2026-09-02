@@ -282,7 +282,7 @@ library a2a_messaging loads libraries
     // flush_deferred) once its AD is re-established. Plain data — EXPORTED.
     // $message_kind is nullable only for import compatibility with pre-v10
     // exported queues; every newly queued entry writes it explicitly.
-    metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time, $message_kind -> str+).
+    metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time, $message_kind -> a2a_protocol::message_kind_t+).
     deferred_msgs is (global_id ->> deferred_msg_t[]) = (,).
 
     // ---- core 0.9.0: per-connection E2E migration FSM (spec §5) -----------
@@ -1487,9 +1487,8 @@ library a2a_messaging loads libraries
         if q == NIL || (_count q?|) == 0 { return out. }
         sc q? -- ( -> m)
         {
-            kind is str = a2a_protocol::message_kind_text.
-            if (m $message_kind) != NIL && a2a_protocol::is_message_kind ((m $message_kind) safe str)
-            { kind -> (m $message_kind) safe str. }
+            kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+            if (m $message_kind) != NIL { kind -> (m $message_kind) safe a2a_protocol::message_kind_t. }
             out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
                 $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to),
                 $message_kind -> kind, $route -> $e2e ).
@@ -1904,14 +1903,13 @@ library a2a_messaging loads libraries
     // replies to (its stamped wire id + an optional sentence index). Every
     // message gets a fresh stringified wire id — the stable, cross-side handle
     // a reply can reference (the receiver's msg_id is local to its own inbox).
-    trn send_message _:($contact -> contact_ref: str, $text -> text: str, $reply_to -> reply_to: a2a_protocol::reply_ref_t+, $message_kind -> requested_kind: str+)
+    trn send_message _:($contact -> contact_ref: str, $text -> text: str, $reply_to -> reply_to: a2a_protocol::reply_ref_t+, $message_kind -> requested_kind: a2a_protocol::message_kind_t+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
         target_id = resolve_contact contact_ref.
-        message_kind is str = a2a_protocol::message_kind_text.
+        message_kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
         if requested_kind != NIL { message_kind -> requested_kind?. }
-        abort "Unsupported application message kind." when a2a_protocol::is_message_kind message_kind != TRUE.
         // An advertised catalog is positive peer evidence for the v10 command
         // producer path. Absence fails closed before any queue entry or SEND.
         abort "Contact does not advertise command support." when message_kind == a2a_protocol::message_kind_command && (contact_command_catalog target_id) == NIL.
@@ -3671,9 +3669,8 @@ library a2a_messaging loads libraries
             actions is transaction::action::type[] = [].
             sc q? -- ( -> m)
             {
-                kind is str = a2a_protocol::message_kind_text.
-                if (m $message_kind) != NIL && a2a_protocol::is_message_kind ((m $message_kind) safe str)
-                { kind -> (m $message_kind) safe str. }
+                kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+                if (m $message_kind) != NIL { kind -> (m $message_kind) safe a2a_protocol::message_kind_t. }
                 actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_message_tx,
                     $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to),
