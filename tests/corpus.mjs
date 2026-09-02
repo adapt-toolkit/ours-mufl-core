@@ -59,12 +59,13 @@ async function main() {
   ok(T(g('sir.v2.ok')) && g('sir.v2.v') === '2' && g('sir.v2.name') === '', 'sir v2: ok, dispatched v2, joiner_name empty (cid fallback branch)');
   ok(T(g('sir.v3.ok')) && g('sir.v3.v') === '3' && g('sir.v3.name') === 'Bob', 'sir v3: ok, dispatched v3, $name honored');
   ok(T(g('sir.v5.ok')) && g('sir.v5.v') === '5' && g('sir.v5.name') === 'Carol', 'sir v5: ok, dispatched v5, $name honored');
+  ok(T(g('sir.v10.ok')) && /\"ping\"/.test(g('sir.v10.catalog')), 'sir v10: opaque command catalog preserved');
   ok(!T(g('sir.old.ok')) && g('sir.old.code') === 'peer_version_unsupported', 'sir $pv=1 (below floor): error-as-data peer_version_unsupported');
   ok(g('sir.old.peer_v') === '1' && g('sir.old.min') === '2', `sir too-old error carries peer_version=1 min_supported=2`);
   ok(/too old/.test(g('sir.old.msg')) && /update/.test(g('sir.old.msg')), 'sir too-old error message is human-readable ("too old", "update")');
   ok(!T(g('sir.bad.ok')) && g('sir.bad.code') === 'payload_shape_unrecognized', 'sir unrecognized shape: error-as-data payload_shape_unrecognized');
   ok(!/too old/.test(g('sir.bad.msg')) && /no supported wire shape/.test(g('sir.bad.msg')), 'sir shape error message is DISTINCT from the too-old message (R2)');
-  ok(T(g('sir.fut.ok')) && g('sir.fut.name') === 'Dee' && T(g('sir.fut.stripped_future')), 'sir $pv=7 (future): narrows as newest registered (v5), unknown field stripped');
+  ok(T(g('sir.fut.ok')) && g('sir.fut.name') === 'Dee' && T(g('sir.fut.stripped_future')), 'sir $pv=11 (future): v10-shaped payload narrows as newest registered, unknown field stripped');
   ok(!T(g('sir.wid.ok')) && g('sir.wid.code') === 'payload_shape_unrecognized', 'sir mistyped $invite_id (int): shape error-as-data, no cast abort (M1)');
   ok(!T(g('sir.wnm.ok')) && g('sir.wnm.code') === 'payload_shape_unrecognized', 'sir mistyped $name (int): shape error-as-data, no cast abort (M1)');
   ok(T(g('sir.wpv.ok')) && g('sir.wpv.v') === '3' && g('sir.wpv.name') === 'Eve', 'sir mistyped $pv (str): tolerated as unstamped, shape-inferred v3 (M1)');
@@ -73,17 +74,34 @@ async function main() {
   console.log('=== corpus: registry cin (v2/v5 + floor) ===');
   ok(T(g('cin.v2.ok')), 'cin v2: ok');
   ok(T(g('cin.v5.ok')), 'cin v5: ok');
+  ok(T(g('cin.v10.ok')) && /\"ping\"/.test(g('cin.v10.catalog')), 'cin v10: opaque command catalog preserved');
   ok(!T(g('cin.old.ok')) && g('cin.old.code') === 'peer_version_unsupported', 'cin below floor: error-as-data');
 
   console.log('=== corpus: registry rst (v2/v5 + floor) ===');
   ok(T(g('rst.v2.ok')), 'rst v2: ok');
   ok(T(g('rst.v5.ok')), 'rst v5: ok');
+  ok(T(g('rst.v10.ok')) && /\"ping\"/.test(g('rst.v10.catalog')), 'rst v10: opaque command catalog preserved');
   ok(!T(g('rst.old.ok')) && g('rst.old.code') === 'peer_version_unsupported', 'rst below floor: error-as-data');
 
   console.log('=== corpus: registry acc (v2/v3 + floor) ===');
   ok(T(g('acc.v2.ok')) && g('acc.v2.name') === '', 'acc v2: ok, joiner_name empty (cid fallback branch)');
   ok(T(g('acc.v3.ok')) && g('acc.v3.name') === 'Joi', 'acc v3: ok, $joiner_name honored');
+  ok(T(g('acc.v10.ok')) && /\"ping\"/.test(g('acc.v10.catalog')), 'acc v10: opaque command catalog preserved');
   ok(!T(g('acc.old.ok')) && g('acc.old.code') === 'peer_version_unsupported', 'acc below floor: error-as-data');
+
+  console.log('=== corpus: typed message/contact v10 ===');
+  ok(T(g('msg.v9.ok')) && g('msg.v9.kind') === 'text', 'msg v9: missing kind maps to text only on old branch');
+  ok(T(g('msg.v9_missing_wire.ok')), 'msg v9: optional wire_id behavior remains unchanged');
+  ok(T(g('msg.v10.ok')) && g('msg.v10.kind') === 'command', 'msg v10: required command kind preserved');
+  ok(!T(g('msg.missing.ok')) && g('msg.missing.code') === 'payload_shape_unrecognized', 'msg v10: missing kind rejected, never text');
+  ok(!T(g('msg.unknown_kind.ok')) && g('msg.unknown_kind.code') === 'payload_shape_unrecognized', 'msg v10: unknown enum kind rejected as error-as-data');
+  ok(!T(g('msg.bad_kind_type.ok')) && g('msg.bad_kind_type.code') === 'payload_shape_unrecognized', 'msg v10: non-string enum kind rejected as error-as-data');
+  ok(!T(g('msg.missing_wire.ok')) && g('msg.missing_wire.code') === 'payload_shape_unrecognized', 'msg v10: missing wire_id rejected');
+  ok(!T(g('msg.bad_wire.ok')) && g('msg.bad_wire.code') === 'payload_shape_unrecognized', 'msg v10: non-string wire_id rejected');
+  ok(!T(g('msg.bad_reply_wire.ok')) && g('msg.bad_reply_wire.code') === 'payload_shape_unrecognized', 'msg v10: malformed reply wire_id rejected');
+  ok(!T(g('msg.bad_reply_sentence.ok')) && g('msg.bad_reply_sentence.code') === 'payload_shape_unrecognized', 'msg v10: malformed reply sentence rejected');
+  ok(T(g('contact_v10.local')) && T(g('contact_v10.sibling')) && T(g('contact_v10.descriptor')) && /\"ping\"/.test(g('contact_v10.catalog')),
+    'all actor-owned v10 contact branches narrow and preserve opaque catalog');
 
   console.log('=== corpus: registry e2e (v1 + floor + shape + M1 wrong-domain + future) ===');
   ok(T(g('e2e.pre.ok')) && g('e2e.pre.v') === '8' && g('e2e.pre.ot') === '0', 'e2e pre-key: ok, dispatched v8, $olm_type=0 round-trips');

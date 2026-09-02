@@ -13,6 +13,17 @@ library a2a_protocol loads library
 {
     metadef contact_t: ($name -> str, $container_id -> global_id).
 
+    // Wire-v10 typed application messages. These remain ordinary message
+    // payloads; the kind only tells the host how to interpret the opaque body.
+    metadef message_kind_t: <$text, $command, $command_result>.
+    message_kind_text is message_kind_t = $text.
+    message_kind_command is message_kind_t = $command.
+    message_kind_command_result is message_kind_t = $command_result.
+
+    // JSON produced and validated by the TypeScript SDK. MUFL deliberately
+    // treats the catalog as an opaque string and never parses JSON Schema.
+    metadef command_catalog_json_t: str.
+
     // ---- identity hierarchy wire shapes ---------------------------------
     // Delegation certificate: "role X belongs to root Y, signed by Y". The
     // signature is over the core's _value_id, binding the role's container

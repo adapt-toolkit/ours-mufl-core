@@ -205,6 +205,10 @@ library a2a_messaging loads libraries
     // guarded on import (pre-0.5 exports import unchanged).
     contact_pv is (global_id ->> int) = (,).
     contact_caps is (global_id ->> str[]) = (,).
+    // Wire-v10 command catalogs. JSON is validated and serialized by the SDK;
+    // core stores and forwards it opaquely under the enclosing payload limits.
+    self_command_catalog is a2a_protocol::command_catalog_json_t+ = NIL.
+    contact_command_catalog is (global_id ->> a2a_protocol::command_catalog_json_t) = (,).
     // ACK-confirmed capability fingerprint per contact. A missing/stale entry
     // is retried by reconcile_advertise; only the encrypted ACK advances it.
     contact_advertised_caps is (global_id ->> str) = (,).
@@ -276,7 +280,9 @@ library a2a_messaging loads libraries
     pending_restore_replies is (global_id ->> restore_reply_t) = (,).
     // Messages queued toward a degraded contact, flushed (host-driven,
     // flush_deferred) once its AD is re-established. Plain data — EXPORTED.
-    metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time).
+    // $message_kind is nullable only for import compatibility with pre-v10
+    // exported queues; every newly queued entry writes it explicitly.
+    metadef deferred_msg_t: ($text -> str, $wire_id -> str, $reply_to -> a2a_protocol::reply_ref_t+, $date -> time, $message_kind -> a2a_protocol::message_kind_t+).
     deferred_msgs is (global_id ->> deferred_msg_t[]) = (,).
 
     // ---- core 0.9.0: per-connection E2E migration FSM (spec §5) -----------
@@ -1471,8 +1477,7 @@ library a2a_messaging loads libraries
         return acts.
     }
 
-    // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
-    // (the daemon sends over the now-active migrated session — core is routing-authority only).
+    // §5.6 flush: drain mig_deferred[cid] FIFO through the existing daemon notification path.
     // The CALLER MUST have set the epoch pin FIRST (else a re-injected send routes "migrating" and
     // re-queues). Clears the queue; an empty queue yields no actions; per-contact order preserved.
     fn flush_mig_deferred_actions (cid: global_id) -> transaction::action::type[]
@@ -1482,8 +1487,11 @@ library a2a_messaging loads libraries
         if q == NIL || (_count q?|) == 0 { return out. }
         sc q? -- ( -> m)
         {
+            kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+            if (m $message_kind) != NIL { kind -> (m $message_kind) safe a2a_protocol::message_kind_t. }
             out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
-                $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to), $route -> $e2e ).
+                $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to),
+                $message_kind -> kind, $route -> $e2e ).
         }
         delete mig_deferred cid.
         return out.
@@ -1500,6 +1508,34 @@ library a2a_messaging loads libraries
         prev = contact_pv cid.
         if prev == NIL || prev? != pv { contact_pv cid -> pv. }
         if (_count caps|) != 0 { contact_caps cid -> caps.  note_e2e_seen cid caps. }
+    }
+
+    fn set_self_command_catalog (catalog: a2a_protocol::command_catalog_json_t+) -> nil
+    {
+        self_command_catalog -> catalog.
+    }
+
+    fn get_self_command_catalog (_) -> a2a_protocol::command_catalog_json_t+
+    {
+        return self_command_catalog.
+    }
+
+    fn get_contact_command_catalog (cid: global_id) -> a2a_protocol::command_catalog_json_t+
+    {
+        return contact_command_catalog cid.
+    }
+
+    // Call only after the surrounding contact/identity authentication gates.
+    // NIL is authoritative "no commands" and clears any previously learned
+    // catalog for the same authenticated peer.
+    fn learn_contact_command_catalog (cid: global_id, catalog: a2a_protocol::command_catalog_json_t+) -> nil
+    {
+        if catalog == NIL
+        {
+            if contact_command_catalog cid != NIL { delete contact_command_catalog cid. }
+            return NIL.
+        }
+        contact_command_catalog cid -> catalog?.
     }
 
     // Owner Addition B: the inviter-facing, render-ready message for a version-
@@ -1799,7 +1835,8 @@ library a2a_messaging loads libraries
             $invite_id -> invite_id,
             $name -> my_name,
             $pv   -> a2a_versions::wire_version,
-            $caps -> (a2a_capabilities::self_cap_ids NIL)
+            $caps -> (a2a_capabilities::self_cap_ids NIL),
+            $command_catalog -> self_command_catalog
         ).
         data = _crypto_encrypt_message (kpr $secret_key) eph_pub_inviter payload.
 
@@ -1866,11 +1903,16 @@ library a2a_messaging loads libraries
     // replies to (its stamped wire id + an optional sentence index). Every
     // message gets a fresh stringified wire id — the stable, cross-side handle
     // a reply can reference (the receiver's msg_id is local to its own inbox).
-    trn send_message _:($contact -> contact_ref: str, $text -> text: str, $reply_to -> reply_to: a2a_protocol::reply_ref_t+)
+    trn send_message _:($contact -> contact_ref: str, $text -> text: str, $reply_to -> reply_to: a2a_protocol::reply_ref_t+, $message_kind -> requested_kind: a2a_protocol::message_kind_t+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
 
         target_id = resolve_contact contact_ref.
+        message_kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+        if requested_kind != NIL { message_kind -> requested_kind?. }
+        // An advertised catalog is positive peer evidence for the v10 command
+        // producer path. Absence fails closed before any queue entry or SEND.
+        abort "Contact does not advertise command support." when message_kind == a2a_protocol::message_kind_command && (contact_command_catalog target_id) == NIL.
         sent_date = (current_transaction_info::get_transaction_time())?.
         wire_id = _str (_new_id "ours message").
 
@@ -1885,7 +1927,7 @@ library a2a_messaging loads libraries
             cur = deferred_msgs target_id.
             if cur != NIL { q -> cur?. }
             abort "Deferred queue for this contact is full (" + (_str deferred_msgs_cap) + ") — contact restore still pending." when (_count q|) >= deferred_msgs_cap.
-            q (_count q|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date).
+            q (_count q|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date, $message_kind -> message_kind).
             deferred_msgs target_id -> q.
             actions is transaction::action::type[] = begin_contact_restore target_id.
             actions (_count actions|) -> _return_data ($sent_to -> target_id, $wire_id -> wire_id, $deferred -> TRUE, $queued -> (_count q|)).
@@ -1904,7 +1946,7 @@ library a2a_messaging loads libraries
             mcur = mig_deferred target_id.
             if mcur != NIL { mq -> mcur?. }
             abort "Migration queue for this contact is full (" + (_str deferred_msgs_cap) + ") — commit window still open." when (_count mq|) >= deferred_msgs_cap.
-            mq (_count mq|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date).
+            mq (_count mq|) -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $date -> sent_date, $message_kind -> message_kind).
             mig_deferred target_id -> mq.
             return transaction::success [
                 _return_data ($sent_to -> target_id, $wire_id -> wire_id, $deferred -> TRUE, $migrating -> TRUE, $queued -> (_count mq|)),
@@ -1922,7 +1964,8 @@ library a2a_messaging loads libraries
             // a DISTINCT box (receive_e2e_message_tx) so the wire separates it from legacy plaintext.
             // A FRESH v2 contact (never pinned) falls through to the legacy box below (unchanged).
             epb = ((((peer_ads target_id)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
-            einner = _write ( $text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version ).
+            einner = _write ( $text -> text, $wire_id -> wire_id, $reply_to -> reply_to,
+                              $pv -> a2a_versions::wire_version, $message_kind -> message_kind ).
             eenv = e2e::encrypt_to target_id einner epb.
             // core 0.11 self-heal: retain until the delivered receipt — the redrive source
             // if the peer restarted and this send lands on a dead session (silent-drop fix).
@@ -1931,8 +1974,8 @@ library a2a_messaging loads libraries
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_e2e_message_tx,
                     $targ -> ( $e2e_envelope -> (eenv $e2e_envelope), $emsignature -> (eenv $emsignature) ) ) ].
-            sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
-            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a) { eacts (_count eacts|) -> a. }
+            sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to, $message_kind -> message_kind) -- ( -> a) { eacts (_count eacts|) -> a. }
+            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to, $message_kind -> message_kind) -- ( -> a) { eacts (_count eacts|) -> a. }
             sc monitor_copy_actions "out" target_id sent_date text -- ( -> a) { eacts (_count eacts|) -> a. }
             // §4 observability: source $session_id from the ACTUAL envelope (NOT a re-read of
             // active_session_id — that would make the #1867 "session_id==pin" assertion CIRCULAR;
@@ -1947,14 +1990,15 @@ library a2a_messaging loads libraries
             actions is transaction::action::type[] = [
                 encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_message_tx,
-                    $targ -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to, $pv -> a2a_versions::wire_version)
+                    $targ -> ($text -> text, $wire_id -> wire_id, $reply_to -> reply_to,
+                              $pv -> a2a_versions::wire_version, $message_kind -> message_kind)
                 )
             ].
-            sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
+            sc on_message_sent ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to, $message_kind -> message_kind) -- ( -> a)
             {
                 actions (_count actions|) -> a.
             }
-            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to) -- ( -> a)
+            sc post_send_middleware ($target_id -> target_id, $text -> text, $date -> sent_date, $wire_id -> wire_id, $reply_to -> reply_to, $message_kind -> message_kind) -- ( -> a)
             {
                 actions (_count actions|) -> a.
             }
@@ -2141,6 +2185,7 @@ library a2a_messaging loads libraries
         if contact_roots target_id != NIL { delete contact_roots target_id. }
         if contact_pv target_id != NIL { delete contact_pv target_id. }
         if contact_caps target_id != NIL { delete contact_caps target_id. }
+        if contact_command_catalog target_id != NIL { delete contact_command_catalog target_id. }
         if contact_advertised_caps target_id != NIL { delete contact_advertised_caps target_id. }
 
         // Contact-restore stores too: an orphaned deferred queue would persist in
@@ -2782,11 +2827,13 @@ library a2a_messaging loads libraries
         return [
             encrypted_channel::send_encrypted_tx a_id (
                 $name -> ingest_connect_descriptor_tx,
-                $targ -> ($peer_ad -> ad_b, $peer_name -> name_b, $pv -> a2a_versions::wire_version)
+                $targ -> ($peer_ad -> ad_b, $peer_name -> name_b, $pv -> a2a_versions::wire_version,
+                          $command_catalog -> (contact_command_catalog b_id))
             ),
             encrypted_channel::send_encrypted_tx b_id (
                 $name -> ingest_connect_descriptor_tx,
-                $targ -> ($peer_ad -> ad_a, $peer_name -> name_a, $pv -> a2a_versions::wire_version)
+                $targ -> ($peer_ad -> ad_a, $peer_name -> name_a, $pv -> a2a_versions::wire_version,
+                          $command_catalog -> (contact_command_catalog a_id))
             )
         ].
     }
@@ -2878,6 +2925,12 @@ library a2a_messaging loads libraries
         // CP-side courtesy rather than enforced.
         abort "This node does not support introductions (core.connect not in its manifest)." when a2a_capabilities::self_supports a2a_capabilities::cap_connect != TRUE.
 
+        nr = a2a_versions::try_narrow_connect_descriptor args.
+        if (nr $ok) != TRUE
+        {
+            return transaction::success [ _notify_agent ($event -> $protocol_error, $error -> (nr $err)?, $peer_cid -> sender_id) ].
+        }
+
         peer_ad = (args $peer_ad) safe address_document_types::t_address_document.
         peer_cid = peer_ad $identity $container_id.
         abort "Cannot introduce me to myself." when peer_cid == _get_container_id().
@@ -2886,6 +2939,7 @@ library a2a_messaging loads libraries
         // storing it (idempotent; peer_cid is key-derived, so an existing contact's keys
         // can never be silently overwritten with a different keyset).
         address_document::process_address_document peer_ad TRUE.
+        peer_catalog = a2a_versions::contact_surface_catalog args.
 
         peer_name is str = "".
         if (args $peer_name) != NIL { peer_name -> (args $peer_name) safe str. }
@@ -2912,6 +2966,7 @@ library a2a_messaging loads libraries
                 }
             }
             peer_ads peer_cid -> peer_ad.
+            learn_contact_command_catalog peer_cid peer_catalog.
             actions (_count actions|) -> _notify_agent ($event -> $reintroduced, $container_id -> peer_cid, $by_cp -> sender_id).
             actions (_count actions|) -> _save_state NIL.
             return transaction::success actions.
@@ -2920,6 +2975,7 @@ library a2a_messaging loads libraries
         // New contact: register under the CP-supplied display name (cid as last resort).
         reg = register_contact peer_cid peer_name.
         peer_ads peer_cid -> peer_ad.
+        learn_contact_command_catalog peer_cid peer_catalog.
 
         actions is transaction::action::type[] = [].
         sc (reg $actions) -- ( -> a) { actions (_count actions|) -> a. }
@@ -2972,7 +3028,7 @@ library a2a_messaging loads libraries
                 )
             ].
         }
-        narrowed is a2a_versions::acc_args_t = (nr $payload)?.
+        narrowed = (nr $payload)?.
 
         invite_id = (args $invite_id) safe global_id.
         joiner_ad = (args $joiner_ad) safe address_document_types::t_address_document.
@@ -3029,9 +3085,10 @@ library a2a_messaging loads libraries
         }
 
         reg = register_contact sender_id contact_name.
-        // Passive version learning: this legacy surface never carries $pv or
-        // $caps — record the shape-inferred dialect (2 or 3).
-        learn_contact_version sender_id (a2a_versions::acc_version_of args) [].
+        // Passive version learning: old acc branches are shape-inferred as 2/3;
+        // the v10 branch carries its explicit dialect, caps, and catalog.
+        learn_contact_version sender_id (a2a_versions::acc_version_of args) (a2a_versions::acc_caps narrowed).
+        learn_contact_command_catalog sender_id (a2a_versions::acc_catalog narrowed).
         // Remember the joiner's address document for upgrade-time re-registration.
         peer_ads sender_id -> joiner_ad.
         if joiner_root != NIL
@@ -3102,7 +3159,7 @@ library a2a_messaging loads libraries
         }
         // `narrowed` is union-typed: backward compat is visible in this
         // binding's type; per-version reads go through the registry accessors.
-        narrowed is a2a_versions::sir_payload_t = (nr $payload)?.
+        narrowed = (nr $payload)?.
 
         // Identity verification takes the RAW payload: narrow() rebuilds the
         // record to the registered fields, and verify must keep seeing exactly
@@ -3126,6 +3183,7 @@ library a2a_messaging loads libraries
         contact_name -> (reg $name).
         // Passive version learning (SPEC §3): dialect + piggybacked caps.
         learn_contact_version sender_id (a2a_versions::sir_version_of payload) (a2a_versions::sir_caps narrowed).
+        learn_contact_command_catalog sender_id (a2a_versions::sir_catalog narrowed).
         peer_ads sender_id -> (vb $ad).
         // Born-on-DR iff the peer presented a v2 (bundle-carrying) AD at first contact.
         if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
@@ -3194,7 +3252,8 @@ library a2a_messaging loads libraries
             $cp_binding -> (b $cp_binding),
             $invite_id -> invite_id,
             $pv   -> a2a_versions::wire_version,
-            $caps -> (a2a_capabilities::self_cap_ids NIL)
+            $caps -> (a2a_capabilities::self_cap_ids NIL),
+            $command_catalog -> self_command_catalog
         ).
         leg3_data = _crypto_encrypt_message (kpi $secret_key) epk_r leg3_payload.
         actions is transaction::action::type[] = [
@@ -3266,7 +3325,7 @@ library a2a_messaging loads libraries
                 )
             ].
         }
-        narrowed is a2a_versions::cin_payload_t = (nr $payload)?.
+        narrowed = (nr $payload)?.
 
         // D8 cid-bind + PoP self-sig, then the optional delegation chain — an
         // invalid chain or forged/inconsistent AD aborts before any write.
@@ -3280,6 +3339,7 @@ library a2a_messaging loads libraries
         reg = register_contact sender_id contact_name.
         contact_name -> (reg $name).
         learn_contact_version sender_id (a2a_versions::cin_version_of payload) (a2a_versions::cin_caps narrowed).
+        learn_contact_command_catalog sender_id (a2a_versions::cin_catalog narrowed).
         peer_ads sender_id -> (vb $ad).
         // Born-on-DR iff the peer presented a v2 (bundle-carrying) AD at first contact.
         if (peer_has_e2e_bundle sender_id) { contact_born_dr sender_id -> TRUE. }
@@ -3360,7 +3420,8 @@ library a2a_messaging loads libraries
         payload = _write (
             $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
             $cp_binding -> (b $cp_binding), $rid -> rid,
-            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL)
+            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL),
+            $command_catalog -> self_command_catalog
         ).
         data = _crypto_encrypt_message (kpr $secret_key) epk_requester payload.
         return transaction::success [
@@ -3420,7 +3481,7 @@ library a2a_messaging loads libraries
                 )
             ].
         }
-        narrowed is a2a_versions::rst_payload_t = (nr $payload)?.
+        narrowed = (nr $payload)?.
 
         // Post-gate the $rid domain is checked, so this strict read cannot abort.
         abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
@@ -3428,6 +3489,7 @@ library a2a_messaging loads libraries
 
         // --- all gates passed: (re)install the peer's keys + single-use consume ---
         learn_contact_version sender_id (a2a_versions::rst_version_of payload) (a2a_versions::rst_caps narrowed).
+        learn_contact_command_catalog sender_id (a2a_versions::rst_catalog narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -3440,7 +3502,8 @@ library a2a_messaging loads libraries
         leg2_payload = _write (
             $ad -> (b $ad), $cert -> (b $cert), $root_profile -> (b $root_profile),
             $cp_binding -> (b $cp_binding), $rid -> rid,
-            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL)
+            $pv -> a2a_versions::wire_version, $caps -> (a2a_capabilities::self_cap_ids NIL),
+            $command_catalog -> self_command_catalog
         ).
         leg2_data = _crypto_encrypt_message (kp2 $secret_key) epk_r leg2_payload.
         contact_name = ((contacts sender_id)?) $name.
@@ -3497,7 +3560,7 @@ library a2a_messaging loads libraries
                 )
             ].
         }
-        narrowed is a2a_versions::rst_payload_t = (nr $payload)?.
+        narrowed = (nr $payload)?.
 
         // Post-gate the $rid domain is checked, so this strict read cannot abort.
         abort "Restore payload correlation mismatch." when ((payload $rid) safe global_id) != rid.
@@ -3505,6 +3568,7 @@ library a2a_messaging loads libraries
 
         // --- all gates passed: replace + single-use consume ---
         learn_contact_version sender_id (a2a_versions::rst_version_of payload) (a2a_versions::rst_caps narrowed).
+        learn_contact_command_catalog sender_id (a2a_versions::rst_catalog narrowed).
         peer_ads sender_id -> (vb $ad).
         if (vb $root) != NIL { contact_roots sender_id -> (vb $root)?. }
         if (vb $pin_binding) != NIL { contact_cp_bindings ((vb $pin_binding_root)?) -> (vb $pin_binding)?. }
@@ -3605,15 +3669,20 @@ library a2a_messaging loads libraries
             actions is transaction::action::type[] = [].
             sc q? -- ( -> m)
             {
+                kind is a2a_protocol::message_kind_t = a2a_protocol::message_kind_text.
+                if (m $message_kind) != NIL { kind -> (m $message_kind) safe a2a_protocol::message_kind_t. }
                 actions (_count actions|) -> encrypted_channel::send_encrypted_tx target_id (
                     $name -> receive_message_tx,
-                    $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $pv -> a2a_versions::wire_version)
+                    $targ -> ($text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to),
+                              $pv -> a2a_versions::wire_version, $message_kind -> kind)
                 ).
-                sc on_message_sent ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
+                sc on_message_sent ($target_id -> target_id, $text -> (m $text), $date -> (m $date),
+                    $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $message_kind -> kind) -- ( -> a)
                 {
                     actions (_count actions|) -> a.
                 }
-                sc post_send_middleware ($target_id -> target_id, $text -> (m $text), $date -> (m $date), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to)) -- ( -> a)
+                sc post_send_middleware ($target_id -> target_id, $text -> (m $text), $date -> (m $date),
+                    $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $message_kind -> kind) -- ( -> a)
                 {
                     actions (_count actions|) -> a.
                 }
@@ -3643,7 +3712,17 @@ library a2a_messaging loads libraries
 
         sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
         msg_date = (current_transaction_info::get_transaction_time())?.
-        text = (args $text) safe str.
+        nr = a2a_versions::try_narrow_msg args.
+        if (nr $ok) != TRUE
+        {
+            return transaction::success [
+                _notify_agent ($event -> $protocol_error, $context -> $message,
+                    $message -> (((nr $err)?) $message), $error -> (nr $err)?, $peer_cid -> sender_id)
+            ].
+        }
+        narrowed = (nr $payload)?.
+        text = (narrowed $text) safe str.
+        message_kind = a2a_versions::msg_kind narrowed.
 
         // Optional, absent from pre-1.4 senders: the message's stable wire id
         // and an optional reply pointer. Default to "" / NIL so old payloads and
@@ -3690,7 +3769,8 @@ library a2a_messaging loads libraries
             $text        -> text,
             $date        -> msg_date,
             $wire_id     -> wire_id,
-            $reply_to    -> reply_to
+            $reply_to    -> reply_to,
+            $message_kind -> message_kind
         ) -- ( -> a)
         {
             actions (_count actions|) -> a.
@@ -3875,6 +3955,24 @@ library a2a_messaging loads libraries
         acts (_count acts|) -> _save_state NIL.
         return acts.
     }
+    // A decrypted message that does not match a registered v9/v10 application
+    // payload is rejected without inbox delivery or a receipt. The ratchet has
+    // already advanced, so preserve the same convergence bookkeeping as other
+    // authenticated post-decrypt rejection paths and persist it atomically.
+    fn mig_e2e_invalid_message_actions (sender_id: global_id, env_sid: bin+, do_ic: bool, pre_sid: bin+, err: a2a_versions::version_error_t) -> transaction::action::type[]
+    {
+        acts is transaction::action::type[] = [].
+        if do_ic { sc mig_e2e_promote_actions sender_id ((contact_migration sender_id)?) -- ( -> a) { acts (_count acts|) -> a. } }
+        if (rekey_pending sender_id) != NIL { delete rekey_pending sender_id. }
+        if (rekey_served sender_id) != NIL { delete rekey_served sender_id. }
+        post_sid is bin+ = e2e::active_session_id sender_id.
+        if pre_sid != NIL && post_sid != NIL && (pre_sid?) != (post_sid?)
+        { sc redrive_unacked_actions sender_id -- ( -> a) { acts (_count acts|) -> a. } }
+        acts (_count acts|) -> _notify_agent ($event -> $protocol_error, $context -> $message,
+            $message -> (err $message), $error -> err, $peer_cid -> sender_id, $session_id -> env_sid).
+        acts (_count acts|) -> _save_state NIL.
+        return acts.
+    }
     // Delivery tail shared by both handlers: DELIVERED receipt (gated on a wire_id) + the §4
     // $e2e_app_recv notify (session_id from the ACTUAL inbound envelope, non-circular #1867 proof) +
     // _save_state (the e2e decode advanced the ratchet — persist unconditionally on the accept path).
@@ -4013,11 +4111,16 @@ library a2a_messaging loads libraries
             racts2 (_count racts2|) -> _save_state NIL.
             return transaction::success racts2.
         }
-        text = (iv $text) safe str.
+        nr_msg = a2a_versions::try_narrow_msg iv.
+        if (nr_msg $ok) != TRUE
+        { return transaction::success (mig_e2e_invalid_message_actions sender_id env_sid do_ic pre_sid (nr_msg $err)?). }
+        narrowed_message = (nr_msg $payload)?.
+        text = (narrowed_message $text) safe str.
+        message_kind = a2a_versions::msg_kind narrowed_message.
         wire_id is str = "".
-        if (iv $wire_id) != NIL { wire_id -> (iv $wire_id) safe str. }
+        if (narrowed_message $wire_id) != NIL { wire_id -> (narrowed_message $wire_id) safe str. }
         reply_to is a2a_protocol::reply_ref_t+ = NIL.
-        if (iv $reply_to) != NIL { reply_to -> (iv $reply_to) safe a2a_protocol::reply_ref_t. }
+        if (narrowed_message $reply_to) != NIL { reply_to -> (narrowed_message $reply_to) safe a2a_protocol::reply_ref_t. }
 
         if (wire_id_valid wire_id) != TRUE
         { return transaction::success (mig_e2e_invalid_wire_actions sender_id env_sid do_ic pre_sid FALSE). }
@@ -4065,7 +4168,8 @@ library a2a_messaging loads libraries
             $text        -> text,
             $date        -> msg_date,
             $wire_id     -> wire_id,
-            $reply_to    -> reply_to
+            $reply_to    -> reply_to,
+            $message_kind -> message_kind
         ) -- ( -> a) { actions (_count actions|) -> a. }
         sc monitor_copy_actions "in" sender_id msg_date text -- ( -> a) { actions (_count actions|) -> a. }
         // core 0.11 self-heal: the decode REPLACED our live session (the peer's fresh pre-key
@@ -5269,6 +5373,8 @@ library a2a_messaging loads libraries
             $deferred_msgs   -> deferred_msgs,
             $contact_pv      -> contact_pv,
             $contact_caps    -> contact_caps,
+            $self_command_catalog -> self_command_catalog,
+            $contact_command_catalog -> contact_command_catalog,
             $contact_advertised_caps -> contact_advertised_caps,
             $contact_e2e_seen -> contact_e2e_seen,
             $contact_born_dr -> contact_born_dr,
@@ -5494,6 +5600,14 @@ library a2a_messaging loads libraries
         if (data $contact_caps) != NIL
         {
             contact_caps -> (data $contact_caps) safe (global_id ->> str[]).
+        }
+        if (data $self_command_catalog) != NIL
+        {
+            self_command_catalog -> (data $self_command_catalog) safe a2a_protocol::command_catalog_json_t.
+        }
+        if (data $contact_command_catalog) != NIL
+        {
+            contact_command_catalog -> (data $contact_command_catalog) safe (global_id ->> a2a_protocol::command_catalog_json_t).
         }
         // core 0.8.0: E2E anti-downgrade pin (absent from pre-0.8 exports →
         // stays empty; re-learned positively from inbound core.e2e evidence).

@@ -25,11 +25,11 @@ const ok = (c, m) => { if (!c) { scorecard.push(`✗ ${m}`); console.log(`  ✗ 
 const T = (s) => /true/i.test(String(s));
 
 let wrapper;
-function mk(name) { return { name, pw: null, cid: '', pending: [] }; }
+function mk(name) { return { name, pw: null, cid: '', pending: [], notifies: [] }; }
 function wire(id) {
   id.pw.on_return_data = (d) => {
     const kind = d.Reduce('kind').Visualize();
-    if (kind === 'notify_agent') { try { const pl=d.Reduce('payload'); const ev=pl.Reduce('event').Visualize(); if(/migration|protocol_error/.test(ev)) process.stderr.write(`[notify ${id.name}] ${ev} cid=${pl.Reduce('cid').Visualize().slice(0,10)}\n`); } catch {} return; }
+    if (kind === 'notify_agent') { try { const pl=d.Reduce('payload'); const ev=pl.Reduce('event').Visualize(); id.notifies.push({ event: ev, wire: pl.Reduce('wire_id').Visualize(), text: pl.Reduce('text').Visualize(), messageKind: pl.Reduce('message_kind').Visualize(), reply: pl.Reduce('reply_to').Visualize() }); if(/migration|protocol_error/.test(ev)) process.stderr.write(`[notify ${id.name}] ${ev} cid=${pl.Reduce('cid').Visualize().slice(0,10)}\n`); } catch {} return; }
     if (kind === 'save_state') return;
     const p = id.pending.shift(); if (!p) return;
     clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
@@ -108,6 +108,15 @@ async function main() {
     ok(T(ro(I, '::actor::qa_mig_pin', { cid: R.cid }).Reduce('seen').Visualize()), 'setup: initiator has contact_e2e_seen==TRUE (production-like — the exact state that masked the do_ic bug)');
     ok(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid').length === 0, 'setup: initiator is BOX-ONLY (no live session)');
     await mutate(I, '::actor::qa_recv_reset', {});
+    await mutate(R, '::actor::qa_recv_reset', {});
+    await mutate(I, '::actor::qa_set_contact_command_catalog', { cid: R.cid, catalog: '{"commands":["queued"]}' });
+    const queued = await mutate(I, '::a2a_messaging::send_message', {
+      contact: R.name, text: '{"command":"queued"}', message_kind: 'command',
+      reply_to: { wire_id: 'queued-origin', sentence: 2 }
+    });
+    ok(T(queued.Reduce('deferred').Visualize()) && T(queued.Reduce('migrating').Visualize()),
+      'typed migration queue: command is deferred during the committed window');
+    const flushNotifyStart = I.notifies.length;
     const appPt = 'responder app on the new session BEFORE the explicit confirm';
     const s = await mutate(R, '::a2a_messaging::send_message', { contact: I.name, text: appPt });
     ok(s.Reduce('route').Visualize() === 'e2e', 'responder boxed its app as receive_e2e_message_tx (routes e2e)');
@@ -117,6 +126,11 @@ async function main() {
     const pin = ro(I, '::actor::qa_mig_pin', { cid: R.cid });
     ok(T(pin.Reduce('pinned').Visualize()) && hex(getBin(pin, 'session_id')) === hex(sid), 'implicit-confirm: epoch pin set to the promoted (migrated) session');
     ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'implicit-confirm: active session == the promoted rotation');
+    const flushNotes = I.notifies.slice(flushNotifyStart).filter((n) => n.event === 'migration_deferred_flush');
+    ok(flushNotes.length === 1 && flushNotes[0].wire === queued.Reduce('wire_id').Visualize() &&
+      flushNotes[0].text === '{"command":"queued"}' && flushNotes[0].messageKind === 'command' &&
+      /queued-origin/.test(flushNotes[0].reply) && ro(R, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '',
+      'typed migration queue: promotion emits the base notify-only flush preserving wire/body/reply/kind');
     // §5.8 mixed-contact independence: this node is epoch-pinned to R (routes e2e) while an
     // unrelated non-e2e contact routes "legacy" — per-contact routing is independent.
     ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'e2e', 'mixed-contact(§5.8): the migrated peer routes e2e');
