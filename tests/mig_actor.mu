@@ -232,6 +232,7 @@ application actor loads libraries
         $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
     trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_wires -> "".  qa_recv_texts -> "".
         qa_recv_kinds -> "".  qa_recv_reply_wires -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.
+        qa_recv_count -> 0.
         return transaction::success [ _return_data ($ok -> TRUE) ]. }
     trn qa_recv_set_abort _:($abort -> ab: bool) { qa_recv_abort -> ab.  return transaction::success [ _return_data ($abort -> qa_recv_abort) ]. }
 
@@ -396,6 +397,22 @@ application actor loads libraries
         acts is transaction::action::type[] = a2a_messaging::flush_mig_deferred_actions cid.
         action_count = _count acts|.
         acts action_count -> _return_data ($flushed -> queued, $actions -> action_count, $order -> order).
+        return transaction::success acts.
+    }
+
+    // Evidence probe for the existing E2E redrive mechanism: retain one fully
+    // typed v10 message, then invoke the production redrive path unchanged.
+    trn qa_typed_redrive _:($cid -> cid: global_id)
+    {
+        now = (current_transaction_info::get_transaction_time())?.
+        reply is a2a_protocol::reply_ref_t+ = ($wire_id -> "typed-origin", $sentence -> 3).
+        inner = _write ($text -> "{\"result\":\"typed-redrive\"}", $wire_id -> "typed-redrive-w",
+            $reply_to -> reply, $pv -> a2a_versions::wire_version,
+            $message_kind -> a2a_protocol::message_kind_command_result).
+        delete a2a_messaging::unacked_e2e cid.
+        a2a_messaging::unacked_note cid "m" "typed-redrive-w" inner now.
+        acts is transaction::action::type[] = a2a_messaging::redrive_unacked_actions cid.
+        acts (_count acts|) -> _return_data ($actions -> (_count acts|)).
         return transaction::success acts.
     }
 

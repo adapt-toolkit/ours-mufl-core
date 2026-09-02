@@ -131,6 +131,13 @@ async function main() {
     const exported = ro(CA, '::actor::qa_export_core', undefined).Visualize();
     ok(/self_command_catalog/.test(exported) && /contact_command_catalog/.test(exported) && /a\.ping/.test(exported) && /b\.ping/.test(exported),
       `core export carries own and authenticated-contact catalogs`);
+    const catalogSnapshot = Buffer.from(ro(CA, '::actor::export_state', undefined).Serialize());
+    await mutate(CA, '::actor::qa_set_command_catalog', { catalog: '{"commands":[{"name":"changed.self"}]}' });
+    await mutate(CA, '::actor::qa_set_contact_command_catalog', { cid: CB.cid, catalog: '{"commands":[{"name":"changed.peer"}]}' });
+    await mutate(CA, '::actor::import_state', CA.pw.packet.ParseValue(new Uint8Array(catalogSnapshot)));
+    const restoredCatalogs = ro(CA, '::actor::qa_get_command_catalogs', { cid: CB.cid }).Visualize();
+    ok(/a\.ping/.test(restoredCatalogs) && /b\.ping/.test(restoredCatalogs) && !/changed\./.test(restoredCatalogs),
+      `actual export→import round-trip restores both opaque command catalogs`);
   }
 
   // ---------- T1 file round-trip (send_file both directions) ----------

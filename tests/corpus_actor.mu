@@ -43,7 +43,7 @@ application actor loads libraries
 
         // registry "sir" — leg-1 boxed bundle: v2 (no $name), v3 (+$name),
         // v5 (+$pv/$caps), a below-floor dialect ($pv -> 1), an unrecognized
-        // shape, and a FUTURE dialect ($pv -> 7, v5 shape + unknown field).
+        // shape, and a FUTURE dialect (> current max, v10 shape + unknown field).
         sir_v2  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid).
         sir_v3  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Bob").
         sir_v5  = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Carol", $pv -> 5, $caps -> ["core.notifications"]).
@@ -51,7 +51,7 @@ application actor loads libraries
         sir_v10 = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Ten", $pv -> 10, $caps -> [], $command_catalog -> catalog).
         sir_old = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $pv -> 1).
         sir_bad = ($nope -> 1).
-        sir_fut = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Dee", $pv -> 7, $caps -> ["core.notifications"], $future_field -> "F").
+        sir_fut = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> iid, $name -> "Dee", $pv -> 11, $caps -> ["core.notifications"], $command_catalog -> catalog, $future_field -> "F").
         // M1 wrong-domain fixtures: present-but-mistyped NON-nullable fields
         // must classify as shape errors (error-as-data), never abort the cast.
         sir_wid = ($ad -> my_ad, $cert -> NIL, $root_profile -> NIL, $cp_binding -> NIL, $invite_id -> 42).
@@ -94,8 +94,13 @@ application actor loads libraries
 
         // wire-v10 message and actor-owned contact surfaces.
         m9 = a2a_versions::try_narrow_msg ($text -> "plain", $wire_id -> "w9", $reply_to -> NIL, $pv -> 9).
+        m9_missing_wire = a2a_versions::try_narrow_msg ($text -> "legacy", $reply_to -> NIL, $pv -> 9).
         m10 = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w10", $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
         m10_missing = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "bad", $reply_to -> NIL, $pv -> 10).
+        m10_missing_wire = a2a_versions::try_narrow_msg ($text -> "{}", $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
+        m10_bad_wire = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> 42, $reply_to -> NIL, $pv -> 10, $message_kind -> "command").
+        m10_bad_reply_wire = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w", $reply_to -> ($wire_id -> 42, $sentence -> NIL), $pv -> 10, $message_kind -> "command_result").
+        m10_bad_reply_sentence = a2a_versions::try_narrow_msg ($text -> "{}", $wire_id -> "w", $reply_to -> ($wire_id -> "origin", $sentence -> "two"), $pv -> 10, $message_kind -> "command_result").
         introbin = _hex_string_to_binary "00112233".
         li10 = a2a_versions::try_narrow_local_intro ($joiner_name -> "L", $joiner_ad -> my_ad, $intro -> introbin, $text -> NIL, $wire_id -> "li", $pv -> 10, $command_catalog -> catalog).
         si10 = a2a_versions::try_narrow_sibling_intro ($joiner_name -> "S", $joiner_ad -> my_ad, $cert -> NIL, $text -> NIL, $wire_id -> "si", $pv -> 10, $command_catalog -> catalog).
@@ -216,8 +221,13 @@ application actor loads libraries
             ),
             $msg -> (
                 $v9 -> ($ok -> (m9 $ok), $kind -> (a2a_versions::msg_kind ((m9 $payload)?))),
+                $v9_missing_wire -> ($ok -> (m9_missing_wire $ok)),
                 $v10 -> ($ok -> (m10 $ok), $kind -> (a2a_versions::msg_kind ((m10 $payload)?))),
-                $missing -> ($ok -> (m10_missing $ok), $code -> (((m10_missing $err)?) $code))
+                $missing -> ($ok -> (m10_missing $ok), $code -> (((m10_missing $err)?) $code)),
+                $missing_wire -> ($ok -> (m10_missing_wire $ok), $code -> (((m10_missing_wire $err)?) $code)),
+                $bad_wire -> ($ok -> (m10_bad_wire $ok), $code -> (((m10_bad_wire $err)?) $code)),
+                $bad_reply_wire -> ($ok -> (m10_bad_reply_wire $ok), $code -> (((m10_bad_reply_wire $err)?) $code)),
+                $bad_reply_sentence -> ($ok -> (m10_bad_reply_sentence $ok), $code -> (((m10_bad_reply_sentence $err)?) $code))
             ),
             $contact_v10 -> ($local -> (li10 $ok), $sibling -> (si10 $ok), $descriptor -> (cd10 $ok),
                              $catalog -> (a2a_versions::contact_surface_catalog ($pv -> 10, $command_catalog -> catalog))),

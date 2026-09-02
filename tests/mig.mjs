@@ -25,11 +25,11 @@ const ok = (c, m) => { if (!c) { scorecard.push(`✗ ${m}`); console.log(`  ✗ 
 const T = (s) => /true/i.test(String(s));
 
 let wrapper;
-function mk(name) { return { name, pw: null, cid: '', pending: [] }; }
+function mk(name) { return { name, pw: null, cid: '', pending: [], notifies: [] }; }
 function wire(id) {
   id.pw.on_return_data = (d) => {
     const kind = d.Reduce('kind').Visualize();
-    if (kind === 'notify_agent') { try { const pl=d.Reduce('payload'); const ev=pl.Reduce('event').Visualize(); if(/migration|protocol_error/.test(ev)) process.stderr.write(`[notify ${id.name}] ${ev} reason=${pl.Reduce('reason').Visualize()} cid=${pl.Reduce('cid').Visualize().slice(0,10)}\n`); } catch {} return; }
+    if (kind === 'notify_agent') { try { const pl=d.Reduce('payload'); const ev=pl.Reduce('event').Visualize(); id.notifies.push({ event: ev, payload: pl.Visualize(), wire: pl.Reduce('wire_id').Visualize(), text: pl.Reduce('text').Visualize(), messageKind: pl.Reduce('message_kind').Visualize(), reply: pl.Reduce('reply_to').Visualize() }); if(/migration|protocol_error/.test(ev)) process.stderr.write(`[notify ${id.name}] ${ev} reason=${pl.Reduce('reason').Visualize()} cid=${pl.Reduce('cid').Visualize().slice(0,10)}\n`); } catch {} return; }
     if (kind === 'save_state') return;
     const p = id.pending.shift(); if (!p) return;
     clearTimeout(p.timer); p.resolve(d.Reduce('payload'));
@@ -327,23 +327,37 @@ async function main() {
   await mutate(loN, '::actor::qa_send_legacy', { contact: hiN.name, text: 'DOWNGRADE ATTEMPT: legacy plaintext to a migrated peer' });
   await sleep(4000);
   ok(ro(hiN, '::actor::qa_recv_last', {}).Reduce('text').Visualize() === '', 'downgrade-refusal(§5.7): legacy plaintext from an EPOCH-pinned contact is DROPPED (not delivered, no receipt)');
-  // Phase D §5.6 flush-on-active: app sends queued during the initiator's commit window (route
-  // "migrating" → mig_deferred) flush FIFO on active, preserving per-contact order, queue ends
-  // empty. loN is epoch-pinned to hiN (active), so pins-before-flush holds; inject a 3-msg queue
-  // then drive the flush (the real drain over flush_mig_deferred_actions).
+  // Phase D §5.6: preserve the base notify-only FIFO flush. The host receives one
+  // $migration_deferred_flush notification per queued item; core performs no direct delivery.
   await mutate(loN, '::actor::qa_mig_inject_deferred', { cid: hiN.cid });
   ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '3', 'flush(§5.6): mig_deferred filled (3 queued app sends)');
   await mutate(hiN, '::actor::qa_recv_reset', {});
+  const notifyStart = loN.notifies.length;
   const flushed = await mutate(loN, '::actor::qa_mig_flush', { cid: hiN.cid });
-  await sleep(4000);
-  const flushRecv = ro(hiN, '::actor::qa_recv_last', {});
+  const flushNotes = loN.notifies.slice(notifyStart).filter((n) => n.event === 'migration_deferred_flush');
   ok(flushed.Reduce('flushed').Visualize() === '3' && flushed.Reduce('order').Visualize() === 'w0,w1,w2,' &&
-    flushRecv.Reduce('wires').Visualize() === 'w0,w1,w2,' &&
-    flushRecv.Reduce('texts').Visualize() === 'm0|{"command":"m1"}|{"result":"m2"}|' &&
-    flushRecv.Reduce('kinds').Visualize() === 'text,command,command_result,' &&
-    flushRecv.Reduce('reply_wires').Visualize() === '-,origin,w1,',
-    'flush(§5.6): real E2E delivery preserves FIFO wire IDs, typed kinds/bodies, and reply correlation');
+    flushNotes.length === 3 &&
+    flushNotes.map((n) => n.wire).join(',') === 'w0,w1,w2' &&
+    flushNotes.map((n) => n.text).join('|') === 'm0|{"command":"m1"}|{"result":"m2"}' &&
+    flushNotes.map((n) => n.messageKind).join(',') === 'text,command,command_result' &&
+    /origin/.test(flushNotes[1].reply) && /w1/.test(flushNotes[2].reply),
+    'flush(§5.6): base FIFO notifications preserve bodies, wire IDs, reply correlation, and typed kinds');
+  ok(ro(hiN, '::actor::qa_recv_last', {}).Reduce('count').Visualize() === '0',
+    'flush(§5.6): notify-only base mechanism performs no direct E2E delivery');
   ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '0', 'flush(§5.6): mig_deferred empty after flush (queue drained in one pass)');
+
+  // Existing E2E redrive retains and replays the exact typed inner payload.
+  await mutate(hiN, '::actor::qa_recv_reset', {});
+  await mutate(loN, '::actor::qa_learn_peer', { cid: hiN.cid, pv: 10, caps: ['core.e2e.rekey'] });
+  const typedRedrive = await mutate(loN, '::actor::qa_typed_redrive', { cid: hiN.cid });
+  await sleep(4000);
+  const redriveRecv = ro(hiN, '::actor::qa_recv_last', {});
+  ok(+typedRedrive.Reduce('actions').Visualize() >= 1 &&
+    redriveRecv.Reduce('wires').Visualize() === 'typed-redrive-w,' &&
+    redriveRecv.Reduce('texts').Visualize() === '{"result":"typed-redrive"}|' &&
+    redriveRecv.Reduce('kinds').Visualize() === 'command_result,' &&
+    redriveRecv.Reduce('reply_wires').Visualize() === 'typed-origin,',
+    'typed E2E redrive preserves body, wire ID, reply_to, and command_result kind');
   // §5.4 trigger GATE — the criterion-1 boundary (old peers must NEVER get an offer). Tested via
   // the pure predicate mig_should_trigger (no send). ISOLATED cap advertise on loN (does not touch
   // the full-suite test_actor). synthetic peer cids.

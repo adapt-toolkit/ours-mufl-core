@@ -1477,8 +1477,7 @@ library a2a_messaging loads libraries
         return acts.
     }
 
-    // §5.6 flush: drain mig_deferred[cid] FIFO and emit each queued app message for E2E delivery
-    // (the daemon sends over the now-active migrated session — core is routing-authority only).
+    // §5.6 flush: drain mig_deferred[cid] FIFO through the existing daemon notification path.
     // The CALLER MUST have set the epoch pin FIRST (else a re-injected send routes "migrating" and
     // re-queues). Clears the queue; an empty queue yields no actions; per-contact order preserved.
     fn flush_mig_deferred_actions (cid: global_id) -> transaction::action::type[]
@@ -1486,33 +1485,14 @@ library a2a_messaging loads libraries
         out is transaction::action::type[] = [].
         q = mig_deferred cid.
         if q == NIL || (_count q?|) == 0 { return out. }
-        pad = peer_ads cid.
-        if pad == NIL { return out. }
-        epb = (((pad?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
-        if epb == NIL { return out. }
         sc q? -- ( -> m)
         {
             kind is str = a2a_protocol::message_kind_text.
             if (m $message_kind) != NIL && a2a_protocol::is_message_kind ((m $message_kind) safe str)
             { kind -> (m $message_kind) safe str. }
-            inner = _write ( $text -> (m $text), $wire_id -> (m $wire_id), $reply_to -> (m $reply_to),
-                             $pv -> a2a_versions::wire_version, $message_kind -> kind ).
-            env = e2e::encrypt_to cid inner epb?.
-            retained = unacked_note cid "m" (m $wire_id) inner (m $date).
-            out (_count out|) -> encrypted_channel::send_encrypted_tx cid (
-                $name -> receive_e2e_message_tx,
-                $targ -> ( $e2e_envelope -> (env $e2e_envelope), $emsignature -> (env $emsignature) ) ).
-            sc on_message_sent ($target_id -> cid, $text -> (m $text), $date -> (m $date),
-                $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $message_kind -> kind) -- ( -> a)
-            { out (_count out|) -> a. }
-            sc post_send_middleware ($target_id -> cid, $text -> (m $text), $date -> (m $date),
-                $wire_id -> (m $wire_id), $reply_to -> (m $reply_to), $message_kind -> kind) -- ( -> a)
-            { out (_count out|) -> a. }
-            sc monitor_copy_actions "out" cid (m $date) (m $text) -- ( -> a) { out (_count out|) -> a. }
             out (_count out|) -> _notify_agent ( $event -> $migration_deferred_flush, $cid -> cid,
                 $wire_id -> (m $wire_id), $text -> (m $text), $reply_to -> (m $reply_to),
-                $message_kind -> kind, $route -> $e2e,
-                $retained -> (retained $retained), $evicted -> (retained $evicted) ).
+                $message_kind -> kind, $route -> $e2e ).
         }
         delete mig_deferred cid.
         return out.

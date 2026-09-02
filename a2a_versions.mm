@@ -25,8 +25,8 @@
 // additive by taxonomy, extra fields strip safely); $pv is peer-asserted
 // metadata — it gates parsing branches and diagnostics, NEVER authz.
 //
-// Self-contained: no library deps (base types only), loadable from anywhere.
-library a2a_versions
+// Depends only on the shared protocol type vocabulary used by registered shapes.
+library a2a_versions loads library a2a_protocol
 {
     // ---- this build's wire dialect id -------------------------------------
     // Stamped as $pv on every 0.5.0+ core-originated send (cleartext $targ
@@ -723,8 +723,8 @@ library a2a_versions
     metadef msg_payload_v9_t: rmsg_targ_v2_t.
     metadef msg_payload_v10_t: (
         $text         -> str,
-        $wire_id      -> str+,
-        $reply_to     -> any,
+        $wire_id      -> str,
+        $reply_to     -> a2a_protocol::reply_ref_t+,
         $pv           -> int,
         $message_kind -> str
     ).
@@ -754,7 +754,11 @@ library a2a_versions
         }
         if v >= 10
         {
-            if is_str (raw $message_kind) != TRUE
+            reply = raw $reply_to.
+            if is_str (raw $wire_id) != TRUE
+                || (reply != NIL && (is_str (reply $wire_id) != TRUE
+                    || ((reply $sentence) != NIL && is_int (reply $sentence) != TRUE)))
+                || is_str (raw $message_kind) != TRUE
                 || (((raw $message_kind) safe str) != "text"
                     && ((raw $message_kind) safe str) != "command"
                     && ((raw $message_kind) safe str) != "command_result")
