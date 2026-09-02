@@ -13,6 +13,24 @@ library a2a_protocol loads library
 {
     metadef contact_t: ($name -> str, $container_id -> global_id).
 
+    // Wire-v10 typed application messages. These remain ordinary message
+    // payloads; the kind only tells the host how to interpret the opaque body.
+    message_kind_text = "text".
+    message_kind_command = "command".
+    message_kind_command_result = "command_result".
+    metadef message_kind_t: str.
+
+    // JSON produced and validated by the TypeScript SDK. MUFL deliberately
+    // treats the catalog as an opaque string and never parses JSON Schema.
+    metadef command_catalog_json_t: str.
+
+    fn is_message_kind (kind: str) -> bool
+    {
+        return kind == message_kind_text
+            || kind == message_kind_command
+            || kind == message_kind_command_result.
+    }
+
     // ---- identity hierarchy wire shapes ---------------------------------
     // Delegation certificate: "role X belongs to root Y, signed by Y". The
     // signature is over the core's _value_id, binding the role's container

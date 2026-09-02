@@ -333,8 +333,16 @@ async function main() {
   // then drive the flush (the real drain over flush_mig_deferred_actions).
   await mutate(loN, '::actor::qa_mig_inject_deferred', { cid: hiN.cid });
   ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '3', 'flush(§5.6): mig_deferred filled (3 queued app sends)');
+  await mutate(hiN, '::actor::qa_recv_reset', {});
   const flushed = await mutate(loN, '::actor::qa_mig_flush', { cid: hiN.cid });
-  ok(flushed.Reduce('flushed').Visualize() === '3' && flushed.Reduce('order').Visualize() === 'w0,w1,w2,', 'flush(§5.6): drained FIFO in order (w0,w1,w2) over e2e');
+  await sleep(4000);
+  const flushRecv = ro(hiN, '::actor::qa_recv_last', {});
+  ok(flushed.Reduce('flushed').Visualize() === '3' && flushed.Reduce('order').Visualize() === 'w0,w1,w2,' &&
+    flushRecv.Reduce('wires').Visualize() === 'w0,w1,w2,' &&
+    flushRecv.Reduce('texts').Visualize() === 'm0|{"command":"m1"}|{"result":"m2"}|' &&
+    flushRecv.Reduce('kinds').Visualize() === 'text,command,command_result,' &&
+    flushRecv.Reduce('reply_wires').Visualize() === '-,origin,w1,',
+    'flush(§5.6): real E2E delivery preserves FIFO wire IDs, typed kinds/bodies, and reply correlation');
   ok(ro(loN, '::actor::qa_mig_deferred_ids', { cid: hiN.cid }).Reduce('count').Visualize() === '0', 'flush(§5.6): mig_deferred empty after flush (queue drained in one pass)');
   // §5.4 trigger GATE — the criterion-1 boundary (old peers must NEVER get an offer). Tested via
   // the pure predicate mig_should_trigger (no send). ISOLATED cap advertise on loN (does not touch

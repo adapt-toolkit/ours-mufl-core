@@ -47,7 +47,7 @@ application actor loads libraries
     hidden
     {
         // Minimal inbox (the app owns message storage; the core calls the hook).
-        metadef msg_t: ($sender -> global_id, $text -> str, $wire_id -> str, $reply_wire -> str).
+        metadef msg_t: ($sender -> global_id, $text -> str, $wire_id -> str, $reply_wire -> str, $message_kind -> str).
         inbox is msg_t[] = [].
 
         // Minimal file store (the app owns file storage; the core calls the hook).
@@ -82,7 +82,9 @@ application actor loads libraries
                 if (arg $wire_id) != NIL { wid -> (arg $wire_id) safe str. }
                 rw is str = "".
                 if (arg $reply_to) != NIL { rw -> ((arg $reply_to) $wire_id) safe str. }
-                inbox (_count inbox|) -> ($sender -> sid, $text -> txt, $wire_id -> wid, $reply_wire -> rw).
+                mk is str = a2a_protocol::message_kind_text.
+                if (arg $message_kind) != NIL { mk -> (arg $message_kind) safe str. }
+                inbox (_count inbox|) -> ($sender -> sid, $text -> txt, $wire_id -> wid, $reply_wire -> rw, $message_kind -> mk).
                 return [ _notify_agent ($event -> $message_received), _save_state NIL ].
             },
             $on_message_sent -> fn (_: any) -> transaction::action::type[] { return []. },
@@ -512,6 +514,26 @@ application actor loads libraries
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
         a2a_messaging::contact_pv cid -> pv.
         return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    trn qa_set_command_catalog _:($catalog -> catalog: str+)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::set_self_command_catalog catalog.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    trn qa_set_contact_command_catalog _:($cid -> cid: global_id, $catalog -> catalog: str+)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        a2a_messaging::learn_contact_command_catalog cid catalog.
+        return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
+    }
+
+    trn readonly qa_get_command_catalogs _:($cid -> cid: global_id)
+    {
+        return ($self -> (a2a_messaging::get_self_command_catalog NIL),
+                $contact -> (a2a_messaging::get_contact_command_catalog cid)).
     }
 
     // Emit the EXACT pre-0.5 legacy receive_message $targ — only $text, no

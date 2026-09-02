@@ -79,6 +79,60 @@ async function main() {
   await sleep(2500);
   ok(/msg-R-to-I/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()), `send_message R→I round-trips over encrypted_channel`);
 
+  // ---------- T1 typed message + authoritative core capability gate ----------
+  {
+    const catalog = '{"commands":[{"name":"ping","input_schema":{"type":"object"}}]}';
+    let unsupported = false;
+    try {
+      await mutate(I, '::a2a_messaging::send_message',
+        { contact: R.cid, text: '{"command":"ping","arguments":{}}', message_kind: 'command' });
+    } catch (e) { unsupported = /does not advertise command support/i.test(String(e)); }
+    ok(unsupported, `command producer fails closed before SEND when the peer catalog is absent`);
+
+    await mutate(I, '::actor::qa_set_contact_command_catalog', { cid: R.cid, catalog });
+    const command = await mutate(I, '::a2a_messaging::send_message',
+      { contact: R.cid, text: '{"command":"ping","arguments":{}}', message_kind: 'command' });
+    const commandWire = command.Reduce('wire_id').Visualize();
+    await sleep(2500);
+    const rin = ro(R, '::actor::list_incoming_messages', undefined).Visualize();
+    ok(/command/.test(rin) && /ping/.test(rin), `v10 command kind/body reach the ordinary receive hook`);
+
+    await mutate(R, '::a2a_messaging::send_message', {
+      contact: I.cid, text: '{"ok":true,"result":"pong"}', message_kind: 'command_result',
+      reply_to: { wire_id: commandWire }
+    });
+    await sleep(2500);
+    const iin = ro(I, '::actor::list_incoming_messages', undefined).Visualize();
+    ok(/command_result/.test(iin) && /pong/.test(iin) && new RegExp(commandWire).test(iin),
+      `v10 command_result preserves kind and reply_to correlation`);
+
+    let invalidKind = false;
+    try { await mutate(I, '::a2a_messaging::send_message', { contact: R.cid, text: '{}', message_kind: 'future_kind' }); }
+    catch (e) { invalidKind = /unsupported application message kind/i.test(String(e)); }
+    ok(invalidKind, `unknown local message kind is rejected before SEND`);
+  }
+
+  // ---------- T1 catalog contact exchange + export state ----------
+  {
+    const CA = mk('catalog-a'); const CB = mk('catalog-b');
+    await mkPacket(CA, 'catalog-a-seed'); await mkPacket(CB, 'catalog-b-seed');
+    await setName(CA, 'CatalogA'); await setName(CB, 'CatalogB');
+    const catA = '{"commands":[{"name":"a.ping","input_schema":{}}]}';
+    const catB = '{"commands":[{"name":"b.ping","input_schema":{}}]}';
+    await mutate(CA, '::actor::qa_set_command_catalog', { catalog: catA });
+    await mutate(CB, '::actor::qa_set_command_catalog', { catalog: catB });
+    const ci = await mutate(CA, '::a2a_messaging::generate_invite', { name: 'CatalogB' });
+    await mutate(CB, '::a2a_messaging::add_contact', { invite: binv(CB, Buffer.from(ci.Reduce('invite').GetBinary())), name: 'CatalogA' });
+    await sleep(5000);
+    const seenA = ro(CA, '::actor::qa_get_command_catalogs', { cid: CB.cid }).Visualize();
+    const seenB = ro(CB, '::actor::qa_get_command_catalogs', { cid: CA.cid }).Visualize();
+    ok(/a\.ping/.test(seenA) && /b\.ping/.test(seenA) && /a\.ping/.test(seenB) && /b\.ping/.test(seenB),
+      `v10 invite legs exchange both opaque catalogs and retain each self catalog`);
+    const exported = ro(CA, '::actor::qa_export_core', undefined).Visualize();
+    ok(/self_command_catalog/.test(exported) && /contact_command_catalog/.test(exported) && /a\.ping/.test(exported) && /b\.ping/.test(exported),
+      `core export carries own and authenticated-contact catalogs`);
+  }
+
   // ---------- T1 file round-trip (send_file both directions) ----------
   const sfIR = await mutate(I, '::a2a_messaging::send_file',
     { contact: R.cid, filename: 'hello.png', mime: 'image/png', data: binv(I, Buffer.from('\x89PNG\r\n\x1a\nDATA')) });
@@ -645,8 +699,8 @@ async function main() {
     await sleep(2500);
     ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(R, I.cid) === '9', `responder learned contact_pv=9 (wire-9 leg-3 + stamped messages)`);
-    ok(pvOf(I, R.cid) === '9', `inviter learned contact_pv=9 (real current-build leg-1)`);
+    ok(pvOf(R, I.cid) === '10', `responder learned contact_pv=10 (wire-10 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '10', `inviter learned contact_pv=10 (real current-build leg-1)`);
   }
 
   // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
@@ -668,14 +722,14 @@ async function main() {
     await sleep(2500);
     ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `post-upgrade stamped message delivered`);
-    ok(pvOf(I, R.cid) === '9', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→9 (ongoing learning)`);
+    ok(pvOf(I, R.cid) === '10', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→10 (ongoing learning)`);
     // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
     await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
     await sleep(2500);
     ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `legacy (pre-wire_id, unstamped) message still delivers`);
-    ok(pvOf(I, R.cid) === '9', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(pvOf(I, R.cid) === '10', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
     ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
       `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
   }

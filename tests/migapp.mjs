@@ -108,6 +108,14 @@ async function main() {
     ok(T(ro(I, '::actor::qa_mig_pin', { cid: R.cid }).Reduce('seen').Visualize()), 'setup: initiator has contact_e2e_seen==TRUE (production-like — the exact state that masked the do_ic bug)');
     ok(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid').length === 0, 'setup: initiator is BOX-ONLY (no live session)');
     await mutate(I, '::actor::qa_recv_reset', {});
+    await mutate(R, '::actor::qa_recv_reset', {});
+    await mutate(I, '::actor::qa_set_contact_command_catalog', { cid: R.cid, catalog: '{"commands":["queued"]}' });
+    const queued = await mutate(I, '::a2a_messaging::send_message', {
+      contact: R.name, text: '{"command":"queued"}', message_kind: 'command',
+      reply_to: { wire_id: 'queued-origin', sentence: 2 }
+    });
+    ok(T(queued.Reduce('deferred').Visualize()) && T(queued.Reduce('migrating').Visualize()),
+      'typed migration queue: command is deferred during the committed window');
     const appPt = 'responder app on the new session BEFORE the explicit confirm';
     const s = await mutate(R, '::a2a_messaging::send_message', { contact: I.name, text: appPt });
     ok(s.Reduce('route').Visualize() === 'e2e', 'responder boxed its app as receive_e2e_message_tx (routes e2e)');
@@ -117,6 +125,10 @@ async function main() {
     const pin = ro(I, '::actor::qa_mig_pin', { cid: R.cid });
     ok(T(pin.Reduce('pinned').Visualize()) && hex(getBin(pin, 'session_id')) === hex(sid), 'implicit-confirm: epoch pin set to the promoted (migrated) session');
     ok(hex(getBin(ro(I, '::actor::qa_e2e_active', { cid: R.cid }), 'sid')) === hex(sid), 'implicit-confirm: active session == the promoted rotation');
+    const flushed = ro(R, '::actor::qa_recv_last', {});
+    ok(flushed.Reduce('text').Visualize() === '{"command":"queued"}' &&
+      flushed.Reduce('message_kind').Visualize() === 'command' && flushed.Reduce('reply_wire').Visualize() === 'queued-origin',
+      'typed migration queue: promotion flush preserves command kind, body, and reply correlation over E2E');
     // §5.8 mixed-contact independence: this node is epoch-pinned to R (routes e2e) while an
     // unrelated non-e2e contact routes "legacy" — per-contact routing is independent.
     ok(ro(I, '::actor::qa_e2e_route', { cid: R.cid }).Reduce('route').Visualize() === 'e2e', 'mixed-contact(§5.8): the migrated peer routes e2e');

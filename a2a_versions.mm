@@ -50,7 +50,9 @@ library a2a_versions
     // (a2a_messaging::contact_removal_gate), exactly like receipts -> 7; the
     // primary evidence stays the positive core.contact.removal cap. Every existing
     // gate is a `>=` threshold (7/8), so the bump is monotone and changes none.
-    wire_version = 9.
+    // 10: typed application-message payloads and opaque command catalogs on
+    // every authenticated contact-establishment family.
+    wire_version = 10.
     // The version floor: OSP (oldest supported peer) = core 0.2.0 -> 2.
     // Raising this = an owner decision recorded in COMPATIBILITY.md (drop the
     // v2 types from the unions + prune the corpus — a visible, reviewed act).
@@ -187,12 +189,23 @@ library a2a_versions
         $pv           -> int,
         $caps         -> str[]+
     ).
+    metadef sir_payload_v10_t: (
+        $ad           -> any,
+        $cert         -> bin+,
+        $root_profile -> bin+,
+        $cp_binding   -> bin+,
+        $invite_id    -> global_id,
+        $name         -> str,
+        $pv           -> int,
+        $caps         -> str[]+,
+        $command_catalog -> str+
+    ).
 
     // The handler-visible contract: union of every version >= OSP (REG-3).
-    metadef sir_payload_t: sir_payload_v5_t || sir_payload_v3_t || sir_payload_v2_t.
+    metadef sir_payload_t: sir_payload_v10_t || sir_payload_v5_t || sir_payload_v3_t || sir_payload_v2_t.
     // Ordered registry listing — the reviewable "what do we accept" artifact.
-    metadef sir_versions_t: [sir_payload_v2_t, sir_payload_v3_t, sir_payload_v5_t].
-    sir_max_version = 5.
+    metadef sir_versions_t: [sir_payload_v2_t, sir_payload_v3_t, sir_payload_v5_t, sir_payload_v10_t].
+    sir_max_version = 10.
 
     // Discriminator: $pv when stamped (0.5.0+); pre-$pv shapes are inferred:
     // $name present => v3, else v2. Registry-local rule, documented here only.
@@ -215,11 +228,12 @@ library a2a_versions
         if (raw $ad) == NIL || is_str (raw $invite_id) != TRUE { return FALSE. }
         if reg >= 3 && is_str (raw $name) != TRUE { return FALSE. }
         if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
+        if reg >= 10 && (raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE { return FALSE. }
         return TRUE.
     }
 
     // try-narrow result: error-as-data union ($ok TRUE => $payload, else $err).
-    metadef sir_narrowed_t: ($ok -> bool, $payload -> sir_payload_t+, $err -> version_error_t+).
+    metadef sir_narrowed_t: ($ok -> bool, $payload -> any, $err -> version_error_t+).
 
     // REG-4 dispatch-then-narrow, error-as-data form (Addition A). $pv NEWER
     // than we know narrows as our newest (class-A forward compat).
@@ -234,11 +248,12 @@ library a2a_versions
         // and its wire on this surface is byte-identical to 0.3's; a synthetic
         // $pv=4 therefore narrows as v3 — requires $name, else shape error),
         // else v2.
-        reg = (v >= 5 ?? 5 ; (v >= 3 ?? 3 ; 2)).
+        reg = (v >= 10 ?? 10 ; (v >= 5 ?? 5 ; (v >= 3 ?? 3 ; 2))).
         if sir_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "sir" v sir_max_version).
         }
+        if reg == 10 { return ($ok -> TRUE, $payload -> raw safe sir_payload_v10_t, $err -> NIL). }
         if reg == 5 { return ($ok -> TRUE, $payload -> raw safe sir_payload_v5_t, $err -> NIL). }
         if reg == 3 { return ($ok -> TRUE, $payload -> raw safe sir_payload_v3_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe sir_payload_v2_t, $err -> NIL).
@@ -246,7 +261,7 @@ library a2a_versions
 
     // Strict form: same dispatch, aborts with the stable message naming the
     // surface — never an EVAL_ERROR from a NIL cast deeper in.
-    fn narrow_sir (raw: any) -> sir_payload_t
+    fn narrow_sir (raw: any) -> any
     {
         r = try_narrow_sir raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
@@ -257,7 +272,7 @@ library a2a_versions
     // gap: v0.3/v0.5 carry $name in their registered type; v0.2 has no such
     // field, so the v2 branch RETURNS the empty sentinel (caller falls back
     // to the sender cid — explicit, typed degradation).
-    fn sir_joiner_name (input: sir_payload_t) -> str
+    fn sir_joiner_name (input: any) -> str
     {
         raw = input as any.
         v = sir_version_of raw.
@@ -268,7 +283,7 @@ library a2a_versions
     // Versioned $caps accessor (M2 pattern: re-cast from raw per version —
     // never read version fields off the union binding): v5 carries $caps
     // (nullable); every earlier version has no such field — empty list.
-    fn sir_caps (input: sir_payload_t) -> str[]
+    fn sir_caps (input: any) -> str[]
     {
         raw = input as any.
         if (sir_version_of raw) >= 5
@@ -279,9 +294,16 @@ library a2a_versions
         return [].
     }
 
+    fn sir_catalog (input: any) -> str+
+    {
+        raw = input as any.
+        if sir_version_of raw >= 10 { return (raw safe sir_payload_v10_t) $command_catalog. }
+        return NIL.
+    }
+
     // ========================================================================
     // REGISTRY "cin" — complete_invite, leg-3 boxed identity bundle.
-    // Never gained $name; v5 adds $pv/$caps only.
+    // Never gained $name; v5 adds $pv/$caps and v10 adds the catalog.
     // ========================================================================
     metadef cin_payload_v2_t: (
         $ad           -> any,
@@ -299,9 +321,19 @@ library a2a_versions
         $pv           -> int,
         $caps         -> str[]+
     ).
-    metadef cin_payload_t: cin_payload_v5_t || cin_payload_v2_t.
-    metadef cin_versions_t: [cin_payload_v2_t, cin_payload_v5_t].
-    cin_max_version = 5.
+    metadef cin_payload_v10_t: (
+        $ad           -> any,
+        $cert         -> bin+,
+        $root_profile -> bin+,
+        $cp_binding   -> bin+,
+        $invite_id    -> global_id,
+        $pv           -> int,
+        $caps         -> str[]+,
+        $command_catalog -> str+
+    ).
+    metadef cin_payload_t: cin_payload_v10_t || cin_payload_v5_t || cin_payload_v2_t.
+    metadef cin_versions_t: [cin_payload_v2_t, cin_payload_v5_t, cin_payload_v10_t].
+    cin_max_version = 10.
 
     // Pre-$pv cin shapes are all v2 (no inferable v3 delta on this surface).
     fn cin_version_of (raw: any) -> int
@@ -314,10 +346,11 @@ library a2a_versions
     {
         if (raw $ad) == NIL || is_str (raw $invite_id) != TRUE { return FALSE. }
         if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
+        if reg >= 10 && (raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE { return FALSE. }
         return TRUE.
     }
 
-    metadef cin_narrowed_t: ($ok -> bool, $payload -> cin_payload_t+, $err -> version_error_t+).
+    metadef cin_narrowed_t: ($ok -> bool, $payload -> any, $err -> version_error_t+).
 
     fn try_narrow_cin (raw: any) -> cin_narrowed_t
     {
@@ -326,23 +359,24 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "cin" v cin_max_version).
         }
-        reg = (v >= 5 ?? 5 ; 2).
+        reg = (v >= 10 ?? 10 ; (v >= 5 ?? 5 ; 2)).
         if cin_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "cin" v cin_max_version).
         }
+        if reg >= 10 { return ($ok -> TRUE, $payload -> raw safe cin_payload_v10_t, $err -> NIL). }
         if reg >= 5 { return ($ok -> TRUE, $payload -> raw safe cin_payload_v5_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe cin_payload_v2_t, $err -> NIL).
     }
 
-    fn narrow_cin (raw: any) -> cin_payload_t
+    fn narrow_cin (raw: any) -> any
     {
         r = try_narrow_cin raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
         return (r $payload)?.
     }
 
-    fn cin_caps (input: cin_payload_t) -> str[]
+    fn cin_caps (input: any) -> str[]
     {
         raw = input as any.
         if (cin_version_of raw) >= 5
@@ -351,6 +385,13 @@ library a2a_versions
             if c != NIL { return c?. }
         }
         return [].
+    }
+
+    fn cin_catalog (input: any) -> str+
+    {
+        raw = input as any.
+        if cin_version_of raw >= 10 { return (raw safe cin_payload_v10_t) $command_catalog. }
+        return NIL.
     }
 
     // ========================================================================
@@ -374,9 +415,19 @@ library a2a_versions
         $pv           -> int,
         $caps         -> str[]+
     ).
-    metadef rst_payload_t: rst_payload_v5_t || rst_payload_v2_t.
-    metadef rst_versions_t: [rst_payload_v2_t, rst_payload_v5_t].
-    rst_max_version = 5.
+    metadef rst_payload_v10_t: (
+        $ad           -> any,
+        $cert         -> bin+,
+        $root_profile -> bin+,
+        $cp_binding   -> bin+,
+        $rid          -> global_id,
+        $pv           -> int,
+        $caps         -> str[]+,
+        $command_catalog -> str+
+    ).
+    metadef rst_payload_t: rst_payload_v10_t || rst_payload_v5_t || rst_payload_v2_t.
+    metadef rst_versions_t: [rst_payload_v2_t, rst_payload_v5_t, rst_payload_v10_t].
+    rst_max_version = 10.
 
     fn rst_version_of (raw: any) -> int
     {
@@ -388,10 +439,11 @@ library a2a_versions
     {
         if (raw $ad) == NIL || is_str (raw $rid) != TRUE { return FALSE. }
         if reg >= 5 && is_int (raw $pv) != TRUE { return FALSE. }
+        if reg >= 10 && (raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE { return FALSE. }
         return TRUE.
     }
 
-    metadef rst_narrowed_t: ($ok -> bool, $payload -> rst_payload_t+, $err -> version_error_t+).
+    metadef rst_narrowed_t: ($ok -> bool, $payload -> any, $err -> version_error_t+).
 
     fn try_narrow_rst (raw: any) -> rst_narrowed_t
     {
@@ -400,23 +452,24 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "rst" v rst_max_version).
         }
-        reg = (v >= 5 ?? 5 ; 2).
+        reg = (v >= 10 ?? 10 ; (v >= 5 ?? 5 ; 2)).
         if rst_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "rst" v rst_max_version).
         }
+        if reg >= 10 { return ($ok -> TRUE, $payload -> raw safe rst_payload_v10_t, $err -> NIL). }
         if reg >= 5 { return ($ok -> TRUE, $payload -> raw safe rst_payload_v5_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe rst_payload_v2_t, $err -> NIL).
     }
 
-    fn narrow_rst (raw: any) -> rst_payload_t
+    fn narrow_rst (raw: any) -> any
     {
         r = try_narrow_rst raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
         return (r $payload)?.
     }
 
-    fn rst_caps (input: rst_payload_t) -> str[]
+    fn rst_caps (input: any) -> str[]
     {
         raw = input as any.
         if (rst_version_of raw) >= 5
@@ -425,6 +478,13 @@ library a2a_versions
             if c != NIL { return c?. }
         }
         return [].
+    }
+
+    fn rst_catalog (input: any) -> str+
+    {
+        raw = input as any.
+        if rst_version_of raw >= 10 { return (raw safe rst_payload_v10_t) $command_catalog. }
+        return NIL.
     }
 
     // ========================================================================
@@ -448,9 +508,20 @@ library a2a_versions
         $joiner_cp_binding   -> bin+,
         $joiner_name         -> str
     ).
-    metadef acc_args_t: acc_args_v3_t || acc_args_v2_t.
-    metadef acc_versions_t: [acc_args_v2_t, acc_args_v3_t].
-    acc_max_version = 3.
+    metadef acc_args_v10_t: (
+        $invite_id           -> global_id,
+        $joiner_ad           -> any,
+        $joiner_cert         -> bin+,
+        $joiner_root_profile -> bin+,
+        $joiner_cp_binding   -> bin+,
+        $joiner_name         -> str,
+        $pv                  -> int,
+        $caps                -> str[]+,
+        $command_catalog     -> str+
+    ).
+    metadef acc_args_t: acc_args_v10_t || acc_args_v3_t || acc_args_v2_t.
+    metadef acc_versions_t: [acc_args_v2_t, acc_args_v3_t, acc_args_v10_t].
+    acc_max_version = 10.
 
     fn acc_version_of (raw: any) -> int
     {
@@ -463,10 +534,11 @@ library a2a_versions
     {
         if is_str (raw $invite_id) != TRUE || (raw $joiner_ad) == NIL { return FALSE. }
         if reg >= 3 && is_str (raw $joiner_name) != TRUE { return FALSE. }
+        if reg >= 10 && (is_int (raw $pv) != TRUE || ((raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE)) { return FALSE. }
         return TRUE.
     }
 
-    metadef acc_narrowed_t: ($ok -> bool, $payload -> acc_args_t+, $err -> version_error_t+).
+    metadef acc_narrowed_t: ($ok -> bool, $payload -> any, $err -> version_error_t+).
 
     fn try_narrow_acc (raw: any) -> acc_narrowed_t
     {
@@ -475,16 +547,17 @@ library a2a_versions
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "acc" v acc_max_version).
         }
-        reg = (v >= 3 ?? 3 ; 2).
+        reg = (v >= 10 ?? 10 ; (v >= 3 ?? 3 ; 2)).
         if acc_shape_ok raw reg != TRUE
         {
             return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "acc" v acc_max_version).
         }
+        if reg >= 10 { return ($ok -> TRUE, $payload -> raw safe acc_args_v10_t, $err -> NIL). }
         if reg >= 3 { return ($ok -> TRUE, $payload -> raw safe acc_args_v3_t, $err -> NIL). }
         return ($ok -> TRUE, $payload -> raw safe acc_args_v2_t, $err -> NIL).
     }
 
-    fn narrow_acc (raw: any) -> acc_args_t
+    fn narrow_acc (raw: any) -> any
     {
         r = try_narrow_acc raw.
         if (r $ok) != TRUE { abort ((r $err)? $message) when TRUE. }
@@ -493,12 +566,30 @@ library a2a_versions
 
     // acc analogue of sir_joiner_name: v3 carries $joiner_name; v2 has no such
     // field — return the empty sentinel (caller falls back to the sender cid).
-    fn acc_joiner_name (input: acc_args_t) -> str
+    fn acc_joiner_name (input: any) -> str
     {
         raw = input as any.
         v = acc_version_of raw.
         if v >= 3 { return ((raw safe acc_args_v3_t) $joiner_name). }
         return "".
+    }
+
+    fn acc_caps (input: any) -> str[]
+    {
+        raw = input as any.
+        if acc_version_of raw >= 10
+        {
+            c = (raw safe acc_args_v10_t) $caps.
+            if c != NIL { return c?. }
+        }
+        return [].
+    }
+
+    fn acc_catalog (input: any) -> str+
+    {
+        raw = input as any.
+        if acc_version_of raw >= 10 { return (raw safe acc_args_v10_t) $command_catalog. }
+        return NIL.
     }
 
     // ========================================================================
@@ -621,18 +712,150 @@ library a2a_versions
     // notify_*) are catalogued in COMPATIBILITY.md.
     // ========================================================================
 
-    // receive_message $targ (v5 adds only the $pv stamp — same shape).
+    // receive_message $targ. The v9 branch is the exact pre-typed shape;
+    // v10 requires an explicit kind. Missing kind is text ONLY in v9.
     metadef rmsg_targ_v2_t: (
         $text     -> str,
         $wire_id  -> str+,
         $reply_to -> any,
         $pv       -> int+
     ).
+    metadef msg_payload_v9_t: rmsg_targ_v2_t.
+    metadef msg_payload_v10_t: (
+        $text         -> str,
+        $wire_id      -> str+,
+        $reply_to     -> any,
+        $pv           -> int,
+        $message_kind -> str
+    ).
+    metadef msg_payload_t: msg_payload_v10_t || msg_payload_v9_t.
+    metadef msg_versions_t: [msg_payload_v9_t, msg_payload_v10_t].
     metadef rmsg_targ_t: rmsg_targ_v2_t.
+    msg_max_version = 10.
     fn rmsg_version_of (raw: any) -> int
     {
         pv = peer_pv raw.
         return (pv != 0 ?? pv ; 2).
+    }
+
+    metadef msg_narrowed_t: ($ok -> bool, $payload -> any, $err -> version_error_t+).
+    fn try_narrow_msg (raw: any) -> msg_narrowed_t
+    {
+        v = rmsg_version_of raw.
+        if v < min_wire_version
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "msg" v msg_max_version).
+        }
+        if is_str (raw $text) != TRUE
+            || ((raw $wire_id) != NIL && is_str (raw $wire_id) != TRUE)
+            || ((raw $pv) != NIL && is_int (raw $pv) != TRUE)
+        {
+            return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "msg" v msg_max_version).
+        }
+        if v >= 10
+        {
+            if is_str (raw $message_kind) != TRUE
+                || (((raw $message_kind) safe str) != "text"
+                    && ((raw $message_kind) safe str) != "command"
+                    && ((raw $message_kind) safe str) != "command_result")
+            {
+                return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "msg" v msg_max_version).
+            }
+            return ($ok -> TRUE, $payload -> raw safe msg_payload_v10_t, $err -> NIL).
+        }
+        return ($ok -> TRUE, $payload -> raw safe msg_payload_v9_t, $err -> NIL).
+    }
+    fn msg_kind (input: any) -> str
+    {
+        raw = input as any.
+        if rmsg_version_of raw >= 10 { return (raw safe msg_payload_v10_t) $message_kind. }
+        return "text".
+    }
+
+    // Actor-owned contact entry surfaces are registered here so their v10
+    // branches can be consumed without mutating the shipped shapes.
+    metadef local_intro_v9_t: (
+        $joiner_name -> str, $joiner_ad -> any, $intro -> bin,
+        $text -> str+, $wire_id -> str
+    ).
+    metadef local_intro_v10_t: (
+        $joiner_name -> str, $joiner_ad -> any, $intro -> bin,
+        $text -> str+, $wire_id -> str, $pv -> int,
+        $command_catalog -> str+
+    ).
+    // These actor-owned surfaces are narrowed before actor field reads. Keep
+    // the branch types and ordered registry here; the result carrier stays
+    // `any` to avoid duplicating the deep address-document union in every
+    // daemon unit's meta-stage type graph.
+    metadef local_intro_t: any.
+    metadef local_intro_versions_t: [local_intro_v9_t, local_intro_v10_t].
+    fn try_narrow_local_intro (raw: any) -> any
+    {
+        v = peer_pv raw.
+        if v == 0 { v -> 9. }
+        if v < min_wire_version { return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "local_intro" v 10). }
+        if is_str (raw $joiner_name) != TRUE || (raw $joiner_ad) == NIL
+            || (raw $intro) == NIL || (_typeof (raw $intro)) != "BINARY"
+            || is_str (raw $wire_id) != TRUE
+            || (v >= 10 && (is_int (raw $pv) != TRUE || ((raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE)))
+        { return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "local_intro" v 10). }
+        if v >= 10 { return ($ok -> TRUE, $payload -> raw safe local_intro_v10_t, $err -> NIL). }
+        return ($ok -> TRUE, $payload -> raw safe local_intro_v9_t, $err -> NIL).
+    }
+
+    metadef sibling_intro_v9_t: (
+        $joiner_name -> str, $joiner_ad -> any, $cert -> bin+,
+        $text -> str+, $wire_id -> str
+    ).
+    metadef sibling_intro_v10_t: (
+        $joiner_name -> str, $joiner_ad -> any, $cert -> bin+,
+        $text -> str+, $wire_id -> str, $pv -> int,
+        $command_catalog -> str+
+    ).
+    metadef sibling_intro_t: any.
+    metadef sibling_intro_versions_t: [sibling_intro_v9_t, sibling_intro_v10_t].
+    fn try_narrow_sibling_intro (raw: any) -> any
+    {
+        v = peer_pv raw.
+        if v == 0 { v -> 9. }
+        if v < min_wire_version { return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "sibling_intro" v 10). }
+        if is_str (raw $joiner_name) != TRUE || (raw $joiner_ad) == NIL
+            || is_str (raw $wire_id) != TRUE
+            || (v >= 10 && (is_int (raw $pv) != TRUE || ((raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE)))
+        { return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "sibling_intro" v 10). }
+        if v >= 10 { return ($ok -> TRUE, $payload -> raw safe sibling_intro_v10_t, $err -> NIL). }
+        return ($ok -> TRUE, $payload -> raw safe sibling_intro_v9_t, $err -> NIL).
+    }
+
+    metadef connect_descriptor_v9_t: (
+        $peer_ad -> any, $peer_name -> str, $pv -> int+
+    ).
+    metadef connect_descriptor_v10_t: (
+        $peer_ad -> any, $peer_name -> str, $pv -> int,
+        $command_catalog -> str+
+    ).
+    metadef connect_descriptor_t: any.
+    metadef connect_descriptor_versions_t: [connect_descriptor_v9_t, connect_descriptor_v10_t].
+    fn try_narrow_connect_descriptor (raw: any) -> any
+    {
+        v = peer_pv raw.
+        if v == 0 { v -> 9. }
+        if v < min_wire_version { return ($ok -> FALSE, $payload -> NIL, $err -> too_old_error "connect_descriptor" v 10). }
+        if (raw $peer_ad) == NIL || is_str (raw $peer_name) != TRUE
+            || ((raw $pv) != NIL && is_int (raw $pv) != TRUE)
+            || (v >= 10 && (is_int (raw $pv) != TRUE || ((raw $command_catalog) != NIL && is_str (raw $command_catalog) != TRUE)))
+        { return ($ok -> FALSE, $payload -> NIL, $err -> shape_error "connect_descriptor" v 10). }
+        if v >= 10 { return ($ok -> TRUE, $payload -> raw safe connect_descriptor_v10_t, $err -> NIL). }
+        return ($ok -> TRUE, $payload -> raw safe connect_descriptor_v9_t, $err -> NIL).
+    }
+
+    fn contact_surface_catalog (raw: any) -> str+
+    {
+        if peer_pv raw >= 10 && (raw $command_catalog) != NIL
+        {
+            return (raw $command_catalog) safe str.
+        }
+        return NIL.
     }
 
     // receive_receipt $targ (core 0.7.0, class-B new surface — single version;

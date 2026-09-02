@@ -39,6 +39,8 @@ application actor loads libraries
         // qa_recv_abort makes the message hook ABORT (must-fix-C rollback probe).
         qa_recv_text is str = "".
         qa_recv_wire is str = "".
+        qa_recv_kind is str = "".
+        qa_recv_reply_wire is str = "".
         qa_recv_file is str = "".
         qa_recv_flen is int = 0.
         qa_recv_count is int = 0.
@@ -50,6 +52,10 @@ application actor loads libraries
                 abort "qa_recv_abort: app hook rejected the message (must-fix-C rollback probe)" WHEN qa_recv_abort.
                 qa_recv_text -> ((a $text) safe str).
                 if (a $wire_id) != NIL { qa_recv_wire -> ((a $wire_id) safe str). }
+                qa_recv_kind -> a2a_protocol::message_kind_text.
+                if (a $message_kind) != NIL { qa_recv_kind -> ((a $message_kind) safe str). }
+                qa_recv_reply_wire -> "".
+                if (a $reply_to) != NIL { qa_recv_reply_wire -> ((a $reply_to) $wire_id) safe str. }
                 qa_recv_count -> (qa_recv_count + 1).
                 return []. },
             $on_message_sent     -> fn (_: any) -> transaction::action::type[] { return []. },
@@ -113,8 +119,10 @@ application actor loads libraries
     trn readonly qa_e2e_staged _:($cid -> cid: global_id) { return ($sid -> (e2e::staged_session_id cid)). }
 
     // ── delivery observability + the must-fix-C rollback probe.
-    trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
-    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
+    trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $message_kind -> qa_recv_kind,
+        $reply_wire -> qa_recv_reply_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
+    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_kind -> "".  qa_recv_reply_wire -> "".
+        qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
     trn readonly qa_receipt_count _ { return ($count -> qa_receipt_count). }
     trn readonly qa_dedup_count _:($cid -> cid: global_id)
     {
@@ -139,7 +147,8 @@ application actor loads libraries
     trn qa_send_custom_message _:($cid -> cid: global_id, $text -> text: str, $wire_id -> wid: str)
     {
         epb = ((((a2a_messaging::peer_ads cid)?) as any) $identity $e2e_bundle) safe address_document_types::t_e2e_bundle.
-        inner = _write ($text -> text, $wire_id -> wid, $reply_to -> NIL, $pv -> a2a_versions::wire_version).
+        inner = _write ($text -> text, $wire_id -> wid, $reply_to -> NIL,
+                        $pv -> a2a_versions::wire_version, $message_kind -> a2a_protocol::message_kind_text).
         env = e2e::encrypt_to cid inner epb.
         return transaction::success [
             encrypted_channel::send_encrypted_tx cid ($name -> a2a_messaging::receive_e2e_message_tx,
@@ -162,6 +171,12 @@ application actor loads libraries
     trn qa_learn_peer _:($cid -> cid: global_id, $pv -> pv: int, $caps -> caps: str[])
     {
         a2a_messaging::learn_contact_version cid pv caps.
+        return transaction::success [ _return_data ($ok -> TRUE) ].
+    }
+
+    trn qa_set_contact_command_catalog _:($cid -> cid: global_id, $catalog -> catalog: str+)
+    {
+        a2a_messaging::learn_contact_command_catalog cid catalog.
         return transaction::success [ _return_data ($ok -> TRUE) ].
     }
 

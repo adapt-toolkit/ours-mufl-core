@@ -45,6 +45,10 @@ application actor loads libraries
         // (the do_ic promotion + pins + flush roll back with the tx when delivery aborts).
         qa_recv_text is str = "".
         qa_recv_wire is str = "".
+        qa_recv_wires is str = "".
+        qa_recv_texts is str = "".
+        qa_recv_kinds is str = "".
+        qa_recv_reply_wires is str = "".
         qa_recv_file is str = "".
         qa_recv_flen is int = 0.
         qa_recv_count is int = 0.
@@ -56,7 +60,18 @@ application actor loads libraries
             $on_message_received -> fn (a: any) -> transaction::action::type[] {
                 abort "qa_recv_abort: app hook rejected the message (must-fix-C rollback probe)" WHEN qa_recv_abort.
                 qa_recv_text -> ((a $text) safe str).
-                if (a $wire_id) != NIL { qa_recv_wire -> ((a $wire_id) safe str). }
+                qa_recv_texts -> qa_recv_texts + qa_recv_text + "|".
+                if (a $wire_id) != NIL
+                {
+                    qa_recv_wire -> ((a $wire_id) safe str).
+                    qa_recv_wires -> qa_recv_wires + qa_recv_wire + ",".
+                }
+                kind is str = a2a_protocol::message_kind_text.
+                if (a $message_kind) != NIL { kind -> ((a $message_kind) safe str). }
+                qa_recv_kinds -> qa_recv_kinds + kind + ",".
+                reply_wire is str = "-".
+                if (a $reply_to) != NIL { reply_wire -> ((a $reply_to) $wire_id) safe str. }
+                qa_recv_reply_wires -> qa_recv_reply_wires + reply_wire + ",".
                 qa_recv_count -> (qa_recv_count + 1).
                 return []. },
             $on_message_sent     -> fn (_: any) -> transaction::action::type[] { return []. },
@@ -212,8 +227,12 @@ application actor loads libraries
     // on_message_received hook stored (proof handle_receive_e2e_message decrypted + delivered it);
     // qa_recv_reset clears it between assertions; qa_recv_set_abort toggles the must-fix-C rollback
     // probe (the app hook aborts → the do_ic promotion rolls back with the tx).
-    trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
-    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.  return transaction::success [ _return_data ($ok -> TRUE) ]. }
+    trn readonly qa_recv_last _ { return ($text -> qa_recv_text, $wire -> qa_recv_wire, $wires -> qa_recv_wires,
+        $texts -> qa_recv_texts, $kinds -> qa_recv_kinds, $reply_wires -> qa_recv_reply_wires,
+        $count -> qa_recv_count, $filename -> qa_recv_file, $flen -> qa_recv_flen). }
+    trn qa_recv_reset _ { qa_recv_text -> "".  qa_recv_wire -> "".  qa_recv_wires -> "".  qa_recv_texts -> "".
+        qa_recv_kinds -> "".  qa_recv_reply_wires -> "".  qa_recv_file -> "".  qa_recv_flen -> 0.
+        return transaction::success [ _return_data ($ok -> TRUE) ]. }
     trn qa_recv_set_abort _:($abort -> ab: bool) { qa_recv_abort -> ab.  return transaction::success [ _return_data ($abort -> qa_recv_abort) ]. }
 
     // ── Full-state persistence (reload port). The host stores the WHOLE export_core_state
@@ -240,7 +259,8 @@ application actor loads libraries
         return transaction::success [
             encrypted_channel::send_encrypted_tx target_id (
                 $name -> "::a2a_messaging::receive_message",
-                $targ -> ($text -> text, $wire_id -> wid, $pv -> a2a_versions::wire_version) ),
+                $targ -> ($text -> text, $wire_id -> wid, $pv -> a2a_versions::wire_version,
+                          $message_kind -> a2a_protocol::message_kind_text) ),
             _return_data ($sent_to -> target_id, $wire_id -> wid) ].
     }
 
@@ -346,10 +366,17 @@ application actor loads libraries
     trn qa_mig_inject_deferred _:($cid -> cid: global_id)
     {
         now = (current_transaction_info::get_transaction_time())?.
+        reply_command is a2a_protocol::reply_ref_t+ = ($wire_id -> "origin", $sentence -> 2).
+        reply_result is a2a_protocol::reply_ref_t+ = ($wire_id -> "w1", $sentence -> NIL).
         q is a2a_messaging::deferred_msg_t[] = [
-            ($text -> "m0", $wire_id -> "w0", $reply_to -> NIL, $date -> now),
-            ($text -> "m1", $wire_id -> "w1", $reply_to -> NIL, $date -> now),
-            ($text -> "m2", $wire_id -> "w2", $reply_to -> NIL, $date -> now) ].
+            ($text -> "m0", $wire_id -> "w0", $reply_to -> NIL, $date -> now,
+             $message_kind -> a2a_protocol::message_kind_text),
+            ($text -> "{\"command\":\"m1\"}", $wire_id -> "w1",
+             $reply_to -> reply_command, $date -> now,
+             $message_kind -> a2a_protocol::message_kind_command),
+            ($text -> "{\"result\":\"m2\"}", $wire_id -> "w2",
+             $reply_to -> reply_result, $date -> now,
+             $message_kind -> a2a_protocol::message_kind_command_result) ].
         a2a_messaging::mig_deferred cid -> q.
         return transaction::success [ _return_data ($injected -> 3) ].
     }
@@ -363,10 +390,13 @@ application actor loads libraries
     trn qa_mig_flush _:($cid -> cid: global_id)
     {
         order is str = "".
+        queued is int = 0.
         q = a2a_messaging::mig_deferred cid.
-        if q != NIL { sc q? -- ( -> m) { order -> order + (m $wire_id) + ",". } }
+        if q != NIL { queued -> (_count q?|).  sc q? -- ( -> m) { order -> order + (m $wire_id) + ",". } }
         acts is transaction::action::type[] = a2a_messaging::flush_mig_deferred_actions cid.
-        return transaction::success [ _return_data ($flushed -> (_count acts|), $order -> order) ].
+        action_count = _count acts|.
+        acts action_count -> _return_data ($flushed -> queued, $actions -> action_count, $order -> order).
+        return transaction::success acts.
     }
 
     // ---- decode_migration_envelope GUARD matrix (point-1 divergence + binding + forgery/replay) ----
