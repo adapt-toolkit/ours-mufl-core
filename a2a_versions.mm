@@ -52,7 +52,10 @@ library a2a_versions loads library a2a_protocol
     // gate is a `>=` threshold (7/8), so the bump is monotone and changes none.
     // 10: typed application-message payloads and opaque command catalogs on
     // every authenticated contact-establishment family.
-    wire_version = 10.
+    // 11: runtime command-catalog snapshots on the authenticated generic
+    // capability refresh path. No registered establishment shape changes;
+    // v11 is positive parsing evidence for this additive transaction field.
+    wire_version = 11.
     // The version floor: OSP (oldest supported peer) = core 0.2.0 -> 2.
     // Raising this = an owner decision recorded in COMPATIBILITY.md (drop the
     // v2 types from the unions + prune the corpus — a visible, reviewed act).

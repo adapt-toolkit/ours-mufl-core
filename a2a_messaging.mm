@@ -210,7 +210,8 @@ library a2a_messaging loads libraries
     self_command_catalog is a2a_protocol::command_catalog_json_t+ = NIL.
     contact_command_catalog is (global_id ->> a2a_protocol::command_catalog_json_t) = (,).
     // ACK-confirmed capability fingerprint per contact. A missing/stale entry
-    // is retried by reconcile_advertise; only the encrypted ACK advances it.
+    // is retried by reconcile_advertise; v11 peers use the same ACK as positive
+    // delivery proof for the additive command-catalog snapshot.
     contact_advertised_caps is (global_id ->> str) = (,).
     // core 0.8.0: monotonic E2E anti-downgrade pin (SPEC §4). Positive-evidence,
     // set TRUE the first time a peer advertises core.e2e and NEVER cleared — it
@@ -1512,6 +1513,9 @@ library a2a_messaging loads libraries
 
     fn set_self_command_catalog (catalog: a2a_protocol::command_catalog_json_t+) -> nil
     {
+        // A real catalog change invalidates the shared capability-delivery
+        // ledger. Unchanged startup registration remains fully deduplicated.
+        if self_command_catalog != catalog { contact_advertised_caps -> (,). }
         self_command_catalog -> catalog.
     }
 
@@ -1536,6 +1540,35 @@ library a2a_messaging loads libraries
             return NIL.
         }
         contact_command_catalog cid -> catalog?.
+    }
+
+    fn fingerprint_caps (caps: str[]) -> str
+    {
+        s is str = "".
+        sc caps -- ( -> c) { s -> (s + c) + ",". }
+        return s.
+    }
+
+    // Public compatibility helper used by migration/diagnostic actors.
+    fn caps_fingerprint (_) -> str
+    {
+        return fingerprint_caps (a2a_capabilities::self_cap_ids NIL).
+    }
+
+    fn receive_command_catalog_snapshot (args: any, cid: global_id, pv: int, caps: str[], fp: str) -> nil
+    {
+        if pv >= 11 && (args $command_catalog_present) == TRUE
+        {
+            catalog is a2a_protocol::command_catalog_json_t+ = NIL.
+            if (args $command_catalog) != NIL
+            { catalog -> (args $command_catalog) safe a2a_protocol::command_catalog_json_t. }
+            abort "Capability advertisement fingerprint mismatch."
+                when fp != ((fingerprint_caps caps) + "|") + (_str (_value_id catalog)).
+            learn_contact_command_catalog cid catalog.
+            return NIL.
+        }
+        abort "Capability advertisement fingerprint mismatch." when fp != fingerprint_caps caps.
+        return NIL.
     }
 
     // Owner Addition B: the inviter-facing, render-ready message for a version-
@@ -5035,24 +5068,6 @@ library a2a_messaging loads libraries
         return transaction::success actions.
     }
 
-    // core 0.12 (2b): comma-joined fingerprint of my advertised cap-id set. self_cap_ids is
-    // captured at init in a stable order (supported ∪ advertise, then any runtime
-    // add_self_cap APPENDS), so this string changes iff my advertised caps change — the cheap
-    // change-detector reconcile_advertise gates the legacy upgrade push on.
-    fn caps_fingerprint (_) -> str
-    {
-        s is str = "".
-        sc (a2a_capabilities::self_cap_ids NIL) -- ( -> c) { s -> (s + c) + ",". }
-        return s.
-    }
-
-    fn fingerprint_caps (caps: str[]) -> str
-    {
-        s is str = "".
-        sc caps -- ( -> c) { s -> (s + c) + ",". }
-        return s.
-    }
-
     // Generic capability snapshot receiver. Exact replacement is intentional:
     // removals must propagate. The E2E pin remains monotonic, so an advertised
     // removal cannot reopen plaintext routing. Duplicate snapshots still ACK,
@@ -5065,9 +5080,12 @@ library a2a_messaging loads libraries
         if (contacts sender_id) == NIL { return transaction::success []. }
         caps is str[] = ((args $caps) safe (str[])).
         fp = (args $fingerprint) safe str.
-        abort "Capability advertisement fingerprint mismatch." when fp != fingerprint_caps caps.
         pv = (args $pv) safe int.
+        // v11 positively identifies catalog parsing; the presence bit makes
+        // NIL an authoritative removal and older snapshots preserve state.
+        receive_command_catalog_snapshot args sender_id pv caps fp.
         prev = contact_caps sender_id.
+        prev_pv = contact_pv sender_id.
         prev_fp is str = "".
         if prev != NIL { prev_fp -> fingerprint_caps prev?. }
         contact_caps sender_id -> caps.
@@ -5079,6 +5097,12 @@ library a2a_messaging loads libraries
                 $targ -> ($fingerprint -> fp)
             )
         ].
+        // Crossing into v11 invalidates any caps-only ACK from the old runtime;
+        // the normal reconciliation cadence then sends the catalog snapshot.
+        if pv >= 11 && (prev_pv == NIL || prev_pv? < 11)
+        {
+            if contact_advertised_caps sender_id != NIL { delete contact_advertised_caps sender_id. }
+        }
         if prev_fp != fp
         {
             actions (_count actions|) -> _notify_agent (
@@ -5101,8 +5125,13 @@ library a2a_messaging loads libraries
         sender_id = current_transaction_info::get_external_envelope_or_abort() $from.
         if (contacts sender_id) == NIL { return transaction::success []. }
         fp = (args $fingerprint) safe str.
-        // A stale/replayed ACK cannot suppress a newer capability snapshot.
-        if fp != caps_fingerprint NIL { return transaction::success []. }
+        // A stale/replayed caps-only ACK cannot suppress a newer catalog
+        // snapshot: v11 contacts must echo the combined current fingerprint.
+        expected is str = caps_fingerprint NIL.
+        pv = contact_pv sender_id.
+        if pv != NIL && pv? >= 11
+        { expected -> (expected + "|") + (_str (_value_id self_command_catalog)). }
+        if fp != expected { return transaction::success []. }
         contact_advertised_caps sender_id -> fp.
         return transaction::success [ _save_state NIL ].
     }
@@ -5124,11 +5153,28 @@ library a2a_messaging loads libraries
         legacy_n is int = 0.
         // Per-contact ACK ledger: retry missing/stale peers on the next cadence,
         // but never re-spam a peer that confirmed this exact capability set.
-        sc contacts -- (cid -> ) ?? ((contact_advertised_caps cid) != cur_fp)
+        sc contacts -- (cid -> ) ?? (
+            ((contact_pv cid) == NIL || (contact_pv cid)? < 11)
+            && (contact_advertised_caps cid) != cur_fp)
         {
             actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
                 $name -> capability_advertise_tx,
                 $targ -> ($pv -> cur_pv, $caps -> (a2a_capabilities::self_cap_ids NIL), $fingerprint -> cur_fp) ).
+            cap_n -> cap_n + 1.
+        }
+        catalog_fp = (cur_fp + "|") + (_str (_value_id self_command_catalog)).
+        sc contacts -- (cid -> ) ?? (
+            (contact_pv cid) != NIL && (contact_pv cid)? >= 11
+            && (contact_advertised_caps cid) != catalog_fp)
+        {
+            actions (_count actions|) -> encrypted_channel::send_encrypted_tx cid (
+                $name -> capability_advertise_tx,
+                $targ -> ($pv -> cur_pv,
+                          $caps -> (a2a_capabilities::self_cap_ids NIL),
+                          $fingerprint -> catalog_fp,
+                          $command_catalog -> self_command_catalog,
+                          $command_catalog_present -> TRUE)
+            ).
             cap_n -> cap_n + 1.
         }
         // ON CHANGE ONLY: the legacy upgrade push to pre-existing legacy contacts.

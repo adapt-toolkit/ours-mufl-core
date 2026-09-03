@@ -145,6 +145,106 @@ async function main() {
     const absentCatalogs = ro(CL, '::actor::qa_get_command_catalogs', { cid: CA.cid }).Visualize();
     ok(!/commands/.test(absentCatalogs),
       `legacy core import with both catalog fields absent keeps compatible empty defaults`);
+
+    // Existing-contact refresh: unlike the fresh handshake above, these peers
+    // establish with empty catalogs and only then add/change/remove commands.
+    const CU = mk('catalog-update-a'); const CV = mk('catalog-update-b');
+    await mkPacket(CU, 'catalog-update-a-seed'); await mkPacket(CV, 'catalog-update-b-seed');
+    await setName(CU, 'CatalogUpdateA'); await setName(CV, 'CatalogUpdateB');
+    await mutate(CU, '::actor::qa_init_caps', { advertise: [] });
+    await mutate(CV, '::actor::qa_init_caps', { advertise: [] });
+    const cui = await mutate(CU, '::a2a_messaging::generate_invite', { name: 'CatalogUpdateB' });
+    await mutate(CV, '::a2a_messaging::add_contact', {
+      invite: binv(CV, Buffer.from(cui.Reduce('invite').GetBinary())), name: 'CatalogUpdateA'
+    });
+    await sleep(5000);
+    let seenUpdate = ro(CV, '::actor::qa_get_command_catalogs', { cid: CU.cid }).Visualize();
+    ok(!/late\.one/.test(seenUpdate), `existing contact begins without an advertised catalog`);
+
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"late.one","input_schema":{}}]}'
+    });
+    await mutate(CV, '::actor::qa_send_caps_only_ack', { target: CU.cid, fingerprint: '' });
+    await sleep(1200);
+    const firstReconcile = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+firstReconcile.Reduce('capability_advertised').Visualize() === 1,
+      `delayed caps-only ACK cannot suppress the changed v11 catalog snapshot`);
+    await sleep(2500);
+    seenUpdate = ro(CV, '::actor::qa_get_command_catalogs', { cid: CU.cid }).Visualize();
+    ok(/late\.one/.test(seenUpdate), `existing contact learns a later catalog addition`);
+
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"late.one","input_schema":{}}]}'
+    });
+    const repeatReconcile = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+repeatReconcile.Reduce('capability_advertised').Visualize() === 0,
+      `identical catalog registration is ACK-deduplicated`);
+
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"late.two","input_schema":{}}]}'
+    });
+    const changedReconcile = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+changedReconcile.Reduce('capability_advertised').Visualize() === 1,
+      `catalog replacement emits one new snapshot`);
+    await sleep(2500);
+    seenUpdate = ro(CV, '::actor::qa_get_command_catalogs', { cid: CU.cid }).Visualize();
+    ok(/late\.two/.test(seenUpdate) && !/late\.one/.test(seenUpdate),
+      `catalog replacement is exact at the existing contact`);
+
+    await mutate(CU, '::actor::qa_set_command_catalog', { catalog: null });
+    await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    await sleep(2500);
+    seenUpdate = ro(CV, '::actor::qa_get_command_catalogs', { cid: CU.cid }).Visualize();
+    ok(!/late\.two/.test(seenUpdate), `catalog removal clears the existing contact snapshot`);
+
+    // Restore the pre-registration sender snapshot: existing contact, but no
+    // catalog ACK ledger. Re-registering models startup after an upgrade.
+    const beforeRegistration = Buffer.from(ro(CU, '::actor::export_state', undefined).Serialize());
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"after.upgrade","input_schema":{}}]}'
+    });
+    await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    await sleep(2500);
+    await mutate(CU, '::actor::import_state', CU.pw.packet.ParseValue(new Uint8Array(beforeRegistration)));
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"after.upgrade","input_schema":{}}]}'
+    });
+    const retriedReconcile = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+retriedReconcile.Reduce('capability_advertised').Visualize() === 1,
+      `pre-upgrade state with no ACK retries on startup registration`);
+    await sleep(2500);
+    await mutate(CU, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"after.upgrade","input_schema":{}}]}'
+    });
+    const settledReconcile = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+settledReconcile.Reduce('capability_advertised').Visualize() === 0,
+      `startup registration settles after the authenticated ACK`);
+
+    const OLD = mk('catalog-old-peer'); const NEW = mk('catalog-old-sender');
+    await mkPacket(OLD, 'catalog-old-peer-seed'); await mkPacket(NEW, 'catalog-old-sender-seed');
+    await setName(OLD, 'CatalogOldPeer'); await setName(NEW, 'CatalogOldSender');
+    await mutate(OLD, '::actor::qa_init_caps', { advertise: [] });
+    await mutate(NEW, '::actor::qa_init_caps', { advertise: [] });
+    const oldInvite = await mutate(NEW, '::a2a_messaging::generate_invite', { name: 'CatalogOldPeer' });
+    await mutate(OLD, '::a2a_messaging::add_contact', {
+      invite: binv(OLD, Buffer.from(oldInvite.Reduce('invite').GetBinary())), name: 'CatalogOldSender'
+    });
+    await sleep(5000);
+    await mutate(NEW, '::actor::qa_set_contact_pv', { cid: OLD.cid, pv: 10 });
+    await mutate(NEW, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"v11.only","input_schema":{}}]}'
+    });
+    await mutate(NEW, '::a2a_messaging::reconcile_advertise', {});
+    await sleep(2500);
+    let oldSeen = ro(OLD, '::actor::qa_get_command_catalogs', { cid: NEW.cid }).Visualize();
+    ok(!/v11\.only/.test(oldSeen), `catalog refresh does not target a peer without positive v11 evidence`);
+    await mutate(NEW, '::actor::qa_set_contact_pv', { cid: OLD.cid, pv: 11 });
+    await mutate(NEW, '::actor::qa_set_command_catalog', {
+      catalog: '{"commands":[{"name":"v11.upgraded","input_schema":{}}]}'
+    });
+    const upgradedReconcile = await mutate(NEW, '::a2a_messaging::reconcile_advertise', {});
+    ok(+upgradedReconcile.Reduce('capability_advertised').Visualize() === 1,
+      `the same existing contact receives the catalog after v11 reconnect evidence`);
   }
 
   // ---------- T1 file round-trip (send_file both directions) ----------
@@ -713,8 +813,8 @@ async function main() {
     await sleep(2500);
     ok(/v5-stamped-msg/.test(ro(R, '::actor::list_incoming_messages', undefined).Visualize()),
       `stamped $targ delivers normally (receiver tolerant of the added $pv)`);
-    ok(pvOf(R, I.cid) === '10', `responder learned contact_pv=10 (wire-10 leg-3 + stamped messages)`);
-    ok(pvOf(I, R.cid) === '10', `inviter learned contact_pv=10 (real current-build leg-1)`);
+    ok(pvOf(R, I.cid) === '11', `responder learned contact_pv=11 (wire-11 leg-3 + stamped messages)`);
+    ok(pvOf(I, R.cid) === '11', `inviter learned contact_pv=11 (real current-build leg-1)`);
   }
 
   // ---------- V7 upgrade-later + monotonic learning (owner scenario) ----------
@@ -736,14 +836,14 @@ async function main() {
     await sleep(2500);
     ok(/post-upgrade-hello/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `post-upgrade stamped message delivered`);
-    ok(pvOf(I, R.cid) === '10', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→10 (ongoing learning)`);
+    ok(pvOf(I, R.cid) === '11', `UPGRADE: first stamped ordinary message re-learned contact_pv 2→11 (ongoing learning)`);
     // Learned v5 caps (as the next bundle exchange would set), then stale legacy traffic.
     await mutate(I, '::actor::qa_set_contact_caps', { cid: R.cid, caps: ['core.notifications'] });
     await mutate(R, '::actor::qa_send_legacy_message', { target: I.cid, text: 'stale-legacy-msg' });
     await sleep(2500);
     ok(/stale-legacy-msg/.test(ro(I, '::actor::list_incoming_messages', undefined).Visualize()),
       `legacy (pre-wire_id, unstamped) message still delivers`);
-    ok(pvOf(I, R.cid) === '10', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
+    ok(pvOf(I, R.cid) === '11', `MONOTONIC: unstamped v2-shape message did NOT downgrade the learned pv`);
     ok(/core\.notifications/.test(String(capsOf(I, R.cid))),
       `MONOTONIC: learned v5 caps NOT clobbered by legacy traffic`);
   }
