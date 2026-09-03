@@ -22,12 +22,13 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
 
 ## The wire version id (`$pv`)
 
-- `wire_version = 9` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
+- `wire_version = 11` (minor-version ints: 0.5.0 stamped `$pv -> 5`; 0.7.x stamps `7` — the
   rcp/receipts surface registered in 0.7 warranted the bump; the initial 0.7.0 under-bump left
   pre-receipts contacts permanently receipt-gated, the fixed single-tick bug; 0.8.0 stamps `8` —
   the **e2e** signed-message surface registered in 0.8; 0.13 stamps `9` — the **crm**
-  contact-removal surface registered in 0.13). Monotone; bump **only** when a wire
-  surface registers a new versioned type — not on every release. Every consumer of a
+  contact-removal surface registered in 0.13; typed messages/contact catalogs stamp `10`;
+  runtime catalog refresh stamps `11`). Monotone; bump only for a wire-visible parsing
+  boundary, not on every release. Every consumer of a
   learned `$pv` is a `>=` threshold, so a bump never changes an existing gate.
 - Stamped on every core-originated send: cleartext `$targ` envelopes **and** inside the
   boxed identity-bundle payloads (invite legs 1/3, restore legs 1/2).
@@ -42,13 +43,12 @@ unions, delete their corpus fixtures (a visible, reviewed act), and update this 
   stamped `$pv` on message/file traffic (an *unstamped* message never overwrites the more
   precise invite-time inference). Both maps are additive in the export blob, guarded on
   import.
-- **Refresh scope (by design):** ordinary message/file traffic refreshes **`$pv` only** —
-  `$caps` refreshes solely via the bundle legs (invite redeem / contact restore) or a future
-  daemon-driven `get_manifest` pull (backlog); it is deliberately NOT piggybacked on every
-  message (wire cost). Consequence: a peer that upgrades and then only sends ordinary
-  messages is re-learned as `contact_pv = 5` with stale/absent caps — **benign** under the
-  fail-open CAP-1 gate (absent/empty caps pass). Learning is per-contact lazy; there is no
-  bulk re-sync. Monotonicity: unstamped traffic writes nothing, and a caps entry is never
+- **Refresh scope (by design):** ordinary message/file traffic refreshes **`$pv` only**;
+  bundle legs and the authenticated `::a2a_capabilities::advertise` snapshot refresh
+  `$caps`. The snapshot is ACK-ledgered and run on boot/GC/new-contact cadence, rather than
+  piggybacked on every message. Command catalogs additionally refresh on that path for a
+  peer positively learned at `pv >= 11`. Monotonicity: unstamped traffic writes nothing,
+  and a caps entry is never
   downgraded to empty — only replaced by a newer non-empty advertisement; `contact_pv`
   itself is last-*stamped*-wins so an honest software downgrade is re-learned (a forged
   lower `$pv` only degrades the forger's own UX — REG-6).
@@ -150,6 +150,22 @@ that never wired capabilities). Learned into `contact_caps`.
 **as data, degrade never abort** — only on **positive evidence**: a non-empty learned caps
 set that lacks `core.notifications`. Unknown / absent / empty caps pass (pre-0.5 peers and
 pre-0.5-established contacts keep working). Owner-approved fail-open interpretation.
+
+## Runtime command-catalog refresh (core 0.14) — v11 snapshot/ACK
+
+Wire v10 introduced opaque command catalogs on authenticated contact-establishment payloads.
+Wire v11 adds their refresh to the existing encrypted capability snapshot for contacts that
+already exist. The snapshot carries an explicit presence bit so `NIL` is an authoritative
+removal, and its `$fingerprint` combines the current capability fingerprint with the catalog
+value hash. The existing encrypted ACK must echo that exact current combined fingerprint;
+a delayed caps-only ACK therefore cannot confirm a later catalog.
+
+Send-side refresh is gated on positively learned `contact_pv >= 11`. v10 and older peers
+remain on the unchanged caps-only snapshot/ACK path. A real local catalog change invalidates
+the per-contact ACK ledger; the SDK immediately runs `reconcile_advertise`, while normal
+boot/GC reconciliation retries missing ACKs and deduplicates confirmed peers. Learning a
+contact's transition into v11 also invalidates its old caps-only ACK, so upgraded established
+contacts converge on the next reconciliation cadence without re-pairing.
 
 ## Wire-change taxonomy
 

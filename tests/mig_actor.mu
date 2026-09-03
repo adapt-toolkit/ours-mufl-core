@@ -302,11 +302,17 @@ application actor loads libraries
         pc = a2a_messaging::contact_caps cid.
         confirmed = a2a_messaging::contact_advertised_caps cid.
         exported = (a2a_messaging::export_core_state NIL) $contact_advertised_caps cid.
+        current is str = a2a_messaging::caps_fingerprint NIL.
+        peer_pv = a2a_messaging::contact_pv cid.
+        if peer_pv != NIL && peer_pv? >= 11
+        {
+            current -> (current + "|") + (_str (_value_id (a2a_messaging::get_self_command_catalog NIL))).
+        }
         return (
             $caps -> (pc == NIL ?? [] ; pc?),
             $confirmed -> (confirmed == NIL ?? "" ; confirmed?),
             $confirmed_persisted -> (exported != NIL && exported? == (confirmed == NIL ?? "" ; confirmed?)),
-            $current -> (a2a_messaging::caps_fingerprint NIL),
+            $current -> current,
             $pinned -> (a2a_messaging::e2e_pinned cid)
         ).
     }

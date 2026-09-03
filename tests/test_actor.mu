@@ -523,6 +523,28 @@ application actor loads libraries
         return transaction::success [ _return_data ($set -> TRUE), _save_state NIL ].
     }
 
+    // Delayed pre-catalog ACK injector: proves a caps-only fingerprint cannot
+    // settle the v11 combined caps+catalog ledger after a catalog change.
+    trn qa_send_caps_only_ack _:($target -> tgt: global_id, $fingerprint -> fp: str)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        return transaction::success [
+            encrypted_channel::send_encrypted_tx tgt (
+                $name -> "::a2a_capabilities::advertise_ack",
+                $targ -> ($fingerprint -> fp)
+            ),
+            _return_data ($sent -> TRUE)
+        ].
+    }
+
+    trn qa_clear_capability_ack _:($cid -> cid: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if a2a_messaging::contact_advertised_caps cid != NIL
+        { delete a2a_messaging::contact_advertised_caps cid. }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
     trn qa_set_contact_command_catalog _:($cid -> cid: global_id, $catalog -> catalog: str+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
@@ -759,6 +781,8 @@ application actor loads libraries
             $handlers -> (,),
             $on_unknown -> fn (_: any) -> transaction::action::type[] { return []. },
             $authorizer -> NIL,
+            $on_advertise -> a2a_messaging::handle_capability_advertise,
+            $on_advertise_ack -> a2a_messaging::handle_capability_advertise_ack,
             $advertise -> adv
         ).
         return transaction::success [ _return_data ($set -> TRUE) ].
