@@ -537,6 +537,14 @@ application actor loads libraries
         ].
     }
 
+    trn qa_clear_capability_ack _:($cid -> cid: global_id)
+    {
+        current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).
+        if a2a_messaging::contact_advertised_caps cid != NIL
+        { delete a2a_messaging::contact_advertised_caps cid. }
+        return transaction::success [ _return_data ($cleared -> TRUE), _save_state NIL ].
+    }
+
     trn qa_set_contact_command_catalog _:($cid -> cid: global_id, $catalog -> catalog: str+)
     {
         current_transaction_info::validate_origin_or_abort (transaction::envelope::origin::user,).

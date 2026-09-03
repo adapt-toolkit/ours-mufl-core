@@ -5088,6 +5088,7 @@ library a2a_messaging loads libraries
         prev_pv = contact_pv sender_id.
         prev_fp is str = "".
         if prev != NIL { prev_fp -> fingerprint_caps prev?. }
+        caps_fp = fingerprint_caps caps.
         contact_caps sender_id -> caps.
         contact_pv sender_id -> pv.
         note_e2e_seen sender_id caps.
@@ -5103,11 +5104,13 @@ library a2a_messaging loads libraries
         {
             if contact_advertised_caps sender_id != NIL { delete contact_advertised_caps sender_id. }
         }
-        if prev_fp != fp
+        // The wire/ACK fingerprint may additionally bind the v11 catalog.
+        // Capability delta consumers must compare and receive caps only.
+        if prev_fp != caps_fp
         {
             actions (_count actions|) -> _notify_agent (
                 $event -> $peer_capabilities_changed, $cid -> sender_id,
-                $previous_fingerprint -> prev_fp, $fingerprint -> fp, $caps -> caps
+                $previous_fingerprint -> prev_fp, $fingerprint -> caps_fp, $caps -> caps
             ).
             // DR migration is a subscriber/special-case of the generic delta:
             // all eligibility, election, born-DR and epoch gates remain inside

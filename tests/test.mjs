@@ -180,6 +180,17 @@ async function main() {
     ok(+repeatReconcile.Reduce('capability_advertised').Visualize() === 0,
       `identical catalog registration is ACK-deduplicated`);
 
+    // Force a byte-identical retry (models a lost ACK). The receiver must ACK
+    // it again, but the catalog-bound wire fingerprint is not a caps delta.
+    const capabilityEvents = CV.events.filter((event) => event === 'peer_capabilities_changed').length;
+    await mutate(CU, '::actor::qa_clear_capability_ack', { cid: CV.cid });
+    const identicalRetry = await mutate(CU, '::a2a_messaging::reconcile_advertise', {});
+    ok(+identicalRetry.Reduce('capability_advertised').Visualize() === 1,
+      `lost ACK retries the identical v11 catalog snapshot`);
+    await sleep(2500);
+    ok(CV.events.filter((event) => event === 'peer_capabilities_changed').length === capabilityEvents,
+      `identical v11 catalog retry has no capability-change side effect`);
+
     await mutate(CU, '::actor::qa_set_command_catalog', {
       catalog: '{"commands":[{"name":"late.two","input_schema":{}}]}'
     });
