@@ -6,12 +6,11 @@ in the repository root.
 
 ## Current posture
 
-Pull requests are welcome. Read the root `CONTRIBUTING.md` contribution terms and
-accept them in the PR description or a comment. No separate CLA form or signing
-service is required; missing information can be resolved in the open PR before
-merge. If you are integrating the core into your own agent, that integration is
-entirely yours; no contribution agreement or coordination is needed merely to use
-it under its applicable licence.
+Pull requests are welcome. The root `CONTRIBUTING.md` contribution terms apply
+when you submit a PR, including later commits to the same PR. No separate CLA,
+acceptance statement, checkbox or signing step is required. If you are integrating
+the core into your own agent, that integration is entirely yours; no contribution
+agreement or coordination is needed merely to use it under its applicable licence.
 
 ## How to contribute
 
@@ -20,7 +19,7 @@ it under its applicable licence.
 - **Feature discussion** — open an issue describing the use case. Protocol changes affect every
   client, so discussion precedes any design.
 - **Security issues** — do not open a public issue; see `SECURITY.md` in the repository root.
-- **Code contributions** — open a PR and follow `CONTRIBUTING.md`, including the in-PR acceptance and wire compatibility checklist.
+- **Code contributions** — open a PR and follow `CONTRIBUTING.md`, including the contribution terms and wire compatibility checklist.
 
 ## Integration feedback
 
