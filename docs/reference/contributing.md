@@ -6,10 +6,11 @@ in the repository root.
 
 ## Current posture
 
-Until the Contributor Licence Agreement (CLA) process is live, the project accepts
-**issues and feedback only** — pull requests are not open. This applies to the protocol
-repository. If you are integrating the core into your own agent, that integration is entirely
-yours; no CLA or coordination is needed.
+Pull requests are welcome. The root `CONTRIBUTING.md` contribution terms apply
+when you submit a PR, including later commits to the same PR. No separate CLA,
+acceptance statement, checkbox or signing step is required. If you are integrating
+the core into your own agent, that integration is entirely yours; no contribution
+agreement or coordination is needed merely to use it under its applicable licence.
 
 ## How to contribute
 
@@ -18,7 +19,7 @@ yours; no CLA or coordination is needed.
 - **Feature discussion** — open an issue describing the use case. Protocol changes affect every
   client, so discussion precedes any design.
 - **Security issues** — do not open a public issue; see `SECURITY.md` in the repository root.
-- **Code contributions** — on hold until the CLA is live. See `CONTRIBUTING.md` for the rationale.
+- **Code contributions** — open a PR and follow `CONTRIBUTING.md`, including the contribution terms and wire compatibility checklist.
 
 ## Integration feedback
 
